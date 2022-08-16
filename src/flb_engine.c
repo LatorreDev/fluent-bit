@@ -46,6 +46,7 @@
 #include <fluent-bit/flb_sosreport.h>
 #include <fluent-bit/flb_storage.h>
 #include <fluent-bit/flb_http_server.h>
+#include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_metrics.h>
 #include <fluent-bit/flb_version.h>
 #include <fluent-bit/flb_ring_buffer.h>
@@ -558,10 +559,11 @@ int flb_engine_start(struct flb_config *config)
 
     /* Initialize the networking layer */
     flb_net_lib_init();
-
     flb_net_ctx_init(&dns_ctx);
     flb_net_dns_ctx_init();
     flb_net_dns_ctx_set(&dns_ctx);
+
+    flb_pack_init(config);
 
     /* Create the event loop and set it in the global configuration */
     evl = mk_event_loop_create(256);
@@ -627,7 +629,7 @@ int flb_engine_start(struct flb_config *config)
     ret = mk_event_channel_create(config->evl,
                                   &config->ch_manager[0],
                                   &config->ch_manager[1],
-                                  config);
+                                  &config->ch_event);
     if (ret != 0) {
         flb_error("[engine] could not create manager channels");
         return -1;

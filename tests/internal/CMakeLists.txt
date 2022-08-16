@@ -6,7 +6,9 @@ set(UNIT_TESTS_FILES
   pack.c
   pipe.c
   sds.c
-  sha512.c
+  hmac.c
+  crypto.c
+  hash.c
   slist.c
   router.c
   network.c

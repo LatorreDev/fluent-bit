@@ -46,11 +46,7 @@ else()
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
 endif()
 
-if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Windows")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__='\"$(subst ${CMAKE_SOURCE_DIR}/,,$(abspath $<))\"'")
-else()
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__=__FILE__")
-endif()
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__=__FILE__")
 
 if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "armv7l")
   set(CMAKE_C_LINK_FLAGS "${CMAKE_C_LINK_FLAGS} -latomic")
@@ -171,6 +167,7 @@ option(FLB_IN_WINDOWS_EXPORTER_METRICS "Enable windows exporter metrics input pl
 option(FLB_IN_OPENTELEMETRY            "Enable OpenTelemetry input plugin"         Yes)
 option(FLB_OUT_AZURE          "Enable Azure output plugin"          Yes)
 option(FLB_OUT_AZURE_BLOB     "Enable Azure output plugin"          Yes)
+option(FLB_OUT_AZURE_KUSTO    "Enable Azure Kusto output plugin"    Yes)
 option(FLB_OUT_BIGQUERY       "Enable BigQuery output plugin"       Yes)
 option(FLB_OUT_CALYPTIA       "Enable Calyptia monitoring plugin"   Yes)
 option(FLB_OUT_COUNTER        "Enable Counter output plugin"        Yes)
@@ -507,11 +504,9 @@ endif()
 if(FLB_TLS)
   FLB_DEFINITION(FLB_HAVE_TLS)
 
-  # Build mbedtls: yes, in this transition period we always enable it
   option(ENABLE_TESTING  OFF)
   option(ENABLE_PROGRAMS OFF)
   option(INSTALL_MBEDTLS_HEADERS OFF)
-  add_subdirectory(${FLB_PATH_LIB_MBEDTLS} EXCLUDE_FROM_ALL)
 
   # Link OpenSSL statically on Windows.
   if (FLB_SYSTEM_WINDOWS)
