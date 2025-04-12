@@ -3,10 +3,42 @@ project(cmetrics C)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# CMetrics Version
+set(CMT_VERSION_MAJOR  0)
+set(CMT_VERSION_MINOR  9)
+set(CMT_VERSION_PATCH  9)
+set(CMT_VERSION_STR "${CMT_VERSION_MAJOR}.${CMT_VERSION_MINOR}.${CMT_VERSION_PATCH}")
+
 # Include helpers
 include(cmake/macros.cmake)
 include(CheckCSourceCompiles)
 include(GNUInstallDirs)
+
+# On macOS, search Homebrew for keg-only versions of Bison and Flex. Xcode does
+# not provide new enough versions for us to use.
+if (CMAKE_HOST_SYSTEM_NAME MATCHES "Darwin")
+    execute_process(
+        COMMAND brew --prefix bison
+        RESULT_VARIABLE BREW_BISON
+        OUTPUT_VARIABLE BREW_BISON_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if (BREW_BISON EQUAL 0 AND EXISTS "${BREW_BISON_PREFIX}")
+        message(STATUS "Found Bison keg installed by Homebrew at ${BREW_BISON_PREFIX}")
+        set(BISON_EXECUTABLE "${BREW_BISON_PREFIX}/bin/bison")
+    endif()
+
+    execute_process(
+        COMMAND brew --prefix flex
+        RESULT_VARIABLE BREW_FLEX
+        OUTPUT_VARIABLE BREW_FLEX_PREFIX
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if (BREW_FLEX EQUAL 0 AND EXISTS "${BREW_FLEX_PREFIX}")
+        message(STATUS "Found Flex keg installed by Homebrew at ${BREW_FLEX_PREFIX}")
+        set(FLEX_EXECUTABLE "${BREW_FLEX_PREFIX}/bin/flex")
+    endif()
+endif()
 
 # Define macro to identify Windows system (without Cygwin)
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
@@ -28,30 +60,39 @@ if(NOT MSVC)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
 endif()
 
-# CMetrics Version
-set(CMT_VERSION_MAJOR  0)
-set(CMT_VERSION_MINOR  3)
-set(CMT_VERSION_PATCH  5)
-set(CMT_VERSION_STR "${CMT_VERSION_MAJOR}.${CMT_VERSION_MINOR}.${CMT_VERSION_PATCH}")
-
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__=__FILE__")
+# Define __CMT_FILENAME__ consistently across Operating Systems
+if(NOT ${CMAKE_SYSTEM_NAME} MATCHES "Windows")
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__CMT_FILENAME__='\"$$(subst ${CMAKE_SOURCE_DIR}/,,$$(abspath $$<))\"'")
+else()
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__CMT_FILENAME__=__FILE__")
+endif()
 
 # Configuration options
-option(CMT_DEV             "Enable development mode"                   No)
-option(CMT_TESTS           "Enable unit testing"                       No)
-option(CMT_INSTALL_TARGETS "Enable subdirectory library installations" Yes)
+option(CMT_DEV                       "Enable development mode"                   No)
+option(CMT_DEBUG                     "Enable debug mode"                         No)
+option(CMT_TESTS                     "Enable unit testing"                       No)
+option(CMT_INSTALL_TARGETS           "Enable subdirectory library installations" Yes)
+option(CMT_ENABLE_PROMETHEUS_DECODER "Enable prometheus decoder"                 Yes)
 
 if(CMT_DEV)
   set(CMT_TESTS   Yes)
+  set(CMT_DEBUG   Yes)
+endif()
+
+if(CMT_DEBUG)
+  set(CMAKE_BUILD_TYPE Debug)
 endif()
 
 set(FLEX_BISON_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR})
+
+# Bundled libraries
+include(cmake/libraries.cmake)
+include(cmake/headers.cmake)
+
 # Include headers and dependency headers
 include_directories(
   src
   include
-  lib/monkey/include
-  lib/xxHash-0.8.0/
   ${FLEX_BISON_GENERATED_DIR}
   )
 
@@ -114,20 +155,46 @@ check_c_source_compiles("
      return 0;
   }" CMT_HAVE_MSGPACK)
 
-# Flex and Bison: check if the variables has not been defined before by
-# a parent project to avoid conflicts.
-if(NOT FLEX_FOUND)
-  find_package(FLEX 2)
+if(CMT_ENABLE_PROMETHEUS_DECODER)
+    # Flex and Bison: check if the variables has not been defined before by
+    # a parent project to avoid conflicts.
+    if(NOT FLEX_FOUND)
+      find_package(FLEX 2)
+    endif()
+
+    if(NOT BISON_FOUND)
+      find_package(BISON 3)
+    endif()
+
+    if(FLEX_FOUND AND BISON_FOUND)
+        set(CMT_BUILD_PROMETHEUS_DECODER 1)
+    endif()
 endif()
 
-if(NOT BISON_FOUND)
-  find_package(BISON 3)
+# Check if 'C Floppy' library is available in the environment, if not,
+# we will try to build a local copy at a later stage
+check_c_source_compiles("
+  #include <cfl/cfl_found.h>
+  int main() {
+     return cfl_found();
+  }" CMT_HAVE_CFL)
+if(CMT_HAVE_CFL)
+  CMT_DEFINITION(CMT_HAVE_CFL)
+  message(STATUS "CFL found in the system. OK")
 endif()
 
-if(FLEX_FOUND AND BISON_FOUND)
-    set(CMT_BUILD_PROMETHEUS_DECODER 1)
+# Check if fluent-otel-proto library is available in the environment, if not,
+# we will try to build a local copy at a later stage
+check_c_source_compiles("
+  #include <fluent-otel-proto/fluent-otel_found.h>
+  int main() {
+     return fluent_otel_found();
+  }" CMT_HAVE_FLUENT_OTEL_PROTO)
+if(CMT_HAVE_FLUENT_OTEL_PROTO)
+  CMT_DEFINITION(CMT_HAVE_FLUENT_OTEL_PROTO)
 endif()
 
+# Configure header files
 configure_file(
   "${PROJECT_SOURCE_DIR}/include/cmetrics/cmt_info.h.in"
   "${PROJECT_SOURCE_DIR}/include/cmetrics/cmt_info.h"
@@ -146,23 +213,6 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 else()
   set(CMT_INSTALL_LIBDIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}")
   set(CMT_INSTALL_INCLUDEDIR "${CMAKE_INSTALL_PREFIX}/include")
-endif()
-
-# xxHash
-if(NOT TARGET xxhash)
-  # Do something when target found
-  set(XXHASH_BUILD_ENABLE_INLINE_API OFF)
-  set(XXHASH_BUILD_XXHSUM OFF)
-  set(BUILD_SHARED_LIBS OFF)
-  add_subdirectory(lib/xxHash-0.8.0/cmake_unofficial EXCLUDE_FROM_ALL)
-
-  if (CMT_INSTALL_TARGETS)
-    install(TARGETS xxhash
-      RUNTIME DESTINATION ${CMT_INSTALL_BINDIR}
-      LIBRARY DESTINATION ${CMT_INSTALL_LIBDIR}
-      ARCHIVE DESTINATION ${CMT_INSTALL_LIBDIR}
-      COMPONENT library)
-  endif()
 endif()
 
 # mpack
@@ -184,10 +234,69 @@ if(NOT TARGET mpack-static)
   endif()
 endif()
 
+# C Floppy
+if (NOT CMT_HAVE_CFL)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/${CMT_PATH_LIB_CFL}/include)
+  add_subdirectory(lib/cfl)
+  CMT_DEFINITION(CMT_HAVE_CFL)
+  CMT_DEFINITION(CMT_HAVE_CFL_INTERNAL)
+  if (CMT_INSTALL_TARGETS)
+    file(GLOB bundledCFLHeaders "lib/cfl/include/cfl/*.h")
+    install(FILES ${bundledCFLHeaders}
+      DESTINATION ${CMT_INSTALL_INCLUDEDIR}/cfl
+      COMPONENT headers
+      PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+
+    install(TARGETS cfl-static
+      RUNTIME DESTINATION ${CMT_INSTALL_BINDIR}
+      LIBRARY DESTINATION ${CMT_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMT_INSTALL_LIBDIR}
+      COMPONENT library)
+
+    # xxHash
+    install(FILES lib/cfl/lib/xxhash/xxh3.h
+      DESTINATION ${CMT_INSTALL_INCLUDEDIR}
+      COMPONENT headers
+      PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+    install(FILES lib/cfl/lib/xxhash/xxhash.h
+      DESTINATION ${CMT_INSTALL_INCLUDEDIR}
+      COMPONENT headers
+      PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+
+    install(TARGETS xxhash
+      RUNTIME DESTINATION ${CMT_INSTALL_BINDIR}
+      LIBRARY DESTINATION ${CMT_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMT_INSTALL_LIBDIR}
+      COMPONENT library)
+  endif()
+endif()
+
+# fluent-otel-proto
+if (NOT CMT_HAVE_FLUENT_OTEL_PROTO)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/${CMT_PATH_LIB_FLUENT_OTEL_PROTO}/include)
+  CMT_OPTION(FLUENT_PROTO_METRICS   "on")
+  CMT_OPTION(FLUENT_PROTO_EXAMPLES "off")
+  add_subdirectory(lib/fluent-otel-proto)
+  CMT_DEFINITION(CMT_HAVE_FLUENT_OTEL_PROTO)
+  CMT_DEFINITION(CMT_HAVE_FLUENT_OTEL_PROTO_INTERNAL)
+  if (CMT_INSTALL_TARGETS)
+    file(GLOB bundledOTELProtoHeaders "lib/fluent-otel-proto/include/fluent-otel-proto/*.h")
+    install(FILES ${bundledOTELProtoHeaders}
+      DESTINATION ${CMT_INSTALL_INCLUDEDIR}/fluent-otel-proto
+      COMPONENT headers
+      PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ)
+
+    install(TARGETS fluent-otel-proto
+      RUNTIME DESTINATION ${CMT_INSTALL_BINDIR}
+      LIBRARY DESTINATION ${CMT_INSTALL_LIBDIR}
+      ARCHIVE DESTINATION ${CMT_INSTALL_LIBDIR}
+      COMPONENT library)
+  endif()
+endif()
+
 # Source code
 add_subdirectory(include)
 add_subdirectory(src)
-add_subdirectory(lib/monkey/include)
 
 # Tests
 if(CMT_TESTS)
@@ -253,7 +362,7 @@ set(CPACK_RPM_PACKAGE_GROUP "System Environment/Daemons")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache v2.0")
 set(CPACK_RPM_PACKAGE_RELEASE ${CPACK_PACKAGE_RELEASE})
 set(CPACK_PACKAGE_DESCRIPTION_FILE "${PROJECT_SOURCE_DIR}/cpack/description")
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Fast data collector for Linux")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "A standalone library to create and manipulate metrics in C")
 set(CPACK_RPM_SPEC_MORE_DEFINE "%define ignore \#")
 set(CPACK_RPM_USER_FILELIST
   "%ignore /lib"
@@ -295,21 +404,24 @@ if(CMT_SYSTEM_MACOS)
 
   if (CPACK_GENERATOR MATCHES "productbuild")
     set(CPACK_SET_DESTDIR "ON")
-    configure_file(cpack/macos/welcome.txt.cmakein ${CMAKE_CURRENT_BINARY_DIR}/welcome.txt)
-    configure_file(LICENSE ${CMAKE_CURRENT_BINARY_DIR}/LICENSE.txt)
+    configure_file(cpack/macos/welcome.txt.cmakein ${CMAKE_CURRENT_SOURCE_DIR}/welcome.txt)
+    configure_file(LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.txt)
     find_program(CONVERTER textutil)
     if (NOT CONVERTER)
       message(FATAL_ERROR "textutil not found.")
     endif()
     if (CONVERTER)
-      execute_process(COMMAND ${CONVERTER} -convert html "${CMAKE_SOURCE_DIR}/README.md" -output "${CMAKE_BINARY_DIR}/README.html")
+      execute_process(COMMAND ${CONVERTER} -convert html "${CMAKE_CURRENT_SOURCE_DIR}/README.md" -output "${CMAKE_CURRENT_SOURCE_DIR}/README.html")
     endif()
     set(CPACK_PACKAGE_FILE_NAME "${CMETRICS_PKG}")
-    set(CPACK_RESOURCE_FILE_WELCOME ${CMAKE_CURRENT_BINARY_DIR}/welcome.txt)
-    set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_CURRENT_BINARY_DIR}/LICENSE.txt)
-    set(CPACK_RESOURCE_FILE_README ${CMAKE_CURRENT_BINARY_DIR}/README.html)
+    set(CPACK_RESOURCE_FILE_WELCOME ${CMAKE_CURRENT_SOURCE_DIR}/welcome.txt)
+    set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE.txt)
+    set(CPACK_RESOURCE_FILE_README ${CMAKE_CURRENT_SOURCE_DIR}/README.html)
     set(CPACK_PRODUCTBUILD_IDENTIFIER "com.calyptia.${CPACK_PACKAGE_NAME}")
   endif()
 endif()
+
+# Create tarball
+add_custom_target(tarball COMMAND "bash" "${CMAKE_CURRENT_SOURCE_DIR}/create-submoduled-tarball.sh" "cmetrics-${CMT_VERSION_STR}")
 
 include(CPack)

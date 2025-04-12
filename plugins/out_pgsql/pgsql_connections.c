@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -54,9 +54,11 @@ void *pgsql_create_connection(struct flb_pgsql_config *ctx)
         flb_errno();
         return NULL;
     }
+
     conn->conn = PQsetdbLogin(ctx->db_hostname,
                               ctx->db_port,
-                              NULL, NULL,
+                              ctx->conn_options,
+                              NULL,
                               ctx->db_name,
                               ctx->db_user,
                               ctx->db_passwd);

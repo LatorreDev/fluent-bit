@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_network.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_error.h>
+#include <fluent-bit/flb_msgpack_append_message.h>
 
 #include "tcp.h"
 #include "tcp_conn.h"
@@ -35,47 +36,114 @@ static inline void consume_bytes(char *buf, int bytes, int length)
 static inline int process_pack(struct tcp_conn *conn,
                                char *pack, size_t size)
 {
+    int ret;
     size_t off = 0;
+    size_t prev_off = 0;
     msgpack_unpacked result;
     msgpack_object entry;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer mp_sbuf;
+    struct flb_in_tcp_config *ctx;
+    char   *appended_address_buffer;
+    size_t  appended_address_size;
+    char   *source_address;
 
-    /* Initialize local msgpack buffer */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+    ctx = conn->ctx;
+
+    flb_log_event_encoder_reset(ctx->log_encoder);
 
     /* First pack the results, iterate concatenated messages */
     msgpack_unpacked_init(&result);
     while (msgpack_unpack_next(&result, pack, size, &off) == MSGPACK_UNPACK_SUCCESS) {
         entry = result.data;
 
-        msgpack_pack_array(&mp_pck, 2);
-        flb_pack_time_now(&mp_pck);
+        appended_address_buffer = NULL;
+        source_address = NULL;
 
-        if (entry.type == MSGPACK_OBJECT_MAP) {
-            msgpack_pack_object(&mp_pck, entry);
+        ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+        if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+            ret = flb_log_event_encoder_set_current_timestamp(ctx->log_encoder);
         }
-        else if (entry.type == MSGPACK_OBJECT_ARRAY) {
-            msgpack_pack_map(&mp_pck, 1);
-            msgpack_pack_str(&mp_pck, 3);
-            msgpack_pack_str_body(&mp_pck, "msg", 3);
-            msgpack_pack_object(&mp_pck, entry);
+
+        if (ctx->source_address_key != NULL) {
+            source_address = flb_connection_get_remote_address(conn->connection);
         }
-        else {
-            flb_plg_debug(conn->ins, "record is not a JSON map or array");
-            msgpack_unpacked_destroy(&result);
-            msgpack_sbuffer_destroy(&mp_sbuf);
-            return -1;
+
+        if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+            if (entry.type == MSGPACK_OBJECT_MAP) {
+                if (ctx->source_address_key != NULL && source_address != NULL) {
+                    ret = flb_msgpack_append_message_to_record(&appended_address_buffer,
+                                                               &appended_address_size,
+                                                               ctx->source_address_key,
+                                                               pack + prev_off,
+                                                               size,
+                                                               source_address,
+                                                               strlen(source_address),
+                                                               MSGPACK_OBJECT_STR);
+                }
+
+                if (ret == FLB_MAP_EXPANSION_ERROR) {
+                    flb_plg_debug(ctx->ins, "error expanding source_address : %d", ret);
+                }
+
+                if (appended_address_buffer != NULL) {
+                    ret = flb_log_event_encoder_set_body_from_raw_msgpack(
+                            ctx->log_encoder, appended_address_buffer, appended_address_size);
+                }
+                else {
+                    ret = flb_log_event_encoder_set_body_from_msgpack_object(
+                            ctx->log_encoder, &entry);
+                }
+            }
+            else if (entry.type == MSGPACK_OBJECT_ARRAY) {
+                if (ctx->source_address_key != NULL && source_address != NULL) {
+                    ret = flb_log_event_encoder_append_body_values(
+                        ctx->log_encoder,
+                        FLB_LOG_EVENT_CSTRING_VALUE("msg"),
+                        FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&entry),
+                        FLB_LOG_EVENT_CSTRING_VALUE(ctx->source_address_key),
+                        FLB_LOG_EVENT_CSTRING_VALUE(source_address));
+                }
+                else {
+                    ret = flb_log_event_encoder_append_body_values(
+                        ctx->log_encoder,
+                        FLB_LOG_EVENT_CSTRING_VALUE("msg"),
+                        FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&entry));
+                }
+            }
+            else {
+                ret = FLB_EVENT_ENCODER_ERROR_INVALID_VALUE_TYPE;
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
+            }
+
+            if (appended_address_buffer != NULL) {
+                flb_free(appended_address_buffer);
+            }
+
+            if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                break;
+            }
         }
+        prev_off = off;
     }
 
     msgpack_unpacked_destroy(&result);
 
-    flb_input_chunk_append_raw(conn->ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
-    msgpack_sbuffer_destroy(&mp_sbuf);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        flb_input_log_append(conn->ins, NULL, 0,
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
+        ret = 0;
+    }
+    else {
+        flb_plg_error(ctx->ins, "log event encoding error : %d", ret);
 
-    return 0;
+        ret = -1;
+    }
+
+    return ret;
 }
 
 /* Process a JSON payload, return the number of processed bytes */
@@ -114,23 +182,24 @@ static ssize_t parse_payload_json(struct tcp_conn *conn)
  */
 static ssize_t parse_payload_none(struct tcp_conn *conn)
 {
+    int ret;
     int len;
     int sep_len;
     size_t consumed = 0;
     char *buf;
     char *s;
     char *separator;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer mp_sbuf;
+    struct flb_in_tcp_config *ctx;
+
+    ctx = conn->ctx;
 
     separator = conn->ctx->separator;
     sep_len = flb_sds_len(conn->ctx->separator);
 
-    /* Initialize local msgpack buffer */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
-
     buf = conn->buf_data;
+    ret = FLB_EVENT_ENCODER_SUCCESS;
+
+    flb_log_event_encoder_reset(ctx->log_encoder);
 
     while ((s = strstr(buf, separator))) {
         len = (s - buf);
@@ -138,13 +207,27 @@ static ssize_t parse_payload_none(struct tcp_conn *conn)
             break;
         }
         else if (len > 0) {
-            msgpack_pack_array(&mp_pck, 2);
-            flb_pack_time_now(&mp_pck);
-            msgpack_pack_map(&mp_pck, 1);
-            msgpack_pack_str(&mp_pck, 3);
-            msgpack_pack_str_body(&mp_pck, "log", 3);
-            msgpack_pack_str(&mp_pck, len);
-            msgpack_pack_str_body(&mp_pck, buf, len);
+            ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_set_current_timestamp(ctx->log_encoder);
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_append_body_values(
+                        ctx->log_encoder,
+                        FLB_LOG_EVENT_CSTRING_VALUE("log"),
+                        FLB_LOG_EVENT_STRING_VALUE(buf, len));
+            }
+
+            if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+                ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
+            }
+
+            if (ret != FLB_EVENT_ENCODER_SUCCESS) {
+                break;
+            }
+
             consumed += len + 1;
             buf += len + sep_len;
         }
@@ -153,8 +236,14 @@ static ssize_t parse_payload_none(struct tcp_conn *conn)
         }
     }
 
-    flb_input_chunk_append_raw(conn->ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
-    msgpack_sbuffer_destroy(&mp_sbuf);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        flb_input_log_append(conn->ins, NULL, 0,
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
+    }
+    else {
+        flb_plg_error(ctx->ins, "log event encoding error : %d", ret);
+    }
 
     return consumed;
 }
@@ -168,17 +257,25 @@ int tcp_conn_event(void *data)
     ssize_t ret_payload = -1;
     char *tmp;
     struct mk_event *event;
-    struct tcp_conn *conn = data;
-    struct flb_in_tcp_config *ctx = conn->ctx;
+    struct tcp_conn *conn;
+    struct flb_connection *connection;
+    struct flb_in_tcp_config *ctx;
 
-    event = &conn->event;
+    connection = (struct flb_connection *) data;
+
+    conn = connection->user_data;
+
+    ctx = conn->ctx;
+
+    event = &connection->event;
+
     if (event->mask & MK_EVENT_READ) {
         available = (conn->buf_size - conn->buf_len) - 1;
         if (available < 1) {
             if (conn->buf_size + ctx->chunk_size > ctx->buffer_size) {
-                flb_plg_trace(ctx->ins,
-                              "fd=%i incoming data exceed limit (%zu KB)",
-                              event->fd, (ctx->buffer_size / 1024));
+                flb_plg_warn(ctx->ins,
+                             "fd=%i incoming data exceeds 'Buffer_Size' (%zu KB)",
+                             event->fd, (ctx->buffer_size / 1024));
                 tcp_conn_del(conn);
                 return -1;
             }
@@ -198,8 +295,10 @@ int tcp_conn_event(void *data)
         }
 
         /* Read data */
-        bytes = recv(conn->fd,
-                     conn->buf_data + conn->buf_len, available, 0);
+        bytes = flb_io_net_read(connection,
+                                (void *) &conn->buf_data[conn->buf_len],
+                                available);
+
         if (bytes <= 0) {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
             tcp_conn_del(conn);
@@ -246,6 +345,7 @@ int tcp_conn_event(void *data)
             }
         }
 
+
         consume_bytes(conn->buf_data, ret_payload, conn->buf_len);
         conn->buf_len -= ret_payload;
         conn->buf_data[conn->buf_len] = '\0';
@@ -270,11 +370,11 @@ int tcp_conn_event(void *data)
 }
 
 /* Create a new mqtt request instance */
-struct tcp_conn *tcp_conn_add(int fd, struct flb_in_tcp_config *ctx)
+struct tcp_conn *tcp_conn_add(struct flb_connection *connection,
+                              struct flb_in_tcp_config *ctx)
 {
-    int ret;
     struct tcp_conn *conn;
-    struct mk_event *event;
+    int              ret;
 
     conn = flb_malloc(sizeof(struct tcp_conn));
     if (!conn) {
@@ -282,15 +382,16 @@ struct tcp_conn *tcp_conn_add(int fd, struct flb_in_tcp_config *ctx)
         return NULL;
     }
 
+    conn->connection = connection;
+
     /* Set data for the event-loop */
-    event = &conn->event;
-    MK_EVENT_NEW(event);
-    event->fd           = fd;
-    event->type         = FLB_ENGINE_EV_CUSTOM;
-    event->handler      = tcp_conn_event;
+    MK_EVENT_NEW(&connection->event);
+
+    connection->user_data     = conn;
+    connection->event.type    = FLB_ENGINE_EV_CUSTOM;
+    connection->event.handler = tcp_conn_event;
 
     /* Connection info */
-    conn->fd      = fd;
     conn->ctx     = ctx;
     conn->buf_len = 0;
     conn->rest    = 0;
@@ -299,9 +400,10 @@ struct tcp_conn *tcp_conn_add(int fd, struct flb_in_tcp_config *ctx)
     conn->buf_data = flb_malloc(ctx->chunk_size);
     if (!conn->buf_data) {
         flb_errno();
-        flb_socket_close(fd);
+
         flb_plg_error(ctx->ins, "could not allocate new connection");
         flb_free(conn);
+
         return NULL;
     }
     conn->buf_size = ctx->chunk_size;
@@ -314,12 +416,17 @@ struct tcp_conn *tcp_conn_add(int fd, struct flb_in_tcp_config *ctx)
     }
 
     /* Register instance into the event loop */
-    ret = mk_event_add(ctx->evl, fd, FLB_ENGINE_EV_CUSTOM, MK_EVENT_READ, conn);
+    ret = mk_event_add(flb_engine_evl_get(),
+                       connection->fd,
+                       FLB_ENGINE_EV_CUSTOM,
+                       MK_EVENT_READ,
+                       &connection->event);
     if (ret == -1) {
         flb_plg_error(ctx->ins, "could not register new connection");
-        flb_socket_close(fd);
+
         flb_free(conn->buf_data);
         flb_free(conn);
+
         return NULL;
     }
 
@@ -337,12 +444,15 @@ int tcp_conn_del(struct tcp_conn *conn)
     if (ctx->format == FLB_TCP_FMT_JSON) {
         flb_pack_state_reset(&conn->pack_state);
     }
-    /* Unregister the file descriptior from the event-loop */
-    mk_event_del(ctx->evl, &conn->event);
+
+    /* The downstream unregisters the file descriptor from the event-loop
+     * so there's nothing to be done by the plugin
+     */
+    flb_downstream_conn_release(conn->connection);
 
     /* Release resources */
     mk_list_del(&conn->_head);
-    flb_socket_close(conn->fd);
+
     flb_free(conn->buf_data);
     flb_free(conn);
 

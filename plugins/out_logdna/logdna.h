@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 
 #define FLB_LOGDNA_HOST      "logs.logdna.com"
 #define FLB_LOGDNA_PORT      "443"
+#define FLB_LOGDNA_ENDPOINT  "/logs/ingest"
 #define FLB_LOGDNA_CT        "Content-Type"
 #define FLB_LOGDNA_CT_JSON   "application/json; charset=UTF-8"
 
@@ -32,6 +33,7 @@ struct flb_logdna {
     /* Incoming Configuration Properties */
     flb_sds_t logdna_host;
     int       logdna_port;
+    flb_sds_t logdna_endpoint;
     flb_sds_t api_key;
     flb_sds_t hostname;
     flb_sds_t mac_addr;

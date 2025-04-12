@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_storage.h>
 #include <fluent-bit/flb_utils.h>
 #include <chunkio/chunkio.h>
+#include <chunkio/cio_error.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -50,6 +51,7 @@ struct flb_sb {
     struct flb_input_instance *ins; /* input instance */
     struct cio_ctx *cio;            /* chunk i/o instance */
     struct mk_list backlogs;        /* list of all pending chunks segregated by output plugin */
+    flb_route_mask_element *dummy_routes_mask; /* dummy route mask used when segregating events */
 };
 
 
@@ -90,7 +92,7 @@ static int sb_append_chunk_to_segregated_backlogs(struct cio_chunk  *target_chun
 int sb_segregate_chunks(struct flb_config *config);
 
 int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
-                                  size_t                      required_space);
+                                  ssize_t                    *required_space);
 
 ssize_t sb_get_releasable_output_queue_space(struct flb_output_instance *output_plugin,
                                              size_t                      required_space);
@@ -255,7 +257,6 @@ static int sb_append_chunk_to_segregated_backlog(struct cio_chunk    *target_chu
     struct sb_out_chunk *chunk;
 
     chunk = sb_allocate_chunk(target_chunk, stream, target_chunk_size);
-
     if (chunk == NULL) {
         flb_errno();
         return -1;
@@ -283,14 +284,20 @@ static int sb_append_chunk_to_segregated_backlogs(struct cio_chunk  *target_chun
 
     memset(&dummy_input_chunk, 0, sizeof(struct flb_input_chunk));
 
+    memset(context->dummy_routes_mask,
+           0,
+           context->ins->config->route_mask_slots * sizeof(flb_route_mask_element));
+
     dummy_input_chunk.in    = context->ins;
     dummy_input_chunk.chunk = target_chunk;
+    dummy_input_chunk.routes_mask = context->dummy_routes_mask;
 
     chunk_size = cio_chunk_get_real_size(target_chunk);
 
     if (chunk_size < 0) {
         flb_warn("[storage backlog] could not get real size of chunk %s/%s",
                   stream->name, target_chunk->name);
+
         return -1;
     }
 
@@ -299,6 +306,7 @@ static int sb_append_chunk_to_segregated_backlogs(struct cio_chunk  *target_chun
         flb_error("[storage backlog] could not retrieve chunk tag from %s/%s, "
                   "removing it from the queue",
                   stream->name, target_chunk->name);
+
         return -2;
     }
 
@@ -308,7 +316,8 @@ static int sb_append_chunk_to_segregated_backlogs(struct cio_chunk  *target_chun
     mk_list_foreach_safe(head, tmp, &context->backlogs) {
         backlog = mk_list_entry(head, struct sb_out_queue, _head);
         if (flb_routes_mask_get_bit(dummy_input_chunk.routes_mask,
-                                    backlog->ins->id)) {
+                                    backlog->ins->id,
+                                    backlog->ins->config)) {
             result = sb_append_chunk_to_segregated_backlog(target_chunk, stream,
                                                            chunk_size, backlog);
             if (result) {
@@ -327,6 +336,7 @@ int sb_segregate_chunks(struct flb_config *config)
     struct mk_list    *tmp;
     struct mk_list    *stream_iterator;
     struct mk_list    *chunk_iterator;
+    int                chunk_error;
     struct flb_sb     *context;
     struct cio_stream *stream;
     struct cio_chunk  *chunk;
@@ -351,6 +361,18 @@ int sb_segregate_chunks(struct flb_config *config)
             if (!cio_chunk_is_up(chunk)) {
                 ret = cio_chunk_up_force(chunk);
                 if (ret == CIO_CORRUPTED) {
+                    if (config->storage_del_bad_chunks) {
+                        chunk_error = cio_error_get(chunk);
+
+                        if (chunk_error == CIO_ERR_BAD_FILE_SIZE ||
+                            chunk_error == CIO_ERR_BAD_LAYOUT)
+                        {
+                            flb_plg_error(context->ins, "discarding irrecoverable chunk %s/%s", stream->name, chunk->name);
+
+                            cio_chunk_close(chunk, CIO_TRUE);
+                        }
+                    }
+
                     continue;
                 }
             }
@@ -364,7 +386,16 @@ int sb_segregate_chunks(struct flb_config *config)
             if (ret) {
                 /*
                  * if the chunk could not be segregated, just remove it from the
-                 * queue and continue.
+                 * queue, delete it and continue.
+                 */
+
+                /* If the tag cannot be read it cannot be routed, let's remove it */
+                if (ret == -2) {
+                    cio_chunk_close(chunk, CIO_TRUE);
+                    continue;
+                }
+
+                /*
                  *
                  * if content size is zero, it's safe to 'delete it'.
                  */
@@ -427,9 +458,10 @@ ssize_t sb_get_releasable_output_queue_space(struct flb_output_instance *output_
 }
 
 int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
-                                  size_t                      required_space)
+                                  ssize_t                    *required_space)
 {
     struct mk_list      *chunk_iterator_tmp;
+    struct cio_chunk    *underlying_chunk;
     struct mk_list      *chunk_iterator;
     size_t               released_space;
     struct flb_sb       *context;
@@ -455,18 +487,17 @@ int sb_release_output_queue_space(struct flb_output_instance *output_plugin,
         chunk = mk_list_entry(chunk_iterator, struct sb_out_chunk, _head);
 
         released_space += chunk->size;
+        underlying_chunk = chunk->chunk;
 
-        cio_chunk_close(chunk->chunk, FLB_TRUE);
-        sb_remove_chunk_from_segregated_backlogs(chunk->chunk, context);
+        sb_remove_chunk_from_segregated_backlogs(underlying_chunk, context);
+        cio_chunk_close(underlying_chunk, FLB_TRUE);
 
-        if (released_space >= required_space) {
+        if (released_space >= *required_space) {
             break;
         }
     }
 
-    if (released_space < required_space) {
-        return -3;
-    }
+    *required_space -= released_space;
 
     return 0;
 }
@@ -548,7 +579,7 @@ static int cb_queue_chunks(struct flb_input_instance *in,
                  */
                 tmp_ic.chunk = chunk_instance->chunk;
 
-                /* Retrieve the event type: FLB_INPUT_LOGS or FLB_INPUT_METRICS */
+                /* Retrieve the event type: FLB_INPUT_LOGS, FLB_INPUT_METRICS of FLB_INPUT_TRACES */
                 ret = flb_input_chunk_get_event_type(&tmp_ic);
                 if (ret == -1) {
                     flb_plg_error(ctx->ins, "removing chunk with wrong metadata "
@@ -604,6 +635,7 @@ static int cb_queue_chunks(struct flb_input_instance *in,
                  * queue but we need to leave it in the remainder queues.
                  */
                 sb_remove_chunk_from_segregated_backlogs(chunk_instance->chunk, ctx);
+                cio_chunk_down(ch);
 
                 /* check our limits */
                 total += size;
@@ -625,9 +657,22 @@ static int cb_sb_init(struct flb_input_instance *in,
     char mem[32];
     struct flb_sb *ctx;
 
-    ctx = flb_malloc(sizeof(struct flb_sb));
+    ctx = flb_calloc(1, sizeof(struct flb_sb));
+
     if (!ctx) {
         flb_errno();
+        return -1;
+    }
+
+    ctx->dummy_routes_mask = flb_calloc(in->config->route_mask_slots,
+                                        sizeof(flb_route_mask_element));
+
+    if (ctx->dummy_routes_mask == NULL) {
+        flb_errno();
+        flb_free(ctx);
+
+        flb_error("[storage backlog] could not allocate route mask elements");
+
         return -1;
     }
 
@@ -647,6 +692,7 @@ static int cb_sb_init(struct flb_input_instance *in,
     ret = flb_input_set_collector_time(in, cb_queue_chunks, 1, 0, config);
     if (ret < 0) {
         flb_plg_error(ctx->ins, "could not create collector");
+        flb_free(ctx->dummy_routes_mask);
         flb_free(ctx);
         return -1;
     }
@@ -674,6 +720,10 @@ static int cb_sb_exit(void *data, struct flb_config *config)
     flb_input_collector_pause(ctx->coll_fd, ctx->ins);
 
     sb_destroy_backlogs(ctx);
+
+    if (ctx->dummy_routes_mask != NULL) {
+        flb_free(ctx->dummy_routes_mask);
+    }
 
     flb_free(ctx);
 

@@ -24,8 +24,13 @@
 #include <fluent-bit/flb_http_server.h>
 
 #include <monkey/mk_lib.h>
+
+/* v1 */
 #include "api/v1/register.h"
 #include "api/v1/health.h"
+
+/* v2 */
+#include "api/v2/register.h"
 
 static void cb_root(mk_request_t *request, void *data)
 {
@@ -49,6 +54,12 @@ int flb_hs_push_pipeline_metrics(struct flb_hs *hs, void *data, size_t size)
     return mk_mq_send(hs->ctx, hs->qid_metrics, data, size);
 }
 
+/* Ingest pipeline metrics into the web service context */
+int flb_hs_push_metrics(struct flb_hs *hs, void *data, size_t size)
+{
+    return mk_mq_send(hs->ctx, hs->qid_metrics_v2, data, size);
+}
+
 /* Ingest storage metrics into the web service context */
 int flb_hs_push_storage_metrics(struct flb_hs *hs, void *data, size_t size)
 {
@@ -60,7 +71,8 @@ struct flb_hs *flb_hs_create(const char *listen, const char *tcp_port,
                              struct flb_config *config)
 {
     int vid;
-    char tmp[32];
+    /* Accept IPv6 and IPv4 address */
+    char tmp[46];
     struct flb_hs *hs;
 
     hs = flb_calloc(1, sizeof(struct flb_hs));
@@ -93,8 +105,11 @@ struct flb_hs *flb_hs_create(const char *listen, const char *tcp_port,
                  NULL);
 
 
-    /* Register all api/v1 */
+    /* Register endpoints for /api/v1 */
     api_v1_registration(hs);
+
+    /* Register endpoints for /api/v2 */
+    api_v2_registration(hs);
 
     /* Root */
     mk_vhost_handler(hs->ctx, vid, "/", cb_root, hs);

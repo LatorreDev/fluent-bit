@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,13 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
+
 #include <fluent-bit/flb_gzip.h>
+#include <fluent-bit/flb_snappy.h>
+#include <fluent-bit/flb_zstd.h>
+
 #include <fluent-bit/flb_record_accessor.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 
 #ifdef FLB_HAVE_SIGNV4
@@ -109,14 +114,14 @@ static int http_post(struct flb_out_http *ctx,
                      const char *tag, int tag_len,
                      char **headers)
 {
-    int ret;
+    int ret = 0;
     int out_ret = FLB_OK;
     int compressed = FLB_FALSE;
     size_t b_sent;
     void *payload_buf = NULL;
     size_t payload_size = 0;
     struct flb_upstream *u;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *c;
     struct mk_list *head;
     struct flb_config_map_val *mv;
@@ -138,17 +143,34 @@ static int http_post(struct flb_out_http *ctx,
     payload_size = body_len;
 
     /* Should we compress the payload ? */
+    ret = 0;
     if (ctx->compress_gzip == FLB_TRUE) {
         ret = flb_gzip_compress((void *) body, body_len,
                                 &payload_buf, &payload_size);
-        if (ret == -1) {
-            flb_plg_error(ctx->ins,
-                          "cannot gzip payload, disabling compression");
-        }
-        else {
+        if (ret == 0) {
             compressed = FLB_TRUE;
         }
     }
+    else if (ctx->compress_snappy == FLB_TRUE) {
+        ret = flb_snappy_compress((void *) body, body_len,
+                                  (char **) &payload_buf, &payload_size);
+        if (ret == 0) {
+            compressed = FLB_TRUE;
+        }
+    }
+    else if (ctx->compress_zstd == FLB_TRUE) {
+        ret = flb_zstd_compress((void *) body, body_len,
+                                &payload_buf, &payload_size);
+        if (ret == 0) {
+            compressed = FLB_TRUE;
+        }
+    }
+
+    if (ret == -1) {
+        flb_plg_warn(ctx->ins, "could not compress payload, sending as it is");
+        compressed = FLB_FALSE;
+    }
+
 
     /* Create HTTP client context */
     c = flb_http_client(u_conn, FLB_HTTP_POST, ctx->uri,
@@ -177,7 +199,6 @@ static int http_post(struct flb_out_http *ctx,
     }
     else if ((ctx->out_format == FLB_PACK_JSON_FORMAT_JSON) ||
         (ctx->out_format == FLB_PACK_JSON_FORMAT_STREAM) ||
-        (ctx->out_format == FLB_PACK_JSON_FORMAT_LINES) ||
         (ctx->out_format == FLB_HTTP_OUT_GELF)) {
         flb_http_add_header(c,
                             FLB_HTTP_CONTENT_TYPE,
@@ -185,7 +206,14 @@ static int http_post(struct flb_out_http *ctx,
                             FLB_HTTP_MIME_JSON,
                             sizeof(FLB_HTTP_MIME_JSON) - 1);
     }
-    else {
+    else if (ctx->out_format == FLB_PACK_JSON_FORMAT_LINES) {
+        flb_http_add_header(c,
+                            FLB_HTTP_CONTENT_TYPE,
+                            sizeof(FLB_HTTP_CONTENT_TYPE) - 1,
+                            FLB_HTTP_MIME_NDJSON,
+                            sizeof(FLB_HTTP_MIME_NDJSON) - 1);
+    }
+    else if (ctx->out_format == FLB_HTTP_OUT_MSGPACK) {
         flb_http_add_header(c,
                             FLB_HTTP_CONTENT_TYPE,
                             sizeof(FLB_HTTP_CONTENT_TYPE) - 1,
@@ -202,7 +230,15 @@ static int http_post(struct flb_out_http *ctx,
 
     /* Content Encoding: gzip */
     if (compressed == FLB_TRUE) {
-        flb_http_set_content_encoding_gzip(c);
+        if (ctx->compress_gzip == FLB_TRUE) {
+            flb_http_set_content_encoding_gzip(c);
+        }
+        else if (ctx->compress_snappy == FLB_TRUE) {
+            flb_http_set_content_encoding_snappy(c);
+        }
+        else if (ctx->compress_zstd == FLB_TRUE) {
+            flb_http_set_content_encoding_zstd(c);
+        }
     }
 
     /* Basic Auth headers */
@@ -225,14 +261,14 @@ static int http_post(struct flb_out_http *ctx,
 #ifdef FLB_HAVE_AWS
     /* AWS SigV4 headers */
     if (ctx->has_aws_auth == FLB_TRUE) {
-        flb_plg_debug(ctx->ins, "signing request with AWS Sigv4");        
+        flb_plg_debug(ctx->ins, "signing request with AWS Sigv4");
         signature = flb_signv4_do(c,
                                   FLB_TRUE,  /* normalize URI ? */
                                   FLB_TRUE,  /* add x-amz-date header ? */
                                   time(NULL),
                                   (char *) ctx->aws_region,
                                   (char *) ctx->aws_service,
-                                  0,
+                                  0, NULL,
                                   ctx->aws_provider);
 
         if (!signature) {
@@ -269,7 +305,16 @@ static int http_post(struct flb_out_http *ctx,
                 flb_plg_error(ctx->ins, "%s:%i, HTTP status=%i",
                               ctx->host, ctx->port, c->resp.status);
             }
-            out_ret = FLB_RETRY;
+            if (c->resp.status >= 400 && c->resp.status < 500 &&
+                c->resp.status != 429 && c->resp.status != 408) {
+                flb_plg_warn(ctx->ins, "could not flush records to %s:%i (http_do=%i), "
+                                "chunk will not be retried",
+                                ctx->host, ctx->port, ret);
+                out_ret = FLB_ERROR;
+            }
+            else {
+                out_ret = FLB_RETRY;
+            }
         }
         else {
             if (ctx->log_response_payload &&
@@ -315,13 +360,11 @@ static int compose_payload_gelf(struct flb_out_http *ctx,
 {
     flb_sds_t s;
     flb_sds_t tmp = NULL;
-    msgpack_unpacked result;
-    size_t off = 0;
     size_t size = 0;
-    msgpack_object root;
     msgpack_object map;
-    msgpack_object *obj;
-    struct flb_time tm;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    int ret;
 
     size = bytes * 1.5;
 
@@ -332,27 +375,31 @@ static int compose_payload_gelf(struct flb_out_http *ctx,
         return FLB_RETRY;
     }
 
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) ==
-           MSGPACK_UNPACK_SUCCESS) {
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-        if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
 
-        root = result.data;
-        if (root.via.array.size != 2) {
-            continue;
-        }
+        flb_sds_destroy(s);
 
-        flb_time_pop_from_msgpack(&tm, &result, &obj);
-        map = root.via.array.ptr[1];
+        return FLB_RETRY;
+    }
 
-        tmp = flb_msgpack_to_gelf(&s, &map, &tm, &(ctx->gelf_fields));
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        map = *log_event.body;
+
+        tmp = flb_msgpack_to_gelf(&s, &map,
+                                  &log_event.timestamp,
+                                  &(ctx->gelf_fields));
         if (!tmp) {
             flb_plg_error(ctx->ins, "error encoding to GELF");
+
             flb_sds_destroy(s);
-            msgpack_unpacked_destroy(&result);
+            flb_log_event_decoder_destroy(&log_decoder);
+
             return FLB_ERROR;
         }
 
@@ -360,16 +407,20 @@ static int compose_payload_gelf(struct flb_out_http *ctx,
         tmp = flb_sds_cat(s, "\n", 1);
         if (!tmp) {
             flb_plg_error(ctx->ins, "error concatenating records");
+
             flb_sds_destroy(s);
-            msgpack_unpacked_destroy(&result);
+            flb_log_event_decoder_destroy(&log_decoder);
+
             return FLB_RETRY;
         }
+
         s = tmp;
     }
+
     *out_body = s;
     *out_size = flb_sds_len(s);
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
 
     return FLB_OK;
 }
@@ -466,17 +517,14 @@ err:
     }
     return NULL;
 }
+
 static int post_all_requests(struct flb_out_http *ctx,
                              const char *data, size_t size,
                              flb_sds_t body_key,
                              flb_sds_t headers_key,
                              struct flb_event_chunk *event_chunk)
 {
-    struct flb_time t;
-    msgpack_unpacked result;
-    msgpack_object root;
     msgpack_object map;
-    msgpack_object *obj;
     msgpack_object *k;
     msgpack_object *v;
     msgpack_object *start_key;
@@ -485,31 +533,29 @@ static int post_all_requests(struct flb_out_http *ctx,
     bool body_found;
     bool headers_found;
     char **headers;
-    size_t off = 0;
     size_t record_count = 0;
     int ret = 0;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
 
-    msgpack_unpacked_init(&result);
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, size);
 
-    while (msgpack_unpack_next(&result, data, size, &off) == MSGPACK_UNPACK_SUCCESS) {
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
+    }
+
+    while ((flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         headers = NULL;
         body_found = false;
         headers_found = false;
-        root = result.data;
 
-        if (root.type != MSGPACK_OBJECT_ARRAY) {
-            ret = -1;
-            break;
-        }
+        map = *log_event.body;
 
-        if (root.via.array.size != 2) {
-            ret = -1;
-            break;
-        }
-
-        flb_time_pop_from_msgpack(&t, &result, &obj);
-
-        map = root.via.array.ptr[1];
         if (map.type != MSGPACK_OBJECT_MAP) {
             ret = -1;
             break;
@@ -541,7 +587,7 @@ static int post_all_requests(struct flb_out_http *ctx,
         }
 
         if (body_found && headers_found) {
-            flb_plg_trace(ctx->ins, "posting record %d", record_count++);
+            flb_plg_trace(ctx->ins, "posting record %zu", record_count++);
             ret = http_post(ctx, body, body_size, event_chunk->tag,
                     flb_sds_len(event_chunk->tag), headers);
         }
@@ -556,7 +602,8 @@ static int post_all_requests(struct flb_out_http *ctx,
         flb_free(headers);
     }
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
+
     return ret;
 }
 
@@ -642,7 +689,7 @@ static struct flb_config_map config_map[] = {
      "Set HTTP auth password"
     },
 #ifdef FLB_HAVE_SIGNV4
-#ifdef FLB_HAVE_AWS 
+#ifdef FLB_HAVE_AWS
     {
      FLB_CONFIG_MAP_BOOL, "aws_auth", "false",
      0, FLB_TRUE, offsetof(struct flb_out_http, has_aws_auth),
@@ -662,8 +709,8 @@ static struct flb_config_map config_map[] = {
      "Set a HTTP header which value is the Tag"
     },
     {
-     FLB_CONFIG_MAP_STR, "format", NULL,
-     0, FLB_FALSE, 0,
+     FLB_CONFIG_MAP_STR, "format", "json",
+     0, FLB_TRUE, offsetof(struct flb_out_http, format),
      "Set desired payload format: json, json_stream, json_lines, gelf or msgpack"
     },
     {
@@ -679,7 +726,7 @@ static struct flb_config_map config_map[] = {
     {
      FLB_CONFIG_MAP_STR, "compress", NULL,
      0, FLB_FALSE, 0,
-     "Set payload compression mechanism. Option available is 'gzip'"
+     "Set payload compression mechanism. Option available are 'gzip', 'snappy' and 'zstd'"
     },
     {
      FLB_CONFIG_MAP_SLIST_1, "header", NULL,
@@ -737,6 +784,7 @@ static int cb_http_format_test(struct flb_config *config,
                                struct flb_input_instance *ins,
                                void *plugin_context,
                                void *flush_ctx,
+                               int event_type,
                                const char *tag, int tag_len,
                                const void *data, size_t bytes,
                                void **out_data, size_t *out_size)

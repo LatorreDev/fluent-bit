@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,9 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_downstream.h>
 #include <chunkio/chunkio.h>
 
 static inline int instance_id(struct flb_config *config)
@@ -68,7 +71,7 @@ int flb_custom_set_property(struct flb_custom_instance *ins,
     }
 
     if (prop_key_check("alias", k, len) == 0 && tmp) {
-        ins->alias = tmp;
+        flb_utils_set_plugin_string_property("alias", &ins->alias, tmp);
     }
     else if (prop_key_check("log_level", k, len) == 0 && tmp) {
         ret = flb_log_get_level_str(tmp);
@@ -77,6 +80,16 @@ int flb_custom_set_property(struct flb_custom_instance *ins,
             return -1;
         }
         ins->log_level = ret;
+    }
+    else if (strncasecmp("net.", k, 4) == 0 && tmp) {
+        kv = flb_kv_item_create(&ins->net_properties, (char *) k, NULL);
+        if (!kv) {
+            if (tmp) {
+                flb_sds_destroy(tmp);
+            }
+            return -1;
+        }
+        kv->val = tmp;
     }
     else {
         /*
@@ -177,6 +190,7 @@ struct flb_custom_instance *flb_custom_new(struct flb_config *config,
     instance->log_level = -1;
 
     mk_list_init(&instance->properties);
+    mk_list_init(&instance->net_properties);
     mk_list_add(&instance->_head, &config->customs);
 
     return instance;
@@ -192,13 +206,69 @@ const char *flb_custom_name(struct flb_custom_instance *ins)
     return ins->name;
 }
 
+int flb_custom_plugin_property_check(struct flb_custom_instance *ins,
+                                     struct flb_config *config)
+{
+    int ret = 0;
+    struct mk_list *config_map;
+    struct flb_custom_plugin *p = ins->p;
+
+    if (p->config_map) {
+        /*
+         * Create a dynamic version of the configmap that will be used by the specific
+         * instance in question.
+         */
+        config_map = flb_config_map_create(config, p->config_map);
+        if (!config_map) {
+            flb_error("[custom] error loading config map for '%s' plugin",
+                      p->name);
+            return -1;
+        }
+        ins->config_map = config_map;
+
+        if ((p->flags & FLB_CUSTOM_NET_CLIENT) && (p->flags & FLB_CUSTOM_NET_SERVER)) {
+                flb_error("[custom] cannot configure upstream and downstream "
+                          "in the same custom plugin: '%s'",
+                          p->name);
+        }
+        if (p->flags & FLB_CUSTOM_NET_CLIENT) {
+                ins->net_config_map = flb_upstream_get_config_map(config);
+                if (ins->net_config_map == NULL) {
+                        flb_error("[custom] unable to load upstream properties: '%s'",
+                                  p->name);
+                        return -1;
+                }
+        }
+        else if (p->flags & FLB_CUSTOM_NET_SERVER) {
+                ins->net_config_map = flb_downstream_get_config_map(config);
+                if (ins->net_config_map == NULL) {
+                        flb_error("[custom] unable to load downstream properties: '%s'",
+                                  p->name);
+                        return -1;
+                }
+        }
+
+        /* Validate incoming properties against config map */
+        ret = flb_config_map_properties_check(ins->p->name,
+                                              &ins->properties, ins->config_map);
+        if (ret == -1) {
+            if (config->program_name) {
+                flb_helper("try the command: %s -F %s -h\n",
+                           config->program_name, ins->p->name);
+            }
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 /* Initialize all custom plugins */
 int flb_custom_init_all(struct flb_config *config)
 {
     int ret;
     struct mk_list *tmp;
     struct mk_list *head;
-    struct mk_list *config_map;
     struct flb_custom_plugin *p;
     struct flb_custom_instance *ins;
 
@@ -226,30 +296,9 @@ int flb_custom_init_all(struct flb_config *config)
          * Before to call the initialization callback, make sure that the received
          * configuration parameters are valid if the plugin is registering a config map.
          */
-        if (p->config_map) {
-            /*
-             * Create a dynamic version of the configmap that will be used by the specific
-             * instance in question.
-             */
-            config_map = flb_config_map_create(config, p->config_map);
-            if (!config_map) {
-                flb_error("[custom] error loading config map for '%s' plugin",
-                          p->name);
-                return -1;
-            }
-            ins->config_map = config_map;
-
-            /* Validate incoming properties against config map */
-            ret = flb_config_map_properties_check(ins->p->name,
-                                                  &ins->properties, ins->config_map);
-            if (ret == -1) {
-                if (config->program_name) {
-                    flb_helper("try the command: %s -F %s -h\n",
-                               config->program_name, ins->p->name);
-                }
-                flb_custom_instance_destroy(ins);
-                return -1;
-            }
+        if (flb_custom_plugin_property_check(ins, config) == -1) {
+            flb_custom_instance_destroy(ins);
+            return -1;
         }
 
         /* Initialize the input */
@@ -276,9 +325,14 @@ void flb_custom_instance_destroy(struct flb_custom_instance *ins)
     if (ins->config_map) {
         flb_config_map_destroy(ins->config_map);
     }
+    /* destroy net config map */
+    if (ins->net_config_map) {
+        flb_config_map_destroy(ins->net_config_map);
+    }
 
     /* release properties */
     flb_kv_release(&ins->properties);
+    flb_kv_release(&ins->net_properties);
 
     if (ins->alias) {
         flb_sds_destroy(ins->alias);

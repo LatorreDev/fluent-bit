@@ -27,19 +27,27 @@
 #include <fluent-bit/flb_event_loop.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_scheduler.h>
+#include <fluent-bit/flb_downstream.h>
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_input_thread.h>
+#include <fluent-bit/flb_notification.h>
 
 static int input_thread_instance_set_status(struct flb_input_instance *ins, uint32_t status);
 static int input_thread_instance_get_status(struct flb_input_instance *ins);
 
-static void *worker(void *arg)
+/* Cleanup function that runs every 1.5 second */
+static void cb_thread_sched_timer(struct flb_config *ctx, void *data)
 {
-    struct flb_input_thread *it = arg;
-    it->callback(it->write, it->data);
-    fclose(it->write_file);
-    return NULL;
+    struct flb_input_instance *ins;
+
+    (void) ctx;
+
+    /* Downstream timeout handling */
+    ins = (struct flb_input_instance *) data;
+
+    flb_upstream_conn_timeouts(&ins->upstreams);
+    flb_downstream_conn_timeouts(&ins->downstreams);
 }
 
 static inline int handle_input_event(flb_pipefd_t fd, struct flb_input_instance *ins)
@@ -71,6 +79,11 @@ static inline int handle_input_event(flb_pipefd_t fd, struct flb_input_instance 
                 ins->p->cb_pause(ins->context, ins->config);
             }
         }
+        else if (operation == FLB_INPUT_THREAD_RESUME) {
+            if (ins->p->cb_resume) {
+                ins->p->cb_resume(ins->context, ins->config);
+            }
+        }
         else if (operation == FLB_INPUT_THREAD_EXIT) {
             return FLB_INPUT_THREAD_EXIT;
         }
@@ -92,7 +105,7 @@ static inline int handle_input_thread_event(flb_pipefd_t fd, struct flb_config *
 
     bytes = flb_pipe_r(fd, &val, sizeof(val));
     if (bytes == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -176,6 +189,15 @@ static FLB_INLINE int engine_handle_event(flb_pipefd_t fd, int mask,
 
 static void input_thread_instance_destroy(struct flb_input_thread_instance *thi)
 {
+    if (thi->notification_channels_initialized == FLB_TRUE) {
+        mk_event_channel_destroy(thi->evl,
+                                 thi->notification_channels[0],
+                                 thi->notification_channels[1],
+                                 &thi->notification_event);
+
+        thi->notification_channels_initialized = FLB_FALSE;
+    }
+
     if (thi->evl) {
         mk_event_loop_destroy(thi->evl);
     }
@@ -258,6 +280,24 @@ static struct flb_input_thread_instance *input_thread_instance_create(struct flb
     }
     thi->event_local.type = FLB_ENGINE_EV_THREAD_INPUT;
 
+    ret = mk_event_channel_create(thi->evl,
+                                  &thi->notification_channels[0],
+                                  &thi->notification_channels[1],
+                                  &thi->notification_event);
+    if (ret == -1) {
+        flb_error("could not create notification channel for %s",
+                  flb_input_name(ins));
+
+        input_thread_instance_destroy(thi);
+
+        return NULL;
+    }
+
+    thi->notification_channels_initialized = FLB_TRUE;
+    thi->notification_event.type = FLB_ENGINE_EV_NOTIFICATION;
+
+    ins->notification_channel = thi->notification_channels[1];
+
     /* create thread pool, just one worker */
     thi->tp = flb_tp_create(ins->config);
     if (!thi->tp) {
@@ -284,6 +324,7 @@ static void input_thread(void *data)
     struct flb_input_plugin *p;
     struct flb_sched *sched = NULL;
     struct flb_net_dns dns_ctx = {0};
+    struct flb_notification *notification;
 
     thi = (struct flb_input_thread_instance *) data;
     ins = thi->ins;
@@ -298,6 +339,18 @@ static void input_thread(void *data)
         return;
     }
     flb_sched_ctx_set(sched);
+
+    /*
+     * Sched a permanent callback triggered every 1.5 second to let other
+     * components of this thread run tasks at that interval.
+     */
+    ret = flb_sched_timer_cb_create(sched,
+                                    FLB_SCHED_TIMER_CB_PERM,
+                                    1500, cb_thread_sched_timer, ins, NULL);
+    if (ret == -1) {
+        flb_error("could not schedule input thread permanent callback");
+        return;
+    }
 
     flb_coro_thread_init();
 
@@ -373,7 +426,7 @@ static void input_thread(void *data)
                 /* Read the coroutine reference */
                 ret = flb_pipe_r(event->fd, &output_flush, sizeof(struct flb_output_flush *));
                 if (ret <= 0 || output_flush == 0) {
-                    flb_errno();
+                    flb_pipe_error();
                     continue;
                 }
 
@@ -384,18 +437,19 @@ static void input_thread(void *data)
                 event->handler(event);
             }
             else if (event->type == FLB_ENGINE_EV_THREAD) {
-                struct flb_upstream_conn *u_conn;
-                struct flb_coro *co;
+                struct flb_connection *connection;
 
                 /*
                  * Check if we have some co-routine associated to this event,
                  * if so, resume the co-routine
                  */
-                u_conn = (struct flb_upstream_conn *) event;
-                co = u_conn->coro;
-                if (co) {
-                    flb_trace("[engine] resuming coroutine=%p", co);
-                    flb_coro_resume(co);
+                connection = (struct flb_connection *) event;
+
+                if (connection->coroutine != NULL) {
+                    flb_trace("[engine] resuming coroutine=%p",
+                              connection->coroutine);
+
+                    flb_coro_resume(connection->coroutine);
                 }
             }
             else if (event->type == FLB_ENGINE_EV_INPUT) {
@@ -407,9 +461,24 @@ static void input_thread(void *data)
             else if (event->type == FLB_ENGINE_EV_THREAD_INPUT) {
                 handle_input_thread_event(event->fd, ins->config);
             }
+            else if(event->type == FLB_ENGINE_EV_NOTIFICATION) {
+                ret = flb_notification_receive(event->fd, &notification);
+
+                if (ret == 0) {
+                    ret = flb_notification_deliver(notification);
+
+                    flb_notification_cleanup(notification);
+                }
+            }
         }
 
         flb_net_dns_lookup_context_cleanup(&dns_ctx);
+
+        /* Destroy upstream connections from the 'pending destroy list' */
+        flb_upstream_conn_pending_destroy_list(&ins->upstreams);
+
+        /* Destroy downstream connections from the 'pending destroy list' */
+        flb_downstream_conn_pending_destroy_list(&ins->downstreams);
         flb_sched_timer_cleanup(sched);
 
         /* Check if the instance must exit */
@@ -441,6 +510,10 @@ int flb_input_thread_instance_pause(struct flb_input_instance *ins)
     uint64_t val;
     struct flb_input_thread_instance *thi = ins->thi;
 
+    if (thi == NULL) {
+        return 0;
+    }
+
     flb_plg_debug(ins, "thread pause instance");
 
     /* compose message to pause the thread */
@@ -449,7 +522,36 @@ int flb_input_thread_instance_pause(struct flb_input_instance *ins)
 
     ret = flb_pipe_w(thi->ch_parent_events[1], &val, sizeof(val));
     if (ret <= 0) {
-        flb_errno();
+        flb_pipe_error();
+        return -1;
+    }
+
+    return 0;
+}
+
+/*
+ * Signal the thread event loop to resume the running plugin instance. This function
+ * must be called only from the main thread/pipeline.
+ */
+int flb_input_thread_instance_resume(struct flb_input_instance *ins)
+{
+    int ret;
+    uint64_t val;
+    struct flb_input_thread_instance *thi = ins->thi;
+
+    if (thi == NULL) {
+        return 0;
+    }
+
+    flb_plg_debug(ins, "thread resume instance");
+
+    /* compose message to resume the thread */
+    val = FLB_BITS_U64_SET(FLB_INPUT_THREAD_TO_THREAD,
+                           FLB_INPUT_THREAD_RESUME);
+
+    ret = flb_pipe_w(thi->ch_parent_events[1], &val, sizeof(val));
+    if (ret <= 0) {
+        flb_pipe_error();
         return -1;
     }
 
@@ -463,6 +565,10 @@ int flb_input_thread_instance_exit(struct flb_input_instance *ins)
     struct flb_input_thread_instance *thi = ins->thi;
     pthread_t tid;
 
+    if (thi == NULL) {
+        return 0;
+    }
+
     memcpy(&tid, &thi->th->tid, sizeof(pthread_t));
 
     /* compose message to pause the thread */
@@ -471,7 +577,7 @@ int flb_input_thread_instance_exit(struct flb_input_instance *ins)
 
     ret = flb_pipe_w(thi->ch_parent_events[1], &val, sizeof(val));
     if (ret <= 0) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -637,7 +743,7 @@ int flb_input_thread_collectors_signal_start(struct flb_input_instance *ins)
 
     ret = flb_pipe_w(thi->ch_parent_events[1], &val, sizeof(uint64_t));
     if (ret <= 0) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -655,7 +761,7 @@ int flb_input_thread_collectors_signal_wait(struct flb_input_instance *ins)
     thi = ins->thi;
     bytes = flb_pipe_r(thi->ch_parent_events[0], &val, sizeof(uint64_t));
     if (bytes <= 0) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -686,126 +792,4 @@ int flb_input_thread_collectors_start(struct flb_input_instance *ins)
     }
 
     return 0;
-}
-
-/* ------------------- PREVIOUS INTERFACE START HERE ----------------------- */
-
-int flb_input_thread_init(struct flb_input_thread *it, flb_input_thread_cb callback, void *data)
-{
-    flb_pipefd_t fd[2];
-    int result;
-
-    result = flb_pipe_create(fd);
-    if (result) {
-        flb_error("[input] failed to create pipe: %d", result);
-        return -1;
-    }
-
-    it->read = fd[0];
-    it->write = fd[1];
-    it->data = data;
-    it->callback = callback;
-    it->bufpos = 0;
-    it->write_file = fdopen(it->write, "ab");
-    if (!it->write_file) {
-        flb_errno();
-        return -1;
-    }
-
-    it->exit = false;
-    result = pthread_mutex_init(&it->mutex, NULL);
-    if (result) {
-        flb_error("[input] failed to initialize thread mutex: %d", result);
-        return -1;
-    }
-
-    mpack_writer_init_stdfile(&it->writer, it->write_file, false);
-    result = pthread_create(&it->thread, NULL, worker, it);
-    if (result) {
-        close(it->read);
-        close(it->write);
-        flb_error("[input] failed to create thread: %d", result);
-        return -1;
-    }
-
-    return 0;
-}
-
-int flb_input_thread_collect(struct flb_input_instance *ins,
-                             struct flb_config *config,
-                             void *in_context)
-{
-    int object_count;
-    size_t chunks_len;
-    size_t remaining_bytes;
-    struct flb_input_thread *it = in_context;
-
-    int bytes_read = read(it->read,
-                          it->buf + it->bufpos,
-                          sizeof(it->buf) - it->bufpos);
-    flb_plg_trace(ins, "input thread read() = %i", bytes_read);
-
-    if (bytes_read == 0) {
-        flb_plg_warn(ins, "end of file (read pipe closed by input thread)");
-        flb_input_collector_pause(it->coll_fd, ins);
-        return 0;
-    }
-
-    if (bytes_read <= 0) {
-        flb_input_collector_pause(it->coll_fd, ins);
-        flb_engine_exit(config);
-        return -1;
-    }
-    it->bufpos += bytes_read;
-
-    object_count = flb_mp_count_remaining(it->buf, it->bufpos, &remaining_bytes);
-    if (!object_count) {
-        // msgpack data is still not complete
-        return 0;
-    }
-
-    chunks_len = it->bufpos - remaining_bytes;
-    flb_input_chunk_append_raw(ins, NULL, 0, it->buf, chunks_len);
-    memmove(it->buf, it->buf + chunks_len, remaining_bytes);
-    it->bufpos = remaining_bytes;
-    return 0;
-}
-
-int flb_input_thread_destroy(struct flb_input_thread *it, struct flb_input_instance *ins)
-{
-    int ret;
-    flb_input_thread_exit(it, ins);
-    /* On Darwin, we must call pthread_cancel here to ensure worker
-     * thread termination. Otherwise, worker thread termination will
-     * be blocked. */
-    pthread_cancel(it->thread);
-    ret = pthread_join(it->thread, NULL);
-    mpack_writer_destroy(&it->writer);
-    pthread_mutex_destroy(&it->mutex);
-    return ret;
-}
-
-void flb_input_thread_exit(void *in_context, struct flb_input_instance *ins)
-{
-    struct flb_input_thread *it;
-
-    if (!in_context) {
-        flb_plg_warn(ins, "can't set exit flag, in_context not set");
-        return;
-    }
-
-    it = in_context;
-    pthread_mutex_lock(&it->mutex);
-    it->exit = true;
-    pthread_mutex_unlock(&it->mutex);
-    flb_pipe_close(it->read);
-}
-
-bool flb_input_thread_exited(struct flb_input_thread *it)
-{
-    bool ret;
-    pthread_mutex_lock(&it->mutex);
-    ret = it->exit;
-    pthread_mutex_unlock(&it->mutex);
-    return ret;
 }

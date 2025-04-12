@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,19 @@
 struct flb_time {
     struct timespec tm;
 };
+
+struct flb_tm {
+    struct tm tm;
+#ifndef FLB_HAVE_GMTOFF
+    long int tm_gmtoff;
+#endif
+};
+
+#ifndef FLB_HAVE_GMTOFF
+#define flb_tm_gmtoff(x) (x)->tm_gmtoff
+#else
+#define flb_tm_gmtoff(x) (x)->tm.tm_gmtoff
+#endif
 
 /*
    to represent eventtime of fluentd
@@ -62,6 +75,12 @@ static inline void flb_time_copy(struct flb_time *dst, struct flb_time *src)
     dst->tm.tv_nsec = src->tm.tv_nsec;
 }
 
+static inline void flb_time_from_uint64(struct flb_time *dst, uint64_t value)
+{
+    dst->tm.tv_sec = (long) (value / 1000000000L);
+    dst->tm.tv_nsec = (long) (value - dst->tm.tv_sec);
+}
+
 static inline void flb_time_from_double(struct flb_time *dst, double d)
 {
     dst->tm.tv_sec = (int) d;
@@ -76,6 +95,7 @@ int flb_time_get(struct flb_time *tm);
 int flb_time_msleep(uint32_t ms);
 double flb_time_to_double(struct flb_time *tm);
 uint64_t flb_time_to_nanosec(struct flb_time *tm);
+uint64_t flb_time_to_millisec(struct flb_time *tm);
 int flb_time_add(struct flb_time *base, struct flb_time *duration,
                  struct flb_time *result);
 int flb_time_diff(struct flb_time *time1,

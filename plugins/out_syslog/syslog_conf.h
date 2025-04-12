@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,11 @@
 
 #ifndef FLB_OUT_SYSLOG_CONF_H
 #define FLB_OUT_SYSLOG_CONF_H
+
+#include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_pipe.h>
+
 
 #define FLB_SYSLOG_UDP 0
 #define FLB_SYSLOG_TCP 1
@@ -41,7 +46,16 @@ struct flb_syslog {
     flb_sds_t procid_key;
     flb_sds_t msgid_key;
     struct mk_list *sd_keys;
+    int allow_longer_sd_id;
     flb_sds_t message_key;
+
+    /* Preset */
+    int severity_preset;
+    int facility_preset;
+    flb_sds_t hostname_preset;
+    flb_sds_t appname_preset;
+    flb_sds_t procid_preset;
+    flb_sds_t msgid_preset;
 
     /* Internal */
     int parsed_mode;

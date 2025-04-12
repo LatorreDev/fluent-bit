@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@
 #include <fluent-bit/flb_plugin.h>
 #include <fluent-bit/flb_plugin_proxy.h>
 
+#include <cfl/cfl_sds.h>
+#include <cfl/cfl_variant.h>
+#include <cfl/cfl_kvlist.h>
+
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -49,6 +53,15 @@ static int is_input(char *name)
 static int is_filter(char *name)
 {
     if (strncmp(name, "filter_", 7) == 0) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+static int is_processor(char *name)
+{
+    if (strncmp(name, "processor_", 10) == 0) {
         return FLB_TRUE;
     }
 
@@ -140,6 +153,7 @@ static char *path_to_plugin_name(char *path)
 
     /* Validate expected plugin type */
     if (is_input(name) == FLB_FALSE &&
+        is_processor(name) == FLB_FALSE &&
         is_filter(name) == FLB_FALSE &&
         is_output(name) == FLB_FALSE) {
         flb_error("[plugin] invalid plugin type: %s", name);
@@ -176,6 +190,7 @@ struct flb_plugins *flb_plugin_create()
     }
 
     mk_list_init(&ctx->input);
+    mk_list_init(&ctx->processor);
     mk_list_init(&ctx->filter);
     mk_list_init(&ctx->output);
 
@@ -191,6 +206,7 @@ int flb_plugin_load(char *path, struct flb_plugins *ctx,
     char *plugin_stname;
     struct flb_plugin *plugin;
     struct flb_input_plugin *input;
+    struct flb_processor_plugin *processor;
     struct flb_filter_plugin *filter;
     struct flb_output_plugin *output;
 
@@ -233,6 +249,18 @@ int flb_plugin_load(char *path, struct flb_plugins *ctx,
         }
         memcpy(input, symbol, sizeof(struct flb_input_plugin));
         mk_list_add(&input->_head, &config->in_plugins);
+    }
+    else if (is_processor(plugin_stname) == FLB_TRUE) {
+        type = FLB_PLUGIN_PROCESSOR;
+        processor = flb_malloc(sizeof(struct flb_processor_plugin));
+        if (processor == NULL) {
+            flb_errno();
+            flb_free(plugin_stname);
+            dlclose(dso_handle);
+            return -1;
+        }
+        memcpy(processor, symbol, sizeof(struct flb_processor_plugin));
+        mk_list_add(&processor->_head, &config->processor_plugins);
     }
     else if (is_filter(plugin_stname) == FLB_TRUE) {
         type = FLB_PLUGIN_FILTER;
@@ -282,6 +310,9 @@ int flb_plugin_load(char *path, struct flb_plugins *ctx,
     if (type == FLB_PLUGIN_INPUT) {
         mk_list_add(&plugin->_head, &ctx->input);
     }
+    else if (type == FLB_PLUGIN_PROCESSOR) {
+        mk_list_add(&plugin->_head, &ctx->processor);
+    }
     else if (type == FLB_PLUGIN_FILTER) {
         mk_list_add(&plugin->_head, &ctx->filter);
     }
@@ -322,6 +353,33 @@ int flb_plugin_load_router(char *path, struct flb_config *config)
     return 0;
 }
 
+int flb_plugin_load_config_format(struct flb_cf *cf, struct flb_config *config)
+{
+    int ret;
+    struct mk_list *head;
+    struct cfl_list *head_e;
+    struct flb_cf_section *section;
+    struct cfl_kvpair *entry;
+
+    /* read all 'plugins' sections */
+    mk_list_foreach(head, &cf->plugins) {
+        section = mk_list_entry(head, struct flb_cf_section, _head_section);
+
+        cfl_list_foreach(head_e, &section->properties->list) {
+            entry = cfl_list_entry(head_e, struct cfl_kvpair, _head);
+
+            /* Load plugin with router function */
+            ret = flb_plugin_load_router(entry->key, config);
+            if (ret == -1) {
+                flb_cf_destroy(cf);
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 /* Load plugins from a configuration file */
 int flb_plugin_load_config_file(const char *file, struct flb_config *config)
 {
@@ -329,11 +387,11 @@ int flb_plugin_load_config_file(const char *file, struct flb_config *config)
     char tmp[PATH_MAX + 1];
     char *cfg = NULL;
     struct mk_list *head;
-    struct mk_list *head_e;
+    struct cfl_list *head_e;
     struct stat st;
     struct flb_cf *cf;
     struct flb_cf_section *section;
-    struct flb_kv *entry;
+    struct cfl_kvpair *entry;
 
 #ifndef FLB_HAVE_STATIC_CONF
     ret = stat(file, &st);
@@ -364,27 +422,41 @@ int flb_plugin_load_config_file(const char *file, struct flb_config *config)
         return -1;
     }
 
-    /* read all 'plugins' sections */
-    mk_list_foreach(head, &cf->sections) {
-        section = mk_list_entry(head, struct flb_cf_section, _head);
-        if (strcasecmp(section->name, "plugins") != 0) {
-            continue;
-        }
-
-        mk_list_foreach(head_e, &section->properties) {
-            entry = mk_list_entry(head_e, struct flb_kv, _head);
-            if (strcasecmp(entry->key, "path") != 0) {
+    if (cf->format == FLB_CF_FLUENTBIT) {
+        /* (classic mode) read all 'plugins' sections */
+        mk_list_foreach(head, &cf->sections) {
+            section = mk_list_entry(head, struct flb_cf_section, _head);
+            if (strcasecmp(section->name, "plugins") != 0) {
                 continue;
             }
 
-            /* Load plugin with router function */
-            ret = flb_plugin_load_router(entry->val, config);
-            if (ret == -1) {
-                flb_cf_destroy(cf);
-                return -1;
+            cfl_list_foreach(head_e, &section->properties->list) {
+                entry = cfl_list_entry(head_e, struct cfl_kvpair, _head);
+                if (strcasecmp(entry->key, "path") != 0) {
+                    continue;
+                }
+
+                /* Load plugin with router function */
+                ret = flb_plugin_load_router(entry->val->data.as_string, config);
+                if (ret == -1) {
+                    flb_cf_destroy(cf);
+                    return -1;
+                }
             }
         }
     }
+#ifdef FLB_HAVE_LIBYAML
+    else if (cf->format == FLB_CF_YAML) {
+        /*
+         * pass to the config_format loader also in case some Yaml have been included in
+         * the service section through the option 'plugins_file'
+         */
+        ret = flb_plugin_load_config_format(cf, config);
+        if (ret == -1) {
+            return -1;
+        }
+    }
+#endif
 
     flb_cf_destroy(cf);
     return 0;
@@ -398,6 +470,11 @@ void flb_plugin_destroy(struct flb_plugins *ctx)
     struct flb_plugin *plugin;
 
     mk_list_foreach_safe(head, tmp, &ctx->input) {
+        plugin = mk_list_entry(head, struct flb_plugin, _head);
+        destroy_plugin(plugin);
+    }
+
+    mk_list_foreach_safe(head, tmp, &ctx->processor) {
         plugin = mk_list_entry(head, struct flb_plugin, _head);
         destroy_plugin(plugin);
     }

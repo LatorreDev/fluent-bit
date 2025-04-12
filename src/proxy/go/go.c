@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@
 /*
  * Go Plugin phases
  * ================
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  1. FLBPluginRegister(context)
  *  2. Inside FLBPluginRegister, it needs to register it self using Fluent Bit API
@@ -110,7 +110,6 @@ int proxy_go_output_init(struct flb_plugin_proxy *proxy)
     if (ret <= 0) {
         flb_error("[go proxy]: plugin '%s' failed to initialize",
                   plugin->name);
-        flb_free(plugin);
         return -1;
     }
 
@@ -145,23 +144,29 @@ int proxy_go_output_flush(struct flb_plugin_proxy_context *ctx,
     return ret;
 }
 
-int proxy_go_output_destroy(void *data)
+int proxy_go_output_destroy(struct flb_plugin_proxy_context *ctx)
 {
     int ret = 0;
     struct flbgo_output_plugin *plugin;
 
-    plugin = (struct flbgo_output_plugin *) data;
+    plugin = (struct flbgo_output_plugin *) ctx->proxy->data;
     flb_debug("[GO] running exit callback");
 
     if (plugin->cb_exit_ctx) {
-        ret = plugin->cb_exit_ctx(plugin->context->remote_context);
+        ret = plugin->cb_exit_ctx(ctx->remote_context);
     }
     else if (plugin->cb_exit) {
         ret = plugin->cb_exit();
     }
+    return ret;
+}
+
+void proxy_go_output_unregister(void *data) {
+    struct flbgo_output_plugin *plugin;
+
+    plugin = (struct flbgo_output_plugin *) data;
     flb_free(plugin->name);
     flb_free(plugin);
-    return ret;
 }
 
 int proxy_go_input_register(struct flb_plugin_proxy *proxy,
@@ -249,21 +254,35 @@ int proxy_go_input_cleanup(struct flb_plugin_proxy *ctx,
     if (plugin->cb_cleanup) {
         ret = plugin->cb_cleanup(allocated_data);
     }
+    else {
+        /* If cleanup callback is not registered, we need to cleanup
+         * allocated memory on fluent-bit side. */
+        if (allocated_data != NULL) {
+            free(allocated_data);
+        }
+    }
 
     return ret;
 }
 
-int proxy_go_input_destroy(void *data)
+int proxy_go_input_destroy(struct flb_plugin_input_proxy_context *ctx)
 {
     int ret = 0;
     struct flbgo_input_plugin *plugin;
 
-    plugin = (struct flbgo_input_plugin *) data;
+    plugin = (struct flbgo_input_plugin *) ctx->proxy->data;
     flb_debug("[GO] running exit callback");
 
-    ret = plugin->cb_exit();
+    if (plugin->cb_exit) {
+        ret = plugin->cb_exit();
+    }
+    return ret;
+}
 
+void proxy_go_input_unregister(void *data) {
+    struct flbgo_input_plugin *plugin;
+
+    plugin = (struct flbgo_input_plugin *) data;
     flb_free(plugin->name);
     flb_free(plugin);
-    return ret;
 }

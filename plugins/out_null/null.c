@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -108,7 +108,7 @@ static void cb_null_flush(struct flb_event_chunk *event_chunk,
 
 #ifdef FLB_HAVE_METRICS
     /* Check if the event type is metrics, just return */
-    if (event_chunk->type == FLB_EVENT_TYPE_METRIC) {
+    if (event_chunk->type == FLB_EVENT_TYPE_METRICS) {
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 #endif

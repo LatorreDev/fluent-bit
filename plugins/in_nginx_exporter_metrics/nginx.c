@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -73,16 +73,16 @@ static int nginx_parse_stub_status(flb_sds_t buf, struct nginx_status *status)
         goto error;
     }
 
-    rc = sscanf(lines[0], "Active connections: %lu \n", &status->active);
+    rc = sscanf(lines[0], "Active connections: %" PRIu64 " \n", &status->active);
     if (rc != 1) {
         goto error;
     }
-    rc = sscanf(lines[2], " %lu %lu %lu \n",
+    rc = sscanf(lines[2], " %" PRIu64 " %" PRIu64 " %" PRIu64 " \n",
            &status->accepts, &status->handled, &status->requests);
     if (rc != 3) {
         goto error;
     }
-    rc = sscanf(lines[3], "Reading: %lu Writing: %lu Waiting: %lu \n",
+    rc = sscanf(lines[3], "Reading: %" PRIu64 " Writing: %" PRIu64 " Waiting: %" PRIu64 " \n",
             &status->reading, &status->writing, &status->waiting);
     if (rc != 3) {
         goto error;
@@ -109,7 +109,7 @@ static int nginx_collect_stub_status(struct flb_input_instance *ins,
                          struct flb_config *config, void *in_context)
 {
     struct nginx_ctx *ctx = (struct nginx_ctx *)in_context;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     struct nginx_status status;
     flb_sds_t data;
@@ -117,7 +117,7 @@ static int nginx_collect_stub_status(struct flb_input_instance *ins,
     size_t b_sent;
     int ret = -1;
     int rc = -1;
-    uint64_t ts = cmt_time_now();
+    uint64_t ts = cfl_time_now();
 
 
     u_conn = flb_upstream_conn_get(ctx->upstream);
@@ -359,7 +359,7 @@ static ssize_t parse_payload_json(struct nginx_ctx *nginx, void *ctx, uint64_t t
 static int nginx_collect_plus_connections(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -423,7 +423,7 @@ conn_error:
 static int nginx_collect_plus_ssl(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -486,7 +486,7 @@ conn_error:
 static int nginx_collect_plus_http_requests(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1007,7 +1007,7 @@ static ssize_t parse_payload_json_table(struct nginx_ctx *ctx, int64_t ts,
 static int nginx_collect_plus_server_zones(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1070,7 +1070,7 @@ conn_error:
 static int nginx_collect_plus_location_zones(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1133,7 +1133,7 @@ conn_error:
 static int nginx_collect_plus_upstreams(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1196,7 +1196,7 @@ conn_error:
 static int nginx_collect_plus_stream_server_zones(struct flb_input_instance *ins,
                          struct flb_config *config, struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1260,7 +1260,7 @@ static int nginx_collect_plus_stream_upstreams(struct flb_input_instance *ins,
                                                struct flb_config *config,
                                                struct nginx_ctx *ctx, uint64_t ts)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1323,7 +1323,7 @@ static int nginx_plus_get_version(struct flb_input_instance *ins,
                                   struct flb_config *config,
                                   struct nginx_ctx *ctx)
 {
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *client;
     char url[1024];
     size_t b_sent;
@@ -1433,7 +1433,7 @@ static int nginx_collect_plus(struct flb_input_instance *ins,
     struct nginx_ctx *ctx = (struct nginx_ctx *)in_context;
     int rc = -1;
     int ret = -1;
-    uint64_t ts = cmt_time_now();
+    uint64_t ts = cfl_time_now();
 
 
     version = nginx_plus_get_version(ins, config, in_context);
@@ -1505,6 +1505,7 @@ struct nginx_ctx *nginx_ctx_init(struct flb_input_instance *ins,
                                         struct flb_config *config)
 {
     int ret;
+    int upstream_flags;
     struct nginx_ctx *ctx;
     struct flb_upstream *upstream;
 
@@ -1538,10 +1539,19 @@ struct nginx_ctx *nginx_ctx_init(struct flb_input_instance *ins,
         return NULL;
     }
 
+    upstream_flags = FLB_IO_TCP;
+
+    if (ins->use_tls) {
+        upstream_flags |= FLB_IO_TLS;
+    }
+
     upstream = flb_upstream_create(config, ins->host.name, ins->host.port,
-                                   FLB_IO_TCP, NULL);
+                                   upstream_flags, ins->tls);
+
     if (!upstream) {
         flb_plg_error(ins, "upstream initialization error");
+        cmt_destroy(ctx->cmt);
+        flb_free(ctx);
         return NULL;
     }
     ctx->upstream = upstream;
@@ -1562,6 +1572,7 @@ static int nginx_collect(struct flb_input_instance *ins,
     FLB_INPUT_RETURN(rc);
 }
 
+static int nginx_ctx_destroy(struct nginx_ctx *ctx);
 /**
  * Callback function to initialize nginx metrics plugin
  *
@@ -1577,6 +1588,7 @@ static int nginx_init(struct flb_input_instance *ins,
     struct nginx_ctx *ctx = NULL;
     struct cmt_counter *c;
     struct cmt_gauge *g;
+    int ret = -1;
 
     /* Allocate space for the configuration */
     ctx = nginx_ctx_init(ins, config);
@@ -1596,7 +1608,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                        "Accepted client connections", 0, 
                                                        NULL);
         if (ctx->connections_accepted == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(ctx->connections_accepted);
 
@@ -1604,7 +1616,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                    "active", "active client connections", 
                                                    0, NULL);
         if (ctx->connections_active == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
 
         ctx->connections_handled = cmt_counter_create(ctx->cmt, "nginx", "connections",
@@ -1612,7 +1624,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                       "Handled client connections", 0, 
                                                       NULL);
         if (ctx->connections_handled == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(ctx->connections_handled);
 
@@ -1621,7 +1633,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                     "reading client connections",
                                                     0, NULL);
         if (ctx->connections_reading == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
 
         ctx->connections_writing = cmt_gauge_create(ctx->cmt, "nginx", "connections",
@@ -1629,7 +1641,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                     "writing client connections",
                                                     0, NULL);
         if (ctx->connections_writing == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
 
         ctx->connections_waiting = cmt_gauge_create(ctx->cmt, "nginx", "connections",
@@ -1637,14 +1649,14 @@ static int nginx_init(struct flb_input_instance *ins,
                                                     "waiting client connections",
                                                     0, NULL);
         if (ctx->connections_waiting == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
 
         ctx->connections_total = cmt_counter_create(ctx->cmt, "nginx", "http",
                                                     "requests_total", 
                                                     "Total http requests", 0, NULL);
         if (ctx->connections_total == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(ctx->connections_total);
 
@@ -1670,7 +1682,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "1 for a successful scrape and 0 for a failed "
                              "one", 0, NULL);
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->connection_up = g;
 
@@ -1679,7 +1691,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_connections->connections_accepted = c;
@@ -1690,7 +1702,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_connections->connections_dropped = c;
@@ -1700,7 +1712,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_connections->connections_active = c;
@@ -1710,7 +1722,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_connections->connections_idle = c;
@@ -1720,7 +1732,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_ssl->handshakes = c;
@@ -1730,7 +1742,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_ssl->handshakes_failed = c;
@@ -1740,7 +1752,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_ssl->session_reuses = c;
@@ -1750,7 +1762,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                                0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_http_requests->total = c;
@@ -1760,7 +1772,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Plus Total Connections",
                               0, NULL);
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->plus_http_requests->current = c;
@@ -1772,7 +1784,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone discarded",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->discarded = c;
@@ -1784,7 +1796,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone processing",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->processing = c;
@@ -1796,7 +1808,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone received",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->received = c;
@@ -1808,7 +1820,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone requests",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->requests = c;
@@ -1820,7 +1832,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone responses",
                                2, (char *[]){"server_zone", "code"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->responses = c;
@@ -1832,7 +1844,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone sent",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->server_zones->sent = c;
@@ -1844,7 +1856,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone discarded",
                                1, (char *[]){"location_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->location_zones->discarded = c;
@@ -1856,7 +1868,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone received",
                                1, (char *[]){"location_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->location_zones->received = c;
@@ -1868,7 +1880,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone requests",
                                1, (char *[]){"location_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->location_zones->requests = c;
@@ -1880,7 +1892,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone responses",
                                2, (char *[]){"location_zone", "code"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->location_zones->responses = c;
@@ -1892,7 +1904,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Server Zone sent",
                                1, (char *[]){"location_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->location_zones->sent = c;
@@ -1904,7 +1916,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Keepalives",
                              1, (char *[]){"upstream"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->keepalives = g;
 
@@ -1915,7 +1927,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Zombies",
                              1, (char *[]){"upstream"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->zombies = g;
 
@@ -1926,7 +1938,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Active",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->active = g;
 
@@ -1937,7 +1949,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Fails",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->upstreams->fails = c;
@@ -1949,7 +1961,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Header Time",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->header_time = g;
         
@@ -1960,7 +1972,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Limit",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->limit = g;
 
@@ -1971,7 +1983,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Received",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->upstreams->received = c;
@@ -1983,7 +1995,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Requests",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);                                            
         ctx->upstreams->requests = c;
@@ -1995,7 +2007,7 @@ static int nginx_init(struct flb_input_instance *ins,
                               "NGINX Upstream Responses",
                               3, (char *[]){"code", "upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->upstreams->responses = c;
@@ -2007,7 +2019,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Response Time",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->response_time = g;
 
@@ -2018,7 +2030,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Sent",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->upstreams->sent = c;
@@ -2030,7 +2042,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                                  "NGINX Upstream State",
                                                  2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->upstreams->state = g;
 
@@ -2041,7 +2053,7 @@ static int nginx_init(struct flb_input_instance *ins,
                               "NGINX Upstream Unavailable",
                               2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->upstreams->unavail = c;
@@ -2053,7 +2065,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Stream Server Zone connections",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->connections = c;
@@ -2065,7 +2077,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Stream Server Zone discarded",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->discarded = c;
@@ -2078,7 +2090,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "processing",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->processing = c;
@@ -2090,7 +2102,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Stream Server Zone received",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->received = c;
@@ -2102,7 +2114,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Stream Server Zone sent",
                                1, (char *[]){"server_zone"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->sent = c;
@@ -2114,7 +2126,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Stream Server Zone Sessions",
                                2, (char *[]){"server_zone", "code"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->streams->sessions = c;
@@ -2126,7 +2138,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Zombies",
                              1, (char *[]){"upstream"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->zombies = g;
 
@@ -2137,7 +2149,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Active",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->active = g;
 
@@ -2148,7 +2160,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Fails",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->stream_upstreams->fails = c;
@@ -2160,7 +2172,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Limit",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->limit = g;
 
@@ -2171,7 +2183,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Received",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->stream_upstreams->received = c;
@@ -2183,7 +2195,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Header Time",
                              2, (char *[]){"upstream", "server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->connect_time = g;
 
@@ -2194,7 +2206,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Header Time",
                              2, (char *[]){"upstream", "server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->first_byte_time = g;
 
@@ -2205,7 +2217,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Requests",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->stream_upstreams->connections = c;
@@ -2217,7 +2229,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream Response Time",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->response_time = g;
 
@@ -2228,7 +2240,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Sent",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->stream_upstreams->sent = c;
@@ -2240,7 +2252,7 @@ static int nginx_init(struct flb_input_instance *ins,
                              "NGINX Upstream State",
                              2, (char *[]){"upstream","server"});
         if (g == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         ctx->stream_upstreams->state = g;
 
@@ -2251,7 +2263,7 @@ static int nginx_init(struct flb_input_instance *ins,
                                "NGINX Upstream Unavailable",
                                2, (char *[]){"upstream","server"});
         if (c == NULL) {
-            return -1;
+            goto nginx_init_end;
         }
         cmt_counter_allow_reset(c);
         ctx->stream_upstreams->unavail = c;
@@ -2261,7 +2273,13 @@ static int nginx_init(struct flb_input_instance *ins,
                                                 nginx_collect,
                                                 1,
                                                 0, config);
-    return 0;
+    ret = 0;
+ nginx_init_end:
+    if (ret < 0) {
+        nginx_ctx_destroy(ctx);
+    }
+
+    return ret;
 }
 
 
@@ -2342,5 +2360,4 @@ struct flb_input_plugin in_nginx_exporter_metrics_plugin = {
     .cb_exit      = nginx_exit,
     .config_map   = config_map,
     .flags        = FLB_INPUT_NET|FLB_INPUT_CORO,
-    .event_type   = FLB_INPUT_METRICS
 };

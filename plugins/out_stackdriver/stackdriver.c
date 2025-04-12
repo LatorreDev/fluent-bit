@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/flb_record_accessor.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_gzip.h>
 
 #include <msgpack.h>
 
@@ -46,6 +48,7 @@
 
 pthread_key_t oauth2_type;
 pthread_key_t oauth2_token;
+pthread_key_t oauth2_token_expires;
 
 static void oauth2_cache_exit(void *ptr)
 {
@@ -54,17 +57,26 @@ static void oauth2_cache_exit(void *ptr)
     }
 }
 
+static void oauth2_cache_free_expiration(void *ptr)
+{
+    if (ptr) {
+        flb_free(ptr);
+    }
+}
+
 static void oauth2_cache_init()
 {
     /* oauth2 pthread key */
     pthread_key_create(&oauth2_type, oauth2_cache_exit);
     pthread_key_create(&oauth2_token, oauth2_cache_exit);
+    pthread_key_create(&oauth2_token_expires, oauth2_cache_free_expiration);
 }
 
 /* Set oauth2 type and token in pthread keys */
-static void oauth2_cache_set(char *type, char *token)
+static void oauth2_cache_set(char *type, char *token, time_t expires)
 {
     flb_sds_t tmp;
+    time_t *tmp_expires;
 
     /* oauth2 type */
     tmp = pthread_getspecific(oauth2_type);
@@ -81,6 +93,29 @@ static void oauth2_cache_set(char *type, char *token)
     }
     tmp = flb_sds_create(token);
     pthread_setspecific(oauth2_token, tmp);
+
+    /* oauth2 access token expiration */
+    tmp_expires = pthread_getspecific(oauth2_token_expires);
+    if (tmp_expires) {
+        flb_free(tmp_expires);
+    }
+    tmp_expires = flb_calloc(1, sizeof(time_t));
+    if (!tmp_expires) {
+        flb_errno();
+        return;
+    }
+    *tmp_expires = expires;
+    pthread_setspecific(oauth2_token_expires, tmp_expires);
+}
+
+/* By using pthread keys cached values, compose the authorizatoin token */
+static time_t oauth2_cache_get_expiration()
+{
+    time_t *expires = pthread_getspecific(oauth2_token_expires);
+    if (expires) {
+        return *expires;
+    }
+    return 0;
 }
 
 /* By using pthread keys cached values, compose the authorizatoin token */
@@ -321,6 +356,8 @@ static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
 {
     int ret = 0;
     flb_sds_t output = NULL;
+    time_t cached_expiration = 0;
+    time_t current_timestamp = 0;
 
     ret = pthread_mutex_trylock(&ctx->token_mutex);
     if (ret == EBUSY) {
@@ -331,9 +368,23 @@ static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
          * If the routine fails it will return NULL and the caller will just
          * issue a FLB_RETRY.
          */
-        return oauth2_cache_to_token();
+        output = oauth2_cache_to_token();
+        cached_expiration = oauth2_cache_get_expiration();
+        current_timestamp = time(NULL);
+
+        if (current_timestamp < cached_expiration) {
+            return output;
+        } else {
+            /*
+             * Cached token is expired. Wait on lock to use up-to-date token
+             * by either waiting for it to be refreshed or refresh it ourselves.
+             */
+            flb_plg_info(ctx->ins, "Cached token is expired. Waiting on lock.");
+            ret = pthread_mutex_lock(&ctx->token_mutex);
+        }
     }
-    else if (ret != 0) {
+
+    if (ret != 0) {
         flb_plg_error(ctx->ins, "error locking mutex");
         return NULL;
     }
@@ -345,7 +396,7 @@ static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
     /* Copy string to prevent race conditions (get_oauth2 can free the string) */
     if (ret == 0) {
         /* Update pthread keys cached values */
-        oauth2_cache_set(ctx->o->token_type, ctx->o->access_token);
+        oauth2_cache_set(ctx->o->token_type, ctx->o->access_token, ctx->o->expires);
 
         /* Compose outgoing buffer using cached values */
         output = oauth2_cache_to_token();
@@ -361,13 +412,6 @@ static flb_sds_t get_google_token(struct flb_stackdriver *ctx)
 
 
     return output;
-}
-
-static bool validate_msgpack_unpacked_data(msgpack_object root)
-{
-    return root.type == MSGPACK_OBJECT_ARRAY &&
-           root.via.array.size == 2 &&
-           root.via.array.ptr[1].type == MSGPACK_OBJECT_MAP;
 }
 
 void replace_prefix_dot(flb_sds_t s, int tag_prefix_len)
@@ -394,31 +438,48 @@ void replace_prefix_dot(flb_sds_t s, int tag_prefix_len)
         }
     }
 }
+static int extract_msgpack_obj_from_msgpack_map(msgpack_object_map *root,
+                                                char *name, int size,
+                                                msgpack_object_type object_type,
+                                                msgpack_object *val)
+{
+    int i;
+    msgpack_object key;
+
+    if (root == NULL) {
+      return -1;
+    }
+    for (i = 0; i < root->size; i++) {
+        key = root->ptr[i].key;
+        if (key.type != MSGPACK_OBJECT_STR) {
+            continue;
+        }
+        if (key.via.str.size == size
+            && strncmp(key.via.str.ptr, name, size) == 0) {
+            *val = root->ptr[i].val;
+            if (val->type != object_type) {
+                return -1;
+            }
+            return 0;
+        }
+    }
+    return -1;
+}
+
 
 static flb_sds_t get_str_value_from_msgpack_map(msgpack_object_map map,
                                                 const char *key, int key_size)
 {
-    int i;
-    msgpack_object k;
+    int ret;
     msgpack_object v;
     flb_sds_t ptr = NULL;
 
-    for (i = 0; i < map.size; i++) {
-        k = map.ptr[i].key;
-        v = map.ptr[i].val;
-
-        if (k.type != MSGPACK_OBJECT_STR) {
-            continue;
-        }
-
-        if (k.via.str.size == key_size &&
-            strncmp(key, (char *) k.via.str.ptr, k.via.str.size) == 0) {
-            /* make sure to free it after use */
-            ptr =  flb_sds_create_len(v.via.str.ptr, v.via.str.size);
-            break;
-        }
+    /* convert msgpack_object_map to msgpack_object */
+    ret = extract_msgpack_obj_from_msgpack_map(&map, (char*) key, key_size,
+                                               MSGPACK_OBJECT_STR, &v);
+    if (ret == 0) {
+        ptr = flb_sds_create_len(v.via.str.ptr, v.via.str.size);
     }
-
     return ptr;
 }
 
@@ -443,21 +504,24 @@ static flb_sds_t get_str_value_from_msgpack_map(msgpack_object_map map,
 static int parse_monitored_resource(struct flb_stackdriver *ctx, const void *data, size_t bytes, msgpack_packer *mp_pck)
 {
     int ret = -1;
-    size_t off = 0;
     msgpack_object *obj;
-    msgpack_unpacked result;
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
-        if (result.data.via.array.size != 2) {
-            continue;
-        }
-        obj = &result.data.via.array.ptr[1];
-        if (obj->type != MSGPACK_OBJECT_MAP) {
-            continue;
-        }
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        obj = log_event.body;
+
         msgpack_object_kv *kv = obj->via.map.ptr;
         msgpack_object_kv *const kvend = obj->via.map.ptr + obj->via.map.size;
         for (; kv < kvend; ++kv) {
@@ -494,9 +558,10 @@ static int parse_monitored_resource(struct flb_stackdriver *ctx, const void *dat
                       msgpack_pack_str(mp_pck, q->val.via.str.size);
                       msgpack_pack_str_body(mp_pck, q->val.via.str.ptr, q->val.via.str.size);
                     }
-                    msgpack_unpacked_destroy(&result);
-                    ret = 0;
-                    return ret;
+
+                    flb_log_event_decoder_destroy(&log_decoder);
+
+                    return 0;
                   }
               }
             }
@@ -504,8 +569,10 @@ static int parse_monitored_resource(struct flb_stackdriver *ctx, const void *dat
         }
     }
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
+
     flb_plg_debug(ctx->ins, "[%s] not found in the payload", MONITORED_RESOURCE_KEY);
+
     return ret;
 }
 
@@ -566,23 +633,25 @@ static struct mk_list *parse_local_resource_id_to_list(char *local_resource_id, 
  */
 static int extract_local_resource_id(const void *data, size_t bytes,
                                      struct flb_stackdriver *ctx, const char *tag) {
-    msgpack_object root;
     msgpack_object_map map;
-    msgpack_unpacked result;
     flb_sds_t local_resource_id;
-    size_t off = 0;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    int ret;
 
-    msgpack_unpacked_init(&result);
-    if (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        root = result.data;
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-        if (!validate_msgpack_unpacked_data(root)) {
-            msgpack_unpacked_destroy(&result);
-            flb_plg_error(ctx->ins, "unexpected record format");
-            return -1;
-        }
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
 
-        map = root.via.array.ptr[1].via.map;
+        return -1;
+    }
+
+    if ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        map = log_event.body->via.map;
         local_resource_id = get_str_value_from_msgpack_map(map, LOCAL_RESOURCE_ID_KEY,
                                                            LEN_LOCAL_RESOURCE_ID_KEY);
 
@@ -599,16 +668,20 @@ static int extract_local_resource_id(const void *data, size_t bytes,
         }
 
         ctx->local_resource_id = flb_sds_create(local_resource_id);
+
+        flb_sds_destroy(local_resource_id);
+
+        ret = 0;
     }
     else {
-        msgpack_unpacked_destroy(&result);
         flb_plg_error(ctx->ins, "failed to unpack data");
-        return -1;
+
+        ret = -1;
     }
 
-    flb_sds_destroy(local_resource_id);
-    msgpack_unpacked_destroy(&result);
-    return 0;
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    return ret;
 }
 
 /*
@@ -954,10 +1027,10 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
     struct flb_kv *label_kv;
     struct flb_record_accessor *ra;
     struct flb_ra_value *rval;
-    msgpack_object root;
-    msgpack_unpacked result;
-    size_t off = 0;
     int len;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    int ret;
 
     if (ctx->should_skip_resource_labels_api == FLB_TRUE) {
         return -1;
@@ -968,15 +1041,18 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
         return -1;
     }
 
-    msgpack_unpacked_init(&result);
-    if (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        root = result.data;
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-        if (!validate_msgpack_unpacked_data(root)) {
-            msgpack_unpacked_destroy(&result);
-            flb_plg_error(ctx->ins, "unexpected record format");
-            return -1;
-        }
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return -1;
+    }
+
+    if ((ret = flb_log_event_decoder_next(
+                &log_decoder,
+                &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
 
         flb_mp_map_header_init(mh, mp_pck);
         mk_list_foreach(head, &ctx->resource_labels_kvs) {
@@ -988,12 +1064,12 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
              */
             if (label_kv->val[0] == '$') {
                 ra = flb_ra_create(label_kv->val, FLB_TRUE);
-                rval = flb_ra_get_value_object(ra, root.via.array.ptr[1]);
+                rval = flb_ra_get_value_object(ra, *log_event.body);
 
                 if (rval != NULL && rval->o.type == MSGPACK_OBJECT_STR) {
                     flb_mp_map_header_append(mh);
                     msgpack_pack_str(mp_pck, flb_sds_len(label_kv->key));
-                    msgpack_pack_str_body(mp_pck, label_kv->key, 
+                    msgpack_pack_str_body(mp_pck, label_kv->key,
                         flb_sds_len(label_kv->key));
                     msgpack_pack_str(mp_pck, flb_sds_len(rval->val.string));
                     msgpack_pack_str_body(mp_pck, rval->val.string,
@@ -1007,7 +1083,7 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
             } else {
                 flb_mp_map_header_append(mh);
                 msgpack_pack_str(mp_pck, flb_sds_len(label_kv->key));
-                msgpack_pack_str_body(mp_pck, label_kv->key, 
+                msgpack_pack_str_body(mp_pck, label_kv->key,
                     flb_sds_len(label_kv->key));
                 msgpack_pack_str(mp_pck, flb_sds_len(label_kv->val));
                 msgpack_pack_str_body(mp_pck, label_kv->val,
@@ -1016,8 +1092,10 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
         }
     }
     else {
-        msgpack_unpacked_destroy(&result);
         flb_plg_error(ctx->ins, "failed to unpack data");
+
+        flb_log_event_decoder_destroy(&log_decoder);
+
         return -1;
     }
 
@@ -1029,8 +1107,9 @@ static int pack_resource_labels(struct flb_stackdriver *ctx,
     msgpack_pack_str_body(mp_pck,
                         ctx->project_id, flb_sds_len(ctx->project_id));
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
     flb_mp_map_header_end(mh);
+
     return 0;
 }
 
@@ -1148,6 +1227,10 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
     /* Set context */
     flb_output_set_context(ins, ctx);
 
+    if (ctx->test_log_entry_format) {
+        return 0;
+    }
+
     /* Network mode IPv6 */
     if (ins->host.ipv6 == FLB_TRUE) {
         io_flags |= FLB_IO_IPV6;
@@ -1160,7 +1243,7 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
     pthread_mutex_init(&ctx->token_mutex, NULL);
 
     /* Create Upstream context for Stackdriver Logging (no oauth2 service) */
-    ctx->u = flb_upstream_create_url(config, FLB_STD_WRITE_URL,
+    ctx->u = flb_upstream_create_url(config, ctx->cloud_logging_write_url,
                                      io_flags, ins->tls);
     ctx->metadata_u = flb_upstream_create_url(config, ctx->metadata_server,
                                               FLB_IO_TCP, NULL);
@@ -1183,7 +1266,7 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
     flb_output_upstream_set(ctx->u, ins);
 
     /* Metadata Upstream Sync flags */
-    ctx->metadata_u->flags &= ~FLB_IO_ASYNC;
+    flb_stream_disable_async_mode(&ctx->metadata_u->base);
 
     if (ins->test_mode == FLB_FALSE) {
         /* Retrieve oauth2 token */
@@ -1202,7 +1285,7 @@ static int cb_stackdriver_init(struct flb_output_instance *ins,
             return -1;
         }
 
-        if (ctx->resource_type != RESOURCE_TYPE_GENERIC_NODE 
+        if (ctx->resource_type != RESOURCE_TYPE_GENERIC_NODE
             && ctx->resource_type != RESOURCE_TYPE_GENERIC_TASK) {
             ret = gce_metadata_read_zone(ctx);
             if (ret == -1) {
@@ -1347,6 +1430,23 @@ static int get_severity_level(severity_t * s, const msgpack_object * o,
     return -1;
 }
 
+static int get_trace_sampled(int * trace_sampled_value, const msgpack_object * src_obj,
+                             const flb_sds_t key)
+{
+    msgpack_object tmp;
+    int ret = get_msgpack_obj(&tmp, src_obj, key, flb_sds_len(key), MSGPACK_OBJECT_BOOLEAN);
+
+    if (ret == 0 && tmp.via.boolean == true) {
+        *trace_sampled_value = FLB_TRUE;
+        return 0;
+    } else if (ret == 0 && tmp.via.boolean == false) {
+        *trace_sampled_value = FLB_FALSE;
+        return 0;
+    }
+
+    return -1;
+}
+
 static insert_id_status validate_insert_id(msgpack_object * insert_id_value,
                                            const msgpack_object * obj)
 {
@@ -1377,15 +1477,16 @@ static insert_id_status validate_insert_id(msgpack_object * insert_id_value,
     return ret;
 }
 
-static int pack_json_payload(int insert_id_extracted,
-                             int operation_extracted, int operation_extra_size,
-                             int source_location_extracted,
-                             int source_location_extra_size,
-                             int http_request_extracted,
-                             int http_request_extra_size,
-                             timestamp_status tms_status,
-                             msgpack_packer *mp_pck, msgpack_object *obj,
-                             struct flb_stackdriver *ctx)
+static int pack_payload(int insert_id_extracted,
+                        int operation_extracted,
+                        int operation_extra_size,
+                        int source_location_extracted,
+                        int source_location_extra_size,
+                        int http_request_extracted,
+                        int http_request_extra_size,
+                        timestamp_status tms_status,
+                        msgpack_packer *mp_pck, msgpack_object *obj,
+                        struct flb_stackdriver *ctx)
 {
     /* Specified fields include local_resource_id, operation, sourceLocation ... */
     int i, j;
@@ -1396,10 +1497,14 @@ static int pack_json_payload(int insert_id_extracted,
     int len;
     int len_to_be_removed;
     int key_not_found;
+    int text_payload_len = 0;
+    int is_string_text_payload = FLB_FALSE;
+    int write_to_textpayload_field = FLB_FALSE;
     flb_sds_t removed;
     flb_sds_t monitored_resource_key;
     flb_sds_t local_resource_id_key;
     flb_sds_t stream;
+    flb_sds_t text_payload = NULL;
     msgpack_object_kv *kv = obj->via.map.ptr;
     msgpack_object_kv *const kvend = obj->via.map.ptr + obj->via.map.size;
 
@@ -1414,9 +1519,12 @@ static int pack_json_payload(int insert_id_extracted,
     {
         monitored_resource_key,
         local_resource_id_key,
+        ctx->project_id_key,
         ctx->labels_key,
         ctx->severity_key,
         ctx->trace_key,
+        ctx->span_id_key,
+        ctx->trace_sampled_key,
         ctx->log_name_key,
         stream
         /* more special fields are required to be added, but, if this grows with more
@@ -1463,14 +1571,36 @@ static int pack_json_payload(int insert_id_extracted,
 
     new_map_size = map_size - to_remove;
 
-    ret = msgpack_pack_map(mp_pck, new_map_size);
-    if (ret < 0) {
-        goto error;
+    if (ctx->text_payload_key && get_string(&text_payload, obj, ctx->text_payload_key) == 0) {
+        is_string_text_payload = FLB_TRUE;
+    }
+
+    /* write to textPayload if text_payload_key is the only residual string field*/
+    if ((new_map_size == 1) && is_string_text_payload) {
+      write_to_textpayload_field = FLB_TRUE;
+    }
+
+    if (write_to_textpayload_field) {
+        msgpack_pack_str(mp_pck, 11);
+        msgpack_pack_str_body(mp_pck, "textPayload", 11);
+
+        text_payload_len = flb_sds_len(text_payload);
+        msgpack_pack_str(mp_pck, text_payload_len);
+        msgpack_pack_str_body(mp_pck, text_payload, text_payload_len);
+    } else {
+      /* jsonPayload */
+      msgpack_pack_str(mp_pck, 11);
+      msgpack_pack_str_body(mp_pck, "jsonPayload", 11);
+
+      ret = msgpack_pack_map(mp_pck, new_map_size);
+      if (ret < 0) {
+          goto error;
+      }
     }
 
     /* points back to the beginning of map */
     kv = obj->via.map.ptr;
-    for(; kv != kvend; ++kv	) {
+    for(; kv != kvend; ++kv) {
         key_not_found = 1;
 
         /* processing logging.googleapis.com/insertId */
@@ -1537,7 +1667,8 @@ static int pack_json_payload(int insert_id_extracted,
             }
         }
 
-        if (key_not_found) {
+        /* write residual log fields to jsonPayload */
+        if (key_not_found && !write_to_textpayload_field) {
             ret = msgpack_pack_object(mp_pck, kv->key);
             if (ret < 0) {
                 goto error;
@@ -1552,12 +1683,14 @@ static int pack_json_payload(int insert_id_extracted,
     flb_sds_destroy(monitored_resource_key);
     flb_sds_destroy(local_resource_id_key);
     flb_sds_destroy(stream);
+    flb_sds_destroy(text_payload);
     return 0;
 
     error:
         flb_sds_destroy(monitored_resource_key);
         flb_sds_destroy(local_resource_id_key);
         flb_sds_destroy(stream);
+        flb_sds_destroy(text_payload);
         return ret;
 }
 
@@ -1572,17 +1705,20 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
     /* The default value is 3: timestamp, jsonPayload, logName. */
     int entry_size = 3;
     size_t s;
-    size_t off = 0;
+    // size_t off = 0;
     char path[PATH_MAX];
     char time_formatted[255];
     const char *newtag;
     const char *new_log_name;
     msgpack_object *obj;
-    msgpack_unpacked result;
     msgpack_sbuffer mp_sbuf;
     msgpack_packer mp_pck;
     flb_sds_t out_buf;
     struct flb_mp_map_header mh;
+
+    /* Parameters for project_id_key */
+    int project_id_extracted = FLB_FALSE;
+    flb_sds_t project_id_key;
 
     /* Parameters for severity */
     int severity_extracted = FLB_FALSE;
@@ -1590,9 +1726,17 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
 
     /* Parameters for trace */
     int trace_extracted = FLB_FALSE;
-    flb_sds_t trace;
+    flb_sds_t trace = NULL;
     char stackdriver_trace[PATH_MAX];
     const char *new_trace;
+
+    /* Parameters for span id */
+    int span_id_extracted = FLB_FALSE;
+    flb_sds_t span_id;
+
+    /* Parameters for trace sampled */
+    int trace_sampled_extracted = FLB_FALSE;
+    int trace_sampled = FLB_FALSE;
 
     /* Parameters for log name */
     int log_name_extracted = FLB_FALSE;
@@ -1627,7 +1771,7 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
 
     /* Parameters for Timestamp */
     struct tm tm;
-    struct flb_time tms;
+    // struct flb_time tms;
     timestamp_status tms_status;
     /* Count number of records */
     array_size = total_records;
@@ -1636,27 +1780,40 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
     msgpack_object *payload_labels_ptr;
     int labels_size = 0;
 
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        return NULL;
+    }
+
     /*
      * Search each entry and validate insertId.
      * Reject the entry if insertId is invalid.
      * If all the entries are rejected, stop formatting.
      *
      */
-    off = 0;
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        flb_time_pop_from_msgpack(&tms, &result, &obj);
-
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         /* Extract insertId */
-        in_status = validate_insert_id(&insert_id_obj, obj);
+        in_status = validate_insert_id(&insert_id_obj, log_event.body);
+
         if (in_status == INSERTID_INVALID) {
             flb_plg_error(ctx->ins,
                           "Incorrect insertId received. InsertId should be non-empty string.");
             array_size -= 1;
         }
     }
-    msgpack_unpacked_destroy(&result);
 
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    /* Sounds like this should compare to -1 instead of zero */
     if (array_size == 0) {
         return NULL;
     }
@@ -1671,7 +1828,12 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
      * {"resource": {"type": "...", "labels": {...},
      *  "entries": []
      */
-    msgpack_pack_map(&mp_pck, 2);
+    msgpack_pack_map(&mp_pck, 3);
+
+    /* Set partialSuccess to true */
+    msgpack_pack_str(&mp_pck, 14);
+    msgpack_pack_str_body(&mp_pck, "partialSuccess", 14);
+    msgpack_pack_true(&mp_pck);
 
     msgpack_pack_str(&mp_pck, 8);
     msgpack_pack_str_body(&mp_pck, "resource", 8);
@@ -1690,7 +1852,7 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
     msgpack_pack_str_body(&mp_pck, "labels", 6);
 
     ret = pack_resource_labels(ctx, &mh, &mp_pck, data, bytes);
-    if (ret != 0) { 
+    if (ret != 0) {
         if (ctx->resource_type == RESOURCE_TYPE_K8S) {
             ret = extract_local_resource_id(data, bytes, ctx, tag);
             if (ret != 0) {
@@ -1946,7 +2108,7 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
                 */
 
                 ret = process_local_resource_id(ctx, tag, tag_len, K8S_POD);
-                if (ret != 0) {
+                if (ret == -1) {
                     flb_plg_error(ctx->ins, "fail to process local_resource_id from "
                                 "log entry for k8s_pod");
                     msgpack_sbuffer_destroy(&mp_sbuf);
@@ -2004,6 +2166,45 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
 
                 flb_mp_map_header_end(&mh);
             }
+            else if (strcmp(ctx->resource, K8S_CLUSTER) == 0) {
+                /* k8s_cluster resource has fields project_id, location, cluster_name
+                *
+                * There is no local_resource_id for k8s_cluster as we get all info
+                *      from plugin config
+                */
+
+                flb_mp_map_header_init(&mh, &mp_pck);
+
+                if (ctx->project_id) {
+                    flb_mp_map_header_append(&mh);
+                    msgpack_pack_str(&mp_pck, 10);
+                    msgpack_pack_str_body(&mp_pck, "project_id", 10);
+                    msgpack_pack_str(&mp_pck, flb_sds_len(ctx->project_id));
+                    msgpack_pack_str_body(&mp_pck,
+                                        ctx->project_id, flb_sds_len(ctx->project_id));
+                }
+
+                if (ctx->cluster_location) {
+                    flb_mp_map_header_append(&mh);
+                    msgpack_pack_str(&mp_pck, 8);
+                    msgpack_pack_str_body(&mp_pck, "location", 8);
+                    msgpack_pack_str(&mp_pck, flb_sds_len(ctx->cluster_location));
+                    msgpack_pack_str_body(&mp_pck,
+                                        ctx->cluster_location,
+                                        flb_sds_len(ctx->cluster_location));
+                }
+
+                if (ctx->cluster_name) {
+                    flb_mp_map_header_append(&mh);
+                    msgpack_pack_str(&mp_pck, 12);
+                    msgpack_pack_str_body(&mp_pck, "cluster_name", 12);
+                    msgpack_pack_str(&mp_pck, flb_sds_len(ctx->cluster_name));
+                    msgpack_pack_str_body(&mp_pck,
+                                        ctx->cluster_name, flb_sds_len(ctx->cluster_name));
+                }
+
+                flb_mp_map_header_end(&mh);
+            }
             else {
                 flb_plg_error(ctx->ins, "unsupported resource type '%s'",
                             ctx->resource);
@@ -2018,12 +2219,21 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
     /* Append entries */
     msgpack_pack_array(&mp_pck, array_size);
 
-    off = 0;
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        /* Get timestamp */
-        flb_time_pop_from_msgpack(&tms, &result, &obj);
-        tms_status = extract_timestamp(obj, &tms);
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+        msgpack_sbuffer_destroy(&mp_sbuf);
+
+        return NULL;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        obj = log_event.body;
+        tms_status = extract_timestamp(obj, &log_event.timestamp);
 
         /*
          * Pack entry
@@ -2034,6 +2244,8 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
          *  "logName": "...",
          *  "jsonPayload": {...},
          *  "timestamp": "...",
+         *  "spanId": "...",
+         *  "traceSampled": <true or false>,
          *  "trace": "..."
          * }
          */
@@ -2055,6 +2267,29 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
             entry_size += 1;
         }
 
+        /* Extract span id */
+        span_id_extracted = FLB_FALSE;
+        if (ctx->span_id_key
+            && get_string(&span_id, obj, ctx->span_id_key) == 0) {
+            span_id_extracted = FLB_TRUE;
+            entry_size += 1;
+        }
+
+        /* Extract trace sampled */
+        trace_sampled_extracted = FLB_FALSE;
+        if (ctx->trace_sampled_key
+            && get_trace_sampled(&trace_sampled, obj, ctx->trace_sampled_key) == 0) {
+            trace_sampled_extracted = FLB_TRUE;
+            entry_size += 1;
+        }
+
+        /* Extract project id */
+        project_id_extracted = FLB_FALSE;
+        if (ctx->project_id_key
+            && get_string(&project_id_key, obj, ctx->project_id_key) == 0) {
+            project_id_extracted = FLB_TRUE;
+        }
+
         /* Extract log name */
         log_name_extracted = FLB_FALSE;
         if (ctx->log_name_key
@@ -2072,9 +2307,22 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
             insert_id_extracted = FLB_FALSE;
         }
         else {
+            if (trace_extracted == FLB_TRUE) {
+                flb_sds_destroy(trace);
+            }
+
+            if (span_id_extracted == FLB_TRUE) {
+                flb_sds_destroy(span_id);
+            }
+
+            if (project_id_extracted == FLB_TRUE) {
+                flb_sds_destroy(project_id_key);
+            }
+
             if (log_name_extracted == FLB_TRUE) {
                 flb_sds_destroy(log_name);
             }
+
             continue;
         }
 
@@ -2110,7 +2358,7 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
         /* Extract httpRequest */
         init_http_request(&http_request);
         http_request_extra_size = 0;
-        http_request_extracted = extract_http_request(&http_request, 
+        http_request_extracted = extract_http_request(&http_request,
                                                       ctx->http_request_key,
                                                       ctx->http_request_key_size,
                                                       obj, &http_request_extra_size);
@@ -2125,8 +2373,28 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
             flb_plg_error(ctx->ins, "the type of payload labels should be map");
             flb_sds_destroy(operation_id);
             flb_sds_destroy(operation_producer);
-            msgpack_unpacked_destroy(&result);
+            flb_sds_destroy(source_location_file);
+            flb_sds_destroy(source_location_function);
+
+            if (trace_extracted == FLB_TRUE) {
+                flb_sds_destroy(trace);
+            }
+
+            if (span_id_extracted == FLB_TRUE) {
+                flb_sds_destroy(span_id);
+            }
+
+            if (project_id_extracted == FLB_TRUE) {
+                flb_sds_destroy(project_id_key);
+            }
+
+            if (log_name_extracted == FLB_TRUE) {
+                flb_sds_destroy(log_name);
+            }
+
+            flb_log_event_decoder_destroy(&log_decoder);
             msgpack_sbuffer_destroy(&mp_sbuf);
+
             return NULL;
         }
 
@@ -2170,6 +2438,26 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
             flb_sds_destroy(trace);
         }
 
+        /* Add spanId field into the log entry */
+        if (span_id_extracted == FLB_TRUE) {
+            msgpack_pack_str_with_body(&mp_pck, "spanId", 6);
+            len = flb_sds_len(span_id);
+            msgpack_pack_str_with_body(&mp_pck, span_id, len);
+            flb_sds_destroy(span_id);
+        }
+
+        /* Add traceSampled field into the log entry */
+        if (trace_sampled_extracted == FLB_TRUE) {
+            msgpack_pack_str_with_body(&mp_pck, "traceSampled", 12);
+
+            if (trace_sampled == FLB_TRUE) {
+                msgpack_pack_true(&mp_pck);
+            } else {
+                msgpack_pack_false(&mp_pck);
+            }
+
+        }
+
         /* Add insertId field into the log entry */
         if (insert_id_extracted == FLB_TRUE) {
             msgpack_pack_str(&mp_pck, 8);
@@ -2208,17 +2496,16 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
         flb_sds_destroy(source_location_function);
         destroy_http_request(&http_request);
 
-        /* jsonPayload */
-        msgpack_pack_str(&mp_pck, 11);
-        msgpack_pack_str_body(&mp_pck, "jsonPayload", 11);
-        pack_json_payload(insert_id_extracted,
-                          operation_extracted, operation_extra_size,
-                          source_location_extracted,
-                          source_location_extra_size,
-                          http_request_extracted,
-                          http_request_extra_size,
-                          tms_status,
-                          &mp_pck, obj, ctx);
+        /* both textPayload and jsonPayload are supported */
+        pack_payload(insert_id_extracted,
+                     operation_extracted,
+                     operation_extra_size,
+                     source_location_extracted,
+                     source_location_extra_size,
+                     http_request_extracted,
+                     http_request_extra_size,
+                     tms_status,
+                     &mp_pck, obj, ctx);
 
         /* avoid modifying the original tag */
         newtag = tag;
@@ -2240,10 +2527,16 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
             new_log_name = log_name;
         }
 
-        /* logName */
-        len = snprintf(path, sizeof(path) - 1,
+        if (project_id_extracted == FLB_TRUE) {
+            len = snprintf(path, sizeof(path) - 1,
+                       "projects/%s/logs/%s", project_id_key, new_log_name);
+            flb_sds_destroy(project_id_key);
+        } else {
+            len = snprintf(path, sizeof(path) - 1,
                        "projects/%s/logs/%s", ctx->export_to_project_id, new_log_name);
+        }
 
+        /* logName */
         if (log_name_extracted == FLB_TRUE) {
             flb_sds_destroy(log_name);
         }
@@ -2268,17 +2561,19 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
          * use the default tms(current time).
          */
 
-        gmtime_r(&tms.tm.tv_sec, &tm);
+        gmtime_r(&log_event.timestamp.tm.tv_sec, &tm);
         s = strftime(time_formatted, sizeof(time_formatted) - 1,
                         FLB_STD_TIME_FMT, &tm);
         len = snprintf(time_formatted + s, sizeof(time_formatted) - 1 - s,
-                        ".%09" PRIu64 "Z", (uint64_t) tms.tm.tv_nsec);
+                       ".%09" PRIu64 "Z",
+                       (uint64_t) log_event.timestamp.tm.tv_nsec);
         s += len;
 
         msgpack_pack_str(&mp_pck, s);
         msgpack_pack_str_body(&mp_pck, time_formatted, s);
-
     }
+
+    flb_log_event_decoder_destroy(&log_decoder);
 
     /* Convert from msgpack to JSON */
     out_buf = flb_msgpack_raw_to_json_sds(mp_sbuf.data, mp_sbuf.size);
@@ -2286,7 +2581,6 @@ static flb_sds_t stackdriver_format(struct flb_stackdriver *ctx,
 
     if (!out_buf) {
         flb_plg_error(ctx->ins, "error formatting JSON payload");
-        msgpack_unpacked_destroy(&result);
         return NULL;
     }
 
@@ -2297,6 +2591,7 @@ static int stackdriver_format_test(struct flb_config *config,
                                    struct flb_input_instance *ins,
                                    void *plugin_context,
                                    void *flush_ctx,
+                                   int event_type,
                                    const char *tag, int tag_len,
                                    const void *data, size_t bytes,
                                    void **out_data, size_t *out_size)
@@ -2320,29 +2615,234 @@ static int stackdriver_format_test(struct flb_config *config,
     return 0;
 
 }
-
 #ifdef FLB_HAVE_METRICS
-static void update_http_metrics(struct flb_stackdriver *ctx,
-                                struct flb_event_chunk *event_chunk,
+static void add_record_metrics(struct flb_stackdriver* ctx,
+                               uint64_t ts,
+                               int val,
+                               int response_code,
+                               int grpc_code)
+{
+  char grpc_code_label[32];
+  char response_code_label[32];
+  char* name = (char*) flb_output_name(ctx->ins);
+  /* convert status to string format */
+  snprintf(response_code_label, sizeof(response_code_label) - 1, "%i",
+           response_code);
+  /* convert grpc_code to string format */
+  snprintf(grpc_code_label, sizeof(grpc_code_label) - 1, "%i", grpc_code);
+
+  /* processed records total */
+  cmt_counter_add(ctx->cmt_proc_records_total, ts, val, 3,
+                  (char* []) {grpc_code_label, response_code_label, name});
+}
+
+static void update_http_metrics(struct flb_stackdriver* ctx,
+                                struct flb_event_chunk* event_chunk,
                                 uint64_t ts,
                                 int http_status)
 {
+    char response_code_label[32];
+
+    /* convert status to string format */
+    snprintf(response_code_label, sizeof(response_code_label) - 1, "%i",
+             http_status);
+    char* name = (char*) flb_output_name(ctx->ins);
+
+    cmt_counter_inc(ctx->cmt_requests_total, ts, 2,
+                    (char* []) {response_code_label, name});
+}
+
+static void update_retry_metric(struct flb_stackdriver *ctx,
+                                 struct flb_event_chunk *event_chunk,
+                                 uint64_t ts,
+                                 int http_status)
+{
     char tmp[32];
+    char *name = (char *) flb_output_name(ctx->ins);
 
     /* convert status to string format */
     snprintf(tmp, sizeof(tmp) - 1, "%i", http_status);
+    cmt_counter_add(ctx->cmt_retried_records_total,
+                    ts, event_chunk->total_events, 2, (char *[]) {tmp, name});
 
-    /* processed records total */
-    cmt_counter_add(ctx->cmt_proc_records_total, ts, event_chunk->total_events,
-                    1, (char *[]) {tmp});
-
-    /* HTTP status */
-    if (http_status != STACKDRIVER_NET_ERROR) {
-        cmt_counter_inc(ctx->cmt_requests_total, ts, 1, (char *[]) {tmp});
-    }
 }
 #endif
 
+static int parse_partial_success_response(struct flb_http_client* c,
+                                          struct flb_stackdriver* ctx,
+                                          uint64_t ts,
+                                          int total_events,
+                                          int* grpc_status_codes)
+{
+    int ret;
+    int root_type;
+    int i;
+    int log_entry_ret;
+    int code_ret;
+    char* buffer;
+    char at_type_str[PARTIAL_SUCCESS_GRPC_TYPE_SIZE];
+    size_t size;
+    size_t off = 0;
+    msgpack_unpacked result;
+    msgpack_object root;
+    msgpack_object error_map;
+    msgpack_object details_arr;
+    msgpack_object details_map;
+    msgpack_object logEntryErrors_map;
+    msgpack_object logEntryError_key;
+    msgpack_object logEntryError_map;
+    msgpack_object logEntryCode;
+    msgpack_object at_type;
+
+    if (c->resp.status != 400 && c->resp.status != 403) {
+        return -1;
+    }
+
+    ret = flb_pack_json(c->resp.payload, c->resp.payload_size,
+                        &buffer, &size, &root_type, NULL);
+    if (ret != 0) {
+        flb_plg_error(ctx->ins, "failed to parse json into msgpack: %s",
+                      c->resp.payload);
+        return -1;
+    }
+
+    msgpack_unpacked_init(&result);
+    ret = msgpack_unpack_next(&result, buffer, size, &off);
+    if (ret != MSGPACK_UNPACK_SUCCESS) {
+        if (c->resp.payload_size > 0) {
+            flb_plg_error(ctx->ins, "Cannot unpack response: %s",
+                          c->resp.payload);
+        }
+        else {
+            flb_plg_error(ctx->ins, "Cannot unpack response");
+        }
+        flb_free(buffer);
+        msgpack_unpacked_destroy(&result);
+        return -1;
+    }
+
+    root = result.data;
+    if (root.type != MSGPACK_OBJECT_MAP) {
+        flb_plg_error(ctx->ins, "response parsing failed, msgpack_type=%i",
+                      root.type);
+        flb_free(buffer);
+        msgpack_unpacked_destroy(&result);
+        return -1;
+    }
+/*  Sample error response
+{
+  "error": {
+    "code": 400,
+    "message": "Log entry with size 293.1K exceeds maximum size of 256.0K",
+    "status": "INVALID_ARGUMENT",
+    "details": [
+      {
+        "@type": "type.googleapis.com/google.logging.v2.WriteLogEntriesPartialErrors",
+        "logEntryErrors": {
+          "2": {
+            "code": 3,
+            "message": "Log entry with size 293.1K exceeds maximum size of 256.0K"
+          },
+          "4": {
+            "code": 3,
+            "message": "Log entry with size 293.1K exceeds maximum size of 256.0K"
+          }
+        }
+      }
+    ]
+  }
+}
+*/
+    ret = extract_msgpack_obj_from_msgpack_map(&root.via.map, "error", 5,
+                                               MSGPACK_OBJECT_MAP, &error_map);
+    if (ret == -1) {
+        flb_plg_debug(ctx->ins, "response does not have key: \"error\"");
+        flb_free(buffer);
+        msgpack_unpacked_destroy(&result);
+        return -1;
+    }
+
+    ret = extract_msgpack_obj_from_msgpack_map(&error_map.via.map, "details", 7,
+                                               MSGPACK_OBJECT_ARRAY,
+                                               &details_arr);
+    if (ret == -1) {
+        flb_plg_debug(ctx->ins, "response does not have key: \"details\"");
+        flb_free(buffer);
+        msgpack_unpacked_destroy(&result);
+        return -1;
+    }
+    for (i = 0; i < details_arr.via.array.size; i++) {
+        details_map = details_arr.via.array.ptr[i];
+        if (details_map.type != MSGPACK_OBJECT_MAP) {
+            continue;
+        }
+
+
+        ret = extract_msgpack_obj_from_msgpack_map(&details_map.via.map,
+                                                   "@type", 5,
+                                                   MSGPACK_OBJECT_STR,
+                                                   &at_type);
+        strncpy(at_type_str, at_type.via.str.ptr,
+                PARTIAL_SUCCESS_GRPC_TYPE_SIZE);
+        if (ret != 0 ||
+            at_type.via.str.size != PARTIAL_SUCCESS_GRPC_TYPE_SIZE ||
+            strncmp(at_type_str, PARTIAL_SUCCESS_GRPC_TYPE,
+                           PARTIAL_SUCCESS_GRPC_TYPE_SIZE) != 0) {
+            continue;
+        }
+
+        ret = extract_msgpack_obj_from_msgpack_map(&details_map.via.map,
+                                                   "logEntryErrors", 14,
+                                                   MSGPACK_OBJECT_MAP,
+                                                   &logEntryErrors_map);
+        if (ret != 0) {
+            continue;
+        }
+
+        for (i = 0; i < logEntryErrors_map.via.map.size; i++) {
+            logEntryError_key = logEntryErrors_map.via.map.ptr[i].key;
+            if (logEntryError_key.type != MSGPACK_OBJECT_STR) {
+                continue;
+            }
+            log_entry_ret = extract_msgpack_obj_from_msgpack_map(
+                &logEntryErrors_map.via.map,
+                (char *) logEntryError_key.via.str.ptr,
+                logEntryError_key.via.str.size,
+                MSGPACK_OBJECT_MAP,
+                &logEntryError_map);
+
+            if (log_entry_ret != 0) {
+                continue;
+            }
+
+            code_ret = extract_msgpack_obj_from_msgpack_map(
+                &logEntryError_map.via.map,
+                "code",
+                4,
+                MSGPACK_OBJECT_POSITIVE_INTEGER,
+                &logEntryCode);
+
+            if (code_ret == 0) {
+                if (logEntryCode.via.i64 < 0
+                    || logEntryCode.via.i64 >= GRPC_STATUS_CODES_SIZE) {
+                    // TODO: fallback on a different data structure
+                    flb_plg_error(ctx->ins,
+                                  "internal error unexpected status code: %i",
+                                  (int) logEntryCode.via.i64);
+                    return -1;
+                }
+                grpc_status_codes[(int) logEntryCode.via.i64]++;
+#ifdef FLB_HAVE_METRICS
+                add_record_metrics(ctx, ts, 1, c->resp.status,
+                                   (int) logEntryCode.via.i64);
+#endif
+            }
+        }
+    }
+    flb_free(buffer);
+    msgpack_unpacked_destroy(&result);
+    return 0;
+}
 static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
                                  struct flb_output_flush *out_flush,
                                  struct flb_input_instance *i_ins,
@@ -2352,33 +2852,26 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
     (void) i_ins;
     (void) config;
     int ret;
+    int code;
+    int ret_partial_success;
     int ret_code = FLB_RETRY;
+    int grpc_status_counts[GRPC_STATUS_CODES_SIZE] = {0};
     size_t b_sent;
     flb_sds_t token;
     flb_sds_t payload_buf;
-    size_t payload_size;
+    void *compressed_payload_buffer = NULL;
+    size_t compressed_payload_size;
     struct flb_stackdriver *ctx = out_context;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *c;
+    int compressed = FLB_FALSE;
+    uint64_t write_entries_start = 0;
+    uint64_t write_entries_end = 0;
+    float write_entries_latency = 0.0;
 #ifdef FLB_HAVE_METRICS
     char *name = (char *) flb_output_name(ctx->ins);
-    uint64_t ts = cmt_time_now();
+    uint64_t ts = cfl_time_now();
 #endif
-
-    /* Get upstream connection */
-    u_conn = flb_upstream_conn_get(ctx->u);
-    if (!u_conn) {
-#ifdef FLB_HAVE_METRICS
-        cmt_counter_inc(ctx->cmt_failed_requests,
-                        ts, 1, (char *[]) {name});
-
-        /* OLD api */
-        flb_metrics_sum(FLB_STACKDRIVER_FAILED_REQUESTS, 1, ctx->ins->metrics);
-
-        update_http_metrics(ctx, event_chunk, ts, STACKDRIVER_NET_ERROR);
-#endif
-        FLB_OUTPUT_RETURN(FLB_RETRY);
-    }
 
     /* Reformat msgpack to stackdriver JSON payload */
     payload_buf = stackdriver_format(ctx,
@@ -2393,10 +2886,30 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
         /* OLD api */
         flb_metrics_sum(FLB_STACKDRIVER_FAILED_REQUESTS, 1, ctx->ins->metrics);
 #endif
-        flb_upstream_conn_release(u_conn);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
-    payload_size = flb_sds_len(payload_buf);
+
+    if (ctx->test_log_entry_format) {
+        printf("%s\n", payload_buf);
+        flb_sds_destroy(payload_buf);
+        FLB_OUTPUT_RETURN(FLB_OK);
+    }
+
+    /* Get upstream connection */
+    u_conn = flb_upstream_conn_get(ctx->u);
+    if (!u_conn) {
+#ifdef FLB_HAVE_METRICS
+        cmt_counter_inc(ctx->cmt_failed_requests,
+                        ts, 1, (char *[]) {name});
+
+        /* OLD api */
+        flb_metrics_sum(FLB_STACKDRIVER_FAILED_REQUESTS, 1, ctx->ins->metrics);
+
+        update_retry_metric(ctx, event_chunk, ts, STACKDRIVER_NET_ERROR);
+#endif
+        flb_sds_destroy(payload_buf);
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
 
     /* Get or renew Token */
     token = get_google_token(ctx);
@@ -2414,9 +2927,22 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
+    compressed_payload_buffer = payload_buf;
+    compressed_payload_size = flb_sds_len(payload_buf);
+    if (ctx->compress_gzip == FLB_TRUE) {
+        ret = flb_gzip_compress((void *) payload_buf, flb_sds_len(payload_buf),
+                                &compressed_payload_buffer, &compressed_payload_size);
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "cannot gzip payload, disabling compression");
+        } else {
+            compressed = FLB_TRUE;
+            flb_sds_destroy(payload_buf);
+        }
+    }
+
     /* Compose HTTP Client request */
     c = flb_http_client(u_conn, FLB_HTTP_POST, FLB_STD_WRITE_URI,
-                        payload_buf, payload_size, NULL, 0, NULL, 0);
+                        compressed_payload_buffer, compressed_payload_size, NULL, 0, NULL, 0);
 
     flb_http_buffer_size(c, 4192);
 
@@ -2431,17 +2957,23 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
 
     flb_http_add_header(c, "Content-Type", 12, "application/json", 16);
     flb_http_add_header(c, "Authorization", 13, token, flb_sds_len(token));
+    /* Content Encoding: gzip */
+    if (compressed == FLB_TRUE) {
+        flb_http_set_content_encoding_gzip(c);
+    }
+
+    write_entries_start = cfl_time_now();
 
     /* Send HTTP request */
     ret = flb_http_do(c, &b_sent);
+
+    write_entries_end = cfl_time_now();
+    write_entries_latency = (float)(write_entries_end - write_entries_start) / 1000000000.0;
 
     /* validate response */
     if (ret != 0) {
         flb_plg_warn(ctx->ins, "http_do=%i", ret);
         ret_code = FLB_RETRY;
-#ifdef FLB_HAVE_METRICS
-        update_http_metrics(ctx, event_chunk, ts, STACKDRIVER_NET_ERROR);
-#endif
     }
     else {
         /* The request was issued successfully, validate the 'error' field */
@@ -2449,50 +2981,93 @@ static void cb_stackdriver_flush(struct flb_event_chunk *event_chunk,
         if (c->resp.status == 200) {
             ret_code = FLB_OK;
         }
-        else if (c->resp.status >= 400 && c->resp.status < 500) {
-            ret_code = FLB_ERROR;
-            flb_plg_warn(ctx->ins, "error\n%s",
-                c->resp.payload);
-        }
         else {
-            if (c->resp.payload_size > 0) {
-                /* we got an error */
-                flb_plg_warn(ctx->ins, "error\n%s",
-                             c->resp.payload);
+#ifdef FLB_HAVE_METRICS
+          /* check partial success */
+          ret_partial_success =
+                parse_partial_success_response(c,
+                                               ctx,
+                                               ts,
+                                               (int) event_chunk->total_events,
+                                               grpc_status_counts);
+
+            int failed_records = 0;
+            if (ret_partial_success == 0) {
+              for (code = 0; code < GRPC_STATUS_CODES_SIZE; code++) {
+                if (grpc_status_counts[code] != 0) {
+                  failed_records += grpc_status_counts[code];
+                }
+              }
+              cmt_counter_add(ctx->ins->cmt_dropped_records, ts,
+                              failed_records, 1, (char* []) {name});
+              int successful_records =
+                  (int) event_chunk->total_events - failed_records;
+              if (successful_records != 0) {
+                add_record_metrics(ctx, ts, successful_records, 200, 0);
+              }
             }
             else {
-                flb_plg_debug(ctx->ins, "response\n%s",
-                              c->resp.payload);
+              add_record_metrics(ctx, ts, (int) event_chunk->total_events,
+                                 c->resp.status, -1);
+              cmt_counter_add(ctx->ins->cmt_dropped_records, ts,
+                              (int) event_chunk->total_events, 1,
+                              (char* []) {name});
+            }
+#endif
+          if (c->resp.status >= 400 && c->resp.status < 500) {
+            ret_code = FLB_ERROR;
+            flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s", event_chunk->tag,
+                         c->resp.payload);
+          }
+          else {
+            if (c->resp.payload_size > 0) {
+              /* we got an error */
+              flb_plg_warn(ctx->ins, "tag=%s error sending to Cloud Logging: %s", event_chunk->tag,
+                           c->resp.payload);
+            }
+            else {
+              flb_plg_debug(ctx->ins, "tag=%s response from Cloud Logging: %s", event_chunk->tag,
+                            c->resp.payload);
             }
             ret_code = FLB_RETRY;
+          }
         }
     }
 
     /* Update specific stackdriver metrics */
 #ifdef FLB_HAVE_METRICS
     if (ret_code == FLB_OK) {
-        cmt_counter_inc(ctx->cmt_successful_requests,
-                        ts, 1, (char *[]) {name});
+        cmt_counter_inc(ctx->cmt_successful_requests, ts, 1, (char *[]) {name});
+        if (write_entries_latency > 0.0) {
+          cmt_histogram_observe(ctx->cmt_write_entries_latency, ts, write_entries_latency, 1, (char *[]) {name});
+        }
+        add_record_metrics(ctx, ts, (int) event_chunk->total_events, 200, 0);
 
         /* OLD api */
         flb_metrics_sum(FLB_STACKDRIVER_SUCCESSFUL_REQUESTS, 1, ctx->ins->metrics);
     }
-    else {
-        cmt_counter_inc(ctx->cmt_failed_requests,
-                        ts, 1, (char *[]) {name});
+    else if (ret_code == FLB_ERROR) {
+        cmt_counter_inc(ctx->cmt_failed_requests, ts, 1, (char* []) {name});
 
         /* OLD api */
         flb_metrics_sum(FLB_STACKDRIVER_FAILED_REQUESTS, 1, ctx->ins->metrics);
     }
 
-    /* Update metrics counter by using labels/http status code */
-    if (ret == 0) {
-        update_http_metrics(ctx, event_chunk, ts, c->resp.status);
+    if (ret_code == FLB_RETRY) {
+        update_retry_metric(ctx, event_chunk, ts, c->resp.status);
     }
+
+    /* Update metrics counter by using labels/http status code */
+    update_http_metrics(ctx, event_chunk, ts, c->resp.status);
 #endif
 
     /* Cleanup */
-    flb_sds_destroy(payload_buf);
+    if (compressed == FLB_TRUE) {
+        flb_free(compressed_payload_buffer);
+    }
+    else {
+        flb_sds_destroy(payload_buf);
+    }
     flb_sds_destroy(token);
     flb_http_client_destroy(c);
     flb_upstream_conn_release(u_conn);
@@ -2541,6 +3116,11 @@ static struct flb_config_map config_map[] = {
       "Export to project id"
     },
     {
+      FLB_CONFIG_MAP_STR, "project_id_key", DEFAULT_PROJECT_ID_KEY,
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, project_id_key),
+      "Set the gcp project id key"
+    },
+    {
       FLB_CONFIG_MAP_STR, "resource", FLB_SDS_RESOURCE_TYPE,
       0, FLB_TRUE, offsetof(struct flb_stackdriver, resource),
       "Set the resource"
@@ -2553,12 +3133,22 @@ static struct flb_config_map config_map[] = {
     {
       FLB_CONFIG_MAP_BOOL, "autoformat_stackdriver_trace", "false",
       0, FLB_TRUE, offsetof(struct flb_stackdriver, autoformat_stackdriver_trace),
-      "Autoformat the stacrdriver trace"
+      "Autoformat the stackdriver trace"
     },
     {
       FLB_CONFIG_MAP_STR, "trace_key", DEFAULT_TRACE_KEY,
       0, FLB_TRUE, offsetof(struct flb_stackdriver, trace_key),
       "Set the trace key"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "span_id_key", DEFAULT_SPAN_ID_KEY,
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, span_id_key),
+      "Set the span id key"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "trace_sampled_key", DEFAULT_TRACE_SAMPLED_KEY,
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, trace_sampled_key),
+      "Set the trace sampled key"
     },
     {
       FLB_CONFIG_MAP_STR, "log_name_key", DEFAULT_LOG_NAME_KEY,
@@ -2606,6 +3196,11 @@ static struct flb_config_map config_map[] = {
       "Set the resource task id"
     },
     {
+      FLB_CONFIG_MAP_STR, "compress", NULL,
+      0, FLB_FALSE, 0,
+      "Set log payload compression method. Option available is 'gzip'"
+    },
+    {
       FLB_CONFIG_MAP_CLIST, "labels", NULL,
       0, FLB_TRUE, offsetof(struct flb_stackdriver, labels),
       "Set the labels"
@@ -2636,6 +3231,21 @@ static struct flb_config_map config_map[] = {
       0, FLB_TRUE, offsetof(struct flb_stackdriver, resource_labels),
       "Set the resource labels"
     },
+    {
+      FLB_CONFIG_MAP_STR, "text_payload_key", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, text_payload_key),
+      "Set key for extracting text payload"
+    },
+    {
+      FLB_CONFIG_MAP_BOOL, "test_log_entry_format", "false",
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, test_log_entry_format),
+      "Test log entry format"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "cloud_logging_base_url", (char *)NULL,
+      0, FLB_TRUE, offsetof(struct flb_stackdriver, cloud_logging_base_url),
+      "The base Cloud Logging API URL to use for the /v2/entries:write API request. Default: https://logging.googleapis.com"
+    },
     /* EOF */
     {0}
 };
@@ -2646,7 +3256,7 @@ struct flb_output_plugin out_stackdriver_plugin = {
     .cb_init      = cb_stackdriver_init,
     .cb_flush     = cb_stackdriver_flush,
     .cb_exit      = cb_stackdriver_exit,
-    .workers      = 2,
+    .workers      = 1,
     .config_map   = config_map,
 
     /* Test */

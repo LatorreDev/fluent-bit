@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ flb_sds_t flb_signv4_do(struct flb_http_client *c, int normalize_uri,
                         time_t t_now,
                         char *region, char *service,
                         int s3_mode,
+                        struct mk_list *unsigned_headers,  /* flb_slist */
                         struct flb_aws_provider *provider);
 
 #endif

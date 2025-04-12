@@ -2,7 +2,7 @@
 
 /*  Fluent Bit Demo
  *  ===============
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,8 @@
 #include <fluent-bit/flb_callback.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_downstream.h>
 #include <fluent-bit/tls/flb_tls.h>
 
 #include <signal.h>
@@ -48,6 +50,12 @@ struct flb_aws_error_reporter *error_reporter;
 
 /* thread initializator */
 static pthread_once_t flb_lib_once = PTHREAD_ONCE_INIT;
+
+/* reference to the last 'flb_lib_ctx' context started through flb_start() */
+FLB_TLS_DEFINE(flb_ctx_t, flb_lib_active_context);
+
+/* reference to the last 'flb_cf' context started through flb_start() */
+FLB_TLS_DEFINE(struct flb_cf, flb_lib_active_cf_context);
 
 #ifdef FLB_SYSTEM_WINDOWS
 static inline int flb_socket_init_win32(void)
@@ -117,7 +125,11 @@ void flb_init_env()
     flb_tls_init();
     flb_coro_init();
     flb_upstream_init();
+    flb_downstream_init();
     flb_output_prepare();
+
+    FLB_TLS_INIT(flb_lib_active_context);
+    FLB_TLS_INIT(flb_lib_active_cf_context);
 
     /* libraries */
     cmt_initialize();
@@ -193,7 +205,7 @@ flb_ctx_t *flb_create()
                                   ctx->event_channel);
     if (ret != 0) {
         flb_error("[lib] could not create notification channels");
-        flb_config_exit(ctx->config);
+        flb_stop(ctx);
         flb_destroy(ctx);
         return NULL;
     }
@@ -223,7 +235,7 @@ void flb_destroy(flb_ctx_t *ctx)
     mk_event_loop_destroy(ctx->event_loop);
 
     /* cfg->is_running is set to false when flb_engine_shutdown has been invoked (event loop) */
-    if(ctx->config) {
+    if (ctx->config) {
         if (ctx->config->is_running == FLB_TRUE) {
             flb_engine_shutdown(ctx->config);
         }
@@ -314,6 +326,86 @@ int flb_input_set(flb_ctx_t *ctx, int ffd, ...)
     }
 
     va_end(va);
+    return 0;
+}
+
+int flb_input_set_processor(flb_ctx_t *ctx, int ffd, struct flb_processor *proc)
+{
+    struct flb_input_instance *i_ins;
+
+    i_ins = in_instance_get(ctx, ffd);
+    if (!i_ins) {
+        return -1;
+    }
+
+    if (i_ins->processor) {
+        flb_processor_destroy(i_ins->processor);
+    }
+
+    i_ins->processor = proc;
+
+    return 0;
+}
+
+int flb_input_set_test(flb_ctx_t *ctx, int ffd, char *test_name,
+                       void (*in_callback) (void *, int, int, void *, size_t, void *),
+                       void *in_callback_data)
+{
+    struct flb_input_instance *i_ins;
+
+    i_ins = in_instance_get(ctx, ffd);
+    if (!i_ins) {
+        return -1;
+    }
+
+    /*
+     * Enabling a test, set the output instance in 'test' mode, so no real
+     * flush callback is invoked, only the desired implemented test.
+     */
+
+    /* Formatter test */
+    if (strcmp(test_name, "formatter") == 0) {
+        i_ins->test_mode = FLB_TRUE;
+        i_ins->test_formatter.rt_ctx = ctx;
+        i_ins->test_formatter.rt_ffd = ffd;
+        i_ins->test_formatter.rt_in_callback = in_callback;
+        i_ins->test_formatter.rt_data = in_callback_data;
+    }
+    else {
+        return -1;
+    }
+
+    return 0;
+}
+
+int flb_output_set_http_test(flb_ctx_t *ctx, int ffd, char *test_name,
+                             void (*out_response) (void *, int, int, void *, size_t, void *),
+                             void *out_callback_data)
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    /*
+     * Enabling a test, set the output instance in 'test' mode, so no real
+     * flush callback is invoked, only the desired implemented test.
+     */
+
+    /* Response test */
+    if (strcmp(test_name, "response") == 0) {
+        o_ins->test_mode = FLB_TRUE;
+        o_ins->test_response.rt_ctx = ctx;
+        o_ins->test_response.rt_ffd = ffd;
+        o_ins->test_response.rt_out_response = out_response;
+        o_ins->test_response.rt_data = out_callback_data;
+    }
+    else {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -453,6 +545,24 @@ int flb_output_set(flb_ctx_t *ctx, int ffd, ...)
     return 0;
 }
 
+int flb_output_set_processor(flb_ctx_t *ctx, int ffd, struct flb_processor *proc)
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    if (o_ins->processor) {
+        flb_processor_destroy(o_ins->processor);
+    }
+
+    o_ins->processor = proc;
+
+    return 0;
+}
+
 int flb_output_set_callback(flb_ctx_t *ctx, int ffd, char *name,
                             void (*cb)(char *, void *, void *))
 {
@@ -589,13 +699,82 @@ int flb_lib_free(void* data)
     return 0;
 }
 
+static int flb_input_run_formatter(flb_ctx_t *ctx, struct flb_input_instance *i_ins,
+                                   const void *data, size_t len)
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    struct flb_test_in_formatter *itf;
+
+    if (!i_ins) {
+        return -1;
+    }
+
+    itf = &i_ins->test_formatter;
+
+    /* Invoke the input plugin formatter test callback */
+    ret = itf->callback(ctx->config,
+                        i_ins,
+                        i_ins->context,
+                        data, len,
+                        &out_buf, &out_size);
+
+    /* Call the runtime test callback checker */
+    if (itf->rt_in_callback) {
+        itf->rt_in_callback(itf->rt_ctx,
+                            itf->rt_ffd,
+                            ret,
+                            out_buf, out_size,
+                            itf->rt_data);
+    }
+    else {
+        flb_free(out_buf);
+    }
+
+    return 0;
+}
+
+static int flb_output_run_response(flb_ctx_t *ctx, struct flb_output_instance *o_ins,
+                                   int status, const void *data, size_t len)
+{
+    int ret;
+    void *out_buf = NULL;
+    size_t out_size = 0;
+    struct flb_test_out_response *resp;
+
+    if (!o_ins) {
+        return -1;
+    }
+
+    resp = &o_ins->test_response;
+
+    /* Invoke the input plugin formatter test callback */
+    ret = resp->callback(ctx->config,
+                         o_ins->context,
+                         status, data, len,
+                         &out_buf, &out_size);
+
+    /* Call the runtime test callback checker */
+    if (resp->rt_out_response) {
+        resp->rt_out_response(resp->rt_ctx,
+                              resp->rt_ffd,
+                              ret,
+                              out_buf, out_size,
+                              resp->rt_data);
+    }
+    else {
+        flb_free(out_buf);
+    }
+
+    return 0;
+}
 
 /* Push some data into the Engine */
 int flb_lib_push(flb_ctx_t *ctx, int ffd, const void *data, size_t len)
 {
     int ret;
     struct flb_input_instance *i_ins;
-
 
     if (ctx->status == FLB_LIB_NONE || ctx->status == FLB_LIB_ERROR) {
         flb_error("[lib] cannot push data, engine is not running");
@@ -607,10 +786,39 @@ int flb_lib_push(flb_ctx_t *ctx, int ffd, const void *data, size_t len)
         return -1;
     }
 
-    ret = flb_pipe_w(i_ins->channel[1], data, len);
-    if (ret == -1) {
-        flb_errno();
+    /* If input's test_formatter is registered, priorize to run it. */
+    if (i_ins->test_formatter.callback != NULL) {
+        ret = flb_input_run_formatter(ctx, i_ins, data, len);
+    }
+    else {
+        ret = flb_pipe_w(i_ins->channel[1], data, len);
+        if (ret == -1) {
+            flb_pipe_error();
+            return -1;
+        }
+    }
+    return ret;
+}
+
+/* Emulate some data from the response */
+int flb_lib_response(flb_ctx_t *ctx, int ffd, int status, const void *data, size_t len)
+{
+    int ret;
+    struct flb_output_instance *o_ins;
+
+    if (ctx->status == FLB_LIB_NONE || ctx->status == FLB_LIB_ERROR) {
+        flb_error("[lib] cannot push data, engine is not running");
         return -1;
+    }
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    /* If input's test_formatter is registered, priorize to run it. */
+    if (o_ins->test_response.callback != NULL) {
+        ret = flb_output_run_response(ctx, o_ins, status, data, len);
     }
     return ret;
 }
@@ -622,6 +830,7 @@ static void flb_lib_worker(void *data)
     struct flb_config *config;
 
     config = ctx->config;
+    flb_context_set(ctx);
     mk_utils_worker_rename("flb-pipeline");
     ret = flb_engine_start(config);
     if (ret == -1) {
@@ -641,8 +850,7 @@ double flb_time_now()
     return flb_time_to_double(&t);
 }
 
-/* Start the engine */
-int flb_start(flb_ctx_t *ctx)
+int static do_start(flb_ctx_t *ctx)
 {
     int fd;
     int bytes;
@@ -654,6 +862,11 @@ int flb_start(flb_ctx_t *ctx)
 
     pthread_once(&flb_lib_once, flb_init_env);
 
+    flb_debug("[lib] context set: %p", ctx);
+
+    /* set context as the last active one */
+
+    /* spawn worker thread */
     config = ctx->config;
     ret = mk_utils_worker_spawn(flb_lib_worker, ctx, &tid);
     if (ret == -1) {
@@ -667,7 +880,9 @@ int flb_start(flb_ctx_t *ctx)
         fd = event->fd;
         bytes = flb_pipe_r(fd, &val, sizeof(uint64_t));
         if (bytes <= 0) {
+#if defined(FLB_SYSTEM_MACOS)
             pthread_cancel(tid);
+#endif
             pthread_join(tid, NULL);
             ctx->status = FLB_LIB_ERROR;
             return -1;
@@ -679,14 +894,40 @@ int flb_start(flb_ctx_t *ctx)
             break;
         }
         else if (val == FLB_ENGINE_FAILED) {
-            flb_error("[lib] backend failed");
+            flb_debug("[lib] backend failed");
+#if defined(FLB_SYSTEM_MACOS)
+            pthread_cancel(tid);
+#endif
             pthread_join(tid, NULL);
             ctx->status = FLB_LIB_ERROR;
             return -1;
         }
+        else {
+            flb_error("[lib] other error");
+        }
     }
 
     return 0;
+}
+
+/* Start the engine */
+int flb_start(flb_ctx_t *ctx)
+{
+    int ret;
+
+    ret = do_start(ctx);
+    if (ret == 0) {
+        /* set context as the last active one */
+        flb_context_set(ctx);
+    }
+
+    return ret;
+}
+
+/* Start the engine without setting the global context */
+int flb_start_trace(flb_ctx_t *ctx)
+{
+    return do_start(ctx);
 }
 
 int flb_loop(flb_ctx_t *ctx)
@@ -703,6 +944,8 @@ int flb_stop(flb_ctx_t *ctx)
     int ret;
     pthread_t tid;
 
+    flb_debug("[lib] ctx stop address: %p, config context=%p\n", ctx, ctx->config);
+
     tid = ctx->config->worker;
 
     if (ctx->status == FLB_LIB_NONE || ctx->status == FLB_LIB_ERROR) {
@@ -711,6 +954,9 @@ int flb_stop(flb_ctx_t *ctx)
          * the service exited for some reason (plugin action). Always
          * wait and double check that the child thread is not running.
          */
+#if defined(FLB_SYSTEM_MACOS)
+        pthread_cancel(tid);
+#endif
         pthread_join(tid, NULL);
         return 0;
     }
@@ -726,6 +972,9 @@ int flb_stop(flb_ctx_t *ctx)
     flb_debug("[lib] sending STOP signal to the engine");
 
     flb_engine_exit(ctx->config);
+#if defined(FLB_SYSTEM_MACOS)
+    pthread_cancel(tid);
+#endif
     ret = pthread_join(tid, NULL);
     if (ret != 0) {
         flb_errno();
@@ -733,4 +982,31 @@ int flb_stop(flb_ctx_t *ctx)
     flb_debug("[lib] Fluent Bit engine stopped");
 
     return ret;
+}
+
+
+void flb_context_set(flb_ctx_t *ctx)
+{
+    FLB_TLS_SET(flb_lib_active_context, ctx);
+}
+
+flb_ctx_t *flb_context_get()
+{
+    flb_ctx_t *ctx;
+
+    ctx = FLB_TLS_GET(flb_lib_active_context);
+    return ctx;
+}
+
+void flb_cf_context_set(struct flb_cf *cf)
+{
+    FLB_TLS_SET(flb_lib_active_cf_context, cf);
+}
+
+struct flb_cf *flb_cf_context_get()
+{
+    struct flb_cf *cf;
+
+    cf = FLB_TLS_GET(flb_lib_active_cf_context);
+    return cf;
 }

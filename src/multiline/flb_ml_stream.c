@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/multiline/flb_ml.h>
 #include <fluent-bit/multiline/flb_ml_rule.h>
-#include <xxhash.h>
+#include <cfl/cfl.h>
 
 static int ml_flush_stdout(struct flb_ml_parser *parser,
                            struct flb_ml_stream *mst,
@@ -73,6 +73,9 @@ static struct flb_ml_stream_group *stream_group_create(struct flb_ml_stream *mst
     }
 
     /* msgpack buffer */
+    msgpack_sbuffer_init(&group->mp_md_sbuf);
+    msgpack_packer_init(&group->mp_md_pck, &group->mp_md_sbuf, msgpack_sbuffer_write);
+
     msgpack_sbuffer_init(&group->mp_sbuf);
     msgpack_packer_init(&group->mp_pck, &group->mp_sbuf, msgpack_sbuffer_write);
 
@@ -135,7 +138,10 @@ static void stream_group_destroy(struct flb_ml_stream_group *group)
     if (group->buf) {
         flb_sds_destroy(group->buf);
     }
+
+    msgpack_sbuffer_destroy(&group->mp_md_sbuf);
     msgpack_sbuffer_destroy(&group->mp_sbuf);
+
     mk_list_del(&group->_head);
     flb_free(group);
 }
@@ -169,7 +175,8 @@ static int stream_group_init(struct flb_ml_stream *stream)
     return 0;
 }
 
-static struct flb_ml_stream *stream_create(uint64_t id,
+static struct flb_ml_stream *stream_create(struct flb_ml *ml,
+                                           uint64_t id,
                                            struct flb_ml_parser_ins *parser,
                                            int (*cb_flush) (struct flb_ml_parser *,
                                                             struct flb_ml_stream *,
@@ -186,6 +193,7 @@ static struct flb_ml_stream *stream_create(uint64_t id,
         flb_errno();
         return NULL;
     }
+    stream->ml = ml;
     stream->id = id;
     stream->parser = parser;
 
@@ -235,7 +243,7 @@ int flb_ml_stream_create(struct flb_ml *ml,
     }
 
     /* Set the stream id by creating a hash using the name */
-    id = XXH3_64bits(name, name_len);
+    id = cfl_hash_64bits(name, name_len);
 
     /* For every group and parser, create a stream for this stream_id/hash */
     mk_list_foreach(head, &ml->groups) {
@@ -249,11 +257,11 @@ int flb_ml_stream_create(struct flb_ml *ml,
             }
 
             /* Create the stream */
-            mst = stream_create(id, parser, cb_flush, cb_data);
+            mst = stream_create(ml, id, parser, cb_flush, cb_data);
             if (!mst) {
                 flb_error("[multiline] could not create stream_id=%" PRIu64
                           "for stream '%s' on parser '%s'",
-                          stream_id, name, parser->ml_parser->name);
+                          *stream_id, name, parser->ml_parser->name);
                 return -1;
             }
         }

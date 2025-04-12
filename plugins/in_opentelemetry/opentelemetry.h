@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,25 +25,37 @@
 #include <fluent-bit/flb_utils.h>
 
 #include <monkey/monkey.h>
+#include <fluent-bit/http_server/flb_http_server.h>
 
 #define HTTP_BUFFER_MAX_SIZE    "4M"
 #define HTTP_BUFFER_CHUNK_SIZE  "512K"
 
 struct flb_opentelemetry {
-    int server_fd;
     int successful_response_code;
     flb_sds_t listen;
     flb_sds_t tcp_port;
     const char *tag_key;
+    int raw_traces;
+    int  tag_from_uri;
+    flb_sds_t logs_metadata_key;
+    int profile_support_enabled;
+    int encode_profiles_as_log;
 
+    struct flb_input_instance *ins;
+
+    /* New gen HTTP server */
+    int enable_http2;
+    struct flb_http_server http_server;
+
+    /* Legacy HTTP server */
     size_t buffer_max_size;            /* Maximum buffer size */
     size_t buffer_chunk_size;          /* Chunk allocation size */
 
+    int collector_id;                  /* Listener collector id       */
+    struct flb_downstream *downstream; /* Client manager */
     struct mk_list connections;        /* linked list of connections */
-    struct mk_event_loop *evl;         /* Event loop context */
 
     struct mk_server *server;
-    struct flb_input_instance *ins;
 };
 
 

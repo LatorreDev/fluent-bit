@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,7 +43,6 @@ struct flb_in_tcp_config *tcp_config_init(struct flb_input_instance *ins)
     }
     ctx->ins = ins;
     ctx->format = FLB_TCP_FMT_JSON;
-    ctx->server_fd = -1;
 
     /* Load the config map */
     ret = flb_input_config_map_set(ins, (void *)ctx);
@@ -120,16 +119,36 @@ struct flb_in_tcp_config *tcp_config_init(struct flb_input_instance *ins)
         ctx->buffer_size  = (atoi(ctx->buffer_size_str) * 1024);
     }
 
+    ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ctx->log_encoder == NULL) {
+        flb_plg_error(ctx->ins, "could not initialize event encoder");
+        tcp_config_destroy(ctx);
+
+        ctx = NULL;
+    }
+
     return ctx;
 }
 
 int tcp_config_destroy(struct flb_in_tcp_config *ctx)
 {
+    if (ctx->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+    }
+
+    if (ctx->collector_id != -1) {
+        flb_input_collector_delete(ctx->collector_id, ctx->ins);
+
+        ctx->collector_id = -1;
+    }
+
+    if (ctx->downstream != NULL) {
+        flb_downstream_destroy(ctx->downstream);
+    }
+
     flb_sds_destroy(ctx->separator);
     flb_free(ctx->tcp_port);
-    if (ctx->server_fd > 0) {
-        flb_socket_close(ctx->server_fd);
-    }
     flb_free(ctx);
 
     return 0;

@@ -26,6 +26,9 @@ Approach for this tests is basing on filter_kubernetes tests
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_compat.h>
+#ifdef FLB_HAVE_UNICODE_ENCODER
+#include <fluent-bit/flb_unicode.h>
+#endif
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -37,6 +40,12 @@ Approach for this tests is basing on filter_kubernetes tests
 #define PATH_SEPARATOR "/"
 
 #define DPATH_COMMON       FLB_TESTS_DATA_PATH "/data/common"
+
+#ifdef _WIN32
+    #define TIME_EPSILON_MS 30
+#else
+    #define TIME_EPSILON_MS 10
+#endif
 
 struct test_tail_ctx {
     flb_ctx_t *flb;    /* Fluent Bit library context */
@@ -275,6 +284,61 @@ struct tail_file_lines {
   int lines_c;
 };
 
+void wait_with_timeout(uint32_t timeout_ms, struct tail_test_result *result, int nExpected)
+{
+    struct flb_time start_time;
+    struct flb_time end_time;
+    struct flb_time diff_time;
+    uint64_t elapsed_time_flb = 0;
+
+    flb_time_get(&start_time);
+
+    while (true) {
+        if (result->nMatched == nExpected) {
+            break;
+        }
+
+        flb_time_msleep(100);
+        flb_time_get(&end_time);
+        flb_time_diff(&end_time, &start_time, &diff_time);
+        elapsed_time_flb = flb_time_to_nanosec(&diff_time) / 1000000;
+
+        if (elapsed_time_flb > timeout_ms - TIME_EPSILON_MS) {
+            flb_warn("[timeout] elapsed_time: %ld", elapsed_time_flb);
+            // Reached timeout.
+            break;
+        }
+    }
+}
+
+void wait_num_with_timeout(uint32_t timeout_ms, int *output_num)
+{
+    struct flb_time start_time;
+    struct flb_time end_time;
+    struct flb_time diff_time;
+    uint64_t elapsed_time_flb = 0;
+
+    flb_time_get(&start_time);
+
+    while (true) {
+        *output_num = get_output_num();
+
+        if (*output_num > 0) {
+            break;
+        }
+
+        flb_time_msleep(100);
+        flb_time_get(&end_time);
+        flb_time_diff(&end_time, &start_time, &diff_time);
+        elapsed_time_flb = flb_time_to_nanosec(&diff_time) / 1000000;
+
+        if (elapsed_time_flb > timeout_ms) {
+            flb_warn("[timeout] elapsed_time: %ld", elapsed_time_flb);
+            /* Reached timeout. */
+            break;
+        }
+    }
+}
 
 static inline int64_t set_result(int64_t v)
 {
@@ -473,10 +537,13 @@ void do_test(char *system, const char *target, int tExpected, int nExpected, ...
     ret = flb_start(ctx);
     TEST_CHECK_(ret == 0, "starting engine");
 
-    /* Poll for up to 2 seconds or until we got a match */
+    /* Poll for up to 5 seconds or until we got a match */
     for (ret = 0; ret < tExpected && result.nMatched < nExpected; ret++) {
         usleep(1000);
     }
+
+    /* Wait until matching nExpected results */
+    wait_with_timeout(5000, &result, nExpected);
 
     TEST_CHECK(result.nMatched == nExpected);
     TEST_MSG("result.nMatched: %i\nnExpected: %i", result.nMatched, nExpected);
@@ -521,6 +588,136 @@ void flb_test_in_tail_dockermode_firstline_detection()
             "Docker_Mode_Parser", "docker_multiline",
             NULL);
 }
+
+#ifdef FLB_HAVE_UNICODE_ENCODER
+void do_test_unicode(char *system, const char *target, int nExpected, ...)
+{
+    int64_t ret;
+    flb_ctx_t    *ctx    = NULL;
+    int in_ffd;
+    int out_ffd;
+    va_list va;
+    char *key;
+    char *value;
+    char path[PATH_MAX];
+    int num;
+    int unused;
+
+    struct flb_lib_out_cb cb;
+
+    /* For UTF-16LE/BE encodings, there are test cases that include
+     * multibyte characters. We didn't fully support for escaping
+     * Unicode code points especially SIMD enabled situations.
+     * So, it's just counting for the consumed record(s) here.
+     */
+    cb.cb   = cb_count_msgpack;
+    cb.data = &unused;
+
+    ctx = flb_create();
+
+    ret = flb_service_set(ctx,
+                          "Log_Level", "error",
+                          NULL);
+    TEST_CHECK_(ret == 0, "setting service options");
+
+    in_ffd = flb_input(ctx, (char *) system, NULL);
+    TEST_CHECK(in_ffd >= 0);
+    TEST_CHECK(flb_input_set(ctx, in_ffd, "tag", "test", NULL) == 0);
+
+    /* Compose path based on target */
+    snprintf(path, sizeof(path) - 1, DPATH "/log/%s.log", target);
+    TEST_CHECK_(access(path, R_OK) == 0, "accessing log file: %s", path);
+
+    TEST_CHECK(flb_input_set(ctx, in_ffd,
+                             "path"          , path,
+                             "read_from_head", "true",
+                             NULL) == 0);
+
+    va_start(va, nExpected);
+    while ((key = va_arg(va, char *))) {
+        value = va_arg(va, char *);
+        TEST_CHECK(value != NULL);
+        TEST_CHECK(flb_input_set(ctx, in_ffd, key, value, NULL) == 0);
+    }
+    va_end(va);
+
+    out_ffd = flb_output(ctx, (char *) "lib", &cb);
+    TEST_CHECK(out_ffd >= 0);
+    TEST_CHECK(flb_output_set(ctx, out_ffd,
+                              "match", "test",
+                              "format", "json",
+                              NULL) == 0);
+
+    TEST_CHECK(flb_service_set(ctx, "Flush", "0.5",
+                                    "Grace", "1",
+                                    NULL) == 0);
+
+    /* Start test */
+    /* Start the engine */
+    ret = flb_start(ctx);
+    TEST_CHECK_(ret == 0, "starting engine");
+
+    /* /\* Poll for up to 5 seconds or until we got a match *\/ */
+    /* for (ret = 0; result.nMatched <= nExpected; ret++) { */
+    /*     usleep(1000); */
+    /* } */
+
+    /* waiting to flush */
+    wait_num_with_timeout(5000, &num);
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no output");
+    }
+
+    ret = flb_stop(ctx);
+    TEST_CHECK_(ret == 0, "stopping engine");
+
+    if (ctx) {
+        flb_destroy(ctx);
+    }
+}
+
+void flb_test_in_tail_utf16le_c()
+{
+    do_test_unicode("tail", "unicode_c", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+
+void flb_test_in_tail_utf16be_c()
+{
+    do_test_unicode("tail", "unicode_be_c", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+
+void flb_test_in_tail_utf16le_j()
+{
+    do_test_unicode("tail", "unicode_j", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+
+void flb_test_in_tail_utf16be_j()
+{
+    do_test_unicode("tail", "unicode_be_j", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+
+void flb_test_in_tail_utf16le_subdivision_flags()
+{
+    do_test_unicode("tail", "unicode_subdivision_flags", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+
+void flb_test_in_tail_utf16be_subdivision_flags()
+{
+    do_test_unicode("tail", "unicode_subdivision_flags_be", 1,
+                    "Unicode.Encoding", "auto",
+                    NULL);
+}
+#endif
 
 int write_long_lines(int fd) {
     ssize_t ret;
@@ -622,7 +819,7 @@ void flb_test_in_tail_skip_long_lines()
     ret = flb_start(ctx);
     TEST_CHECK_(ret == 0, "starting engine");
 
-    sleep(2);
+    wait_with_timeout(5000, &result, nExpected);
 
     TEST_CHECK(result.nMatched == nExpected);
     TEST_MSG("result.nMatched: %i\nnExpected: %i", result.nMatched, nExpected);
@@ -641,9 +838,9 @@ void flb_test_in_tail_skip_long_lines()
     unlink(path);
 }
 
-/* 
+/*
  * test case for https://github.com/fluent/fluent-bit/issues/3943
- * 
+ *
  * test to read the lines "CRLF + empty_line + LF"
  */
 void flb_test_in_tail_issue_3943()
@@ -705,7 +902,7 @@ void flb_test_in_tail_issue_3943()
     ret = flb_start(ctx);
     TEST_CHECK_(ret == 0, "starting engine");
 
-    sleep(2);
+    wait_with_timeout(3000, &result, nExpected);
 
     TEST_CHECK(result.nMatched == nExpected);
     TEST_MSG("result.nMatched: %i\nnExpected: %i", result.nMatched, nExpected);
@@ -748,7 +945,7 @@ void flb_test_in_tail_multiline_json_and_regex()
     ctx = flb_create();
 
     TEST_CHECK(flb_service_set(ctx, "Flush", "0.5",
-                                    "Grace", "1",
+                                    "Grace", "5",
                                     NULL) == 0);
 
     ret = flb_service_set(ctx,
@@ -792,6 +989,7 @@ void flb_test_in_tail_multiline_json_and_regex()
     for (ret = 0; ret < t_expected && result.nMatched < n_expected; ret++) {
         usleep(1000);
     }
+    wait_with_timeout(5000, &result, n_expected);
 
     TEST_CHECK(result.nMatched == n_expected);
     TEST_MSG("result.nMatched: %i\nnExpected: %i", result.nMatched, n_expected);
@@ -1108,6 +1306,75 @@ void flb_test_skip_empty_lines()
     test_tail_ctx_destroy(ctx);
 }
 
+void flb_test_skip_empty_lines_crlf()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"skip_empty_lines_crlf.log"};
+    char *empty_lines[] = {"\r\n", "\r\n"};
+    char *msg = "lalala";
+    int ret;
+    int num;
+    int i;
+
+    char *expected_strs[] = {msg};
+    struct str_list expected = {
+                                .size = sizeof(expected_strs)/sizeof(char*),
+                                .lists = &expected_strs[0],
+    };
+
+    clear_output_num();
+
+    cb_data.cb = cb_check_json_str_list;
+    cb_data.data = &expected;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "skip_empty_lines", "true",
+                        "Read_From_Head", "true",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         "format", "json",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg, strlen(msg));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    for (i=0; i<sizeof(empty_lines)/sizeof(char*); i++) {
+        ret = write_msg(ctx, empty_lines[i], strlen(empty_lines[i]));
+        if (!TEST_CHECK(ret > 0)) {
+            test_tail_ctx_destroy(ctx);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num == 1))  {
+        TEST_MSG("output error: expect=1 got=%d", num);
+    }
+
+    test_tail_ctx_destroy(ctx);
+}
+
 static int ignore_older(int expected, char *ignore_older)
 {
     struct flb_lib_out_cb cb_data;
@@ -1205,6 +1472,76 @@ void flb_test_ignore_older()
             exit(EXIT_FAILURE);
         }
     }
+}
+
+void flb_test_in_tail_ignore_active_older_files()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"source_file.log"};
+    char *path = "source_file.log";
+    char *msg = "TEST LINE";
+    const int expected = 1;
+    int ret;
+    int num;
+    int unused;
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        return;
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", path,
+                        "ignore_older", "2s",
+                        "read_from_head", "on",
+                        "ignore_active_older_files", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+
+    if (!TEST_CHECK(ret == 0)) {
+        test_tail_ctx_destroy(ctx);
+
+        return;
+    }
+
+    ret = write_msg(ctx, msg, strlen(msg));
+
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+
+        return;
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(6000);
+
+    ret = write_msg(ctx, msg, strlen(msg));
+
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+
+        return;
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(1500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num == expected))  {
+        TEST_MSG("output num error. expect=%d got=%d", expected, num);
+    }
+
+    test_tail_ctx_destroy(ctx);
 }
 
 void flb_test_inotify_watcher_false()
@@ -1509,6 +1846,341 @@ void flb_test_db()
     test_tail_ctx_destroy(ctx);
     unlink(db);
 }
+
+void flb_test_db_delete_stale_file()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *org_file[] = {"test_db.log", "test_db_stale.log"};
+    char *tmp_file[] = {"test_db.log"};
+    char *path = "test_db.log, test_db_stale.log";
+    char *move_file[] = {"test_db_stale.log", "test_db_stale_new.log"};
+    char *new_file[] = {"test_db.log", "test_db_stale_new.log"};
+    char *new_path = "test_db.log, test_db_stale_new.log";
+    char *db = "test_db.db";
+    char *msg_init = "hello world";
+    char *msg_end = "hello db end";
+    int i;
+    int ret;
+    int num;
+    int unused;
+
+    unlink(db);
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data,
+                               &org_file[0],
+                               sizeof(org_file)/sizeof(char *),
+                               FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", path,
+                        "read_from_head", "true",
+                        "db", db,
+                        "db.sync", "full",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg_init, strlen(msg_init));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no output");
+    }
+
+    if (ctx->fds != NULL) {
+        for (i=0; i<ctx->fd_num; i++) {
+            close(ctx->fds[i]);
+        }
+        flb_free(ctx->fds);
+    }
+    flb_stop(ctx->flb);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+
+    /* re-init to use db */
+    clear_output_num();
+
+    /*
+     * Changing the file name from 'test_db_stale.log' to
+     * 'test_db_stale_new.log.' In this scenario, it is assumed that the
+     * file was deleted after the FluentBit was terminated. However, since
+     * the FluentBit was shutdown, the inode remains in the database.
+     * The reason for renaming is to preserve the existing file for later use.
+     */
+    ret = rename(move_file[0], move_file[1]);
+    TEST_CHECK(ret == 0);
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data,
+                               &tmp_file[0],
+                               sizeof(tmp_file)/sizeof(char *),
+                               FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", path,
+                        "read_from_head", "true",
+                        "db", db,
+                        "db.sync", "full",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    /*
+     * Start the engine
+     * FluentBit will delete stale inodes.
+     */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    if (ctx->fds != NULL) {
+        for (i=0; i<ctx->fd_num; i++) {
+            close(ctx->fds[i]);
+        }
+        flb_free(ctx->fds);
+    }
+    flb_stop(ctx->flb);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+
+    /* re-init to use db */
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data,
+                               &new_file[0],
+                               sizeof(new_file)/sizeof(char *),
+                               FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", new_path,
+                        "read_from_head", "true",
+                        "db", db,
+                        "db.sync", "full",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    /*
+     * Start the engine
+     * 'test_db_stale_new.log.' is a new file.
+     * The inode of 'test_db_stale.log' was deleted previously.
+     * So, it reads from the beginning of the file.
+     */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    ret = write_msg(ctx, msg_end, strlen(msg_end));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num == 3))  {
+        /* 3 =
+         * test_db.log : "hello db end"
+         * test_db_stale.log : "msg_init" + "hello db end"
+         */
+        TEST_MSG("num error. expect=3 got=%d", num);
+    }
+
+    test_tail_ctx_destroy(ctx);
+    unlink(db);
+}
+
+void flb_test_db_compare_filename()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *org_file[] = {"test_db.log"};
+    char *moved_file[] = {"test_db_moved.log"};
+    char *db = "test_db.db";
+    char *msg_init = "hello world";
+    char *msg_moved = "hello world moved";
+    char *msg_end = "hello db end";
+    int i;
+    int ret;
+    int num;
+    int unused;
+
+    unlink(db);
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data,
+                               &org_file[0],
+                               sizeof(org_file)/sizeof(char *),
+                               FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", org_file[0],
+                        "read_from_head", "true",
+                        "db", db,
+                        "db.sync", "full",
+                        "db.compare_filename", "true",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set(ctx->flb, ctx->o_ffd,
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    /* Start the engine */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg_init, strlen(msg_init));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num > 0))  {
+        TEST_MSG("no output");
+    }
+
+    if (ctx->fds != NULL) {
+        for (i=0; i<ctx->fd_num; i++) {
+            close(ctx->fds[i]);
+        }
+        flb_free(ctx->fds);
+    }
+    flb_stop(ctx->flb);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+
+    /* re-init to use db */
+    clear_output_num();
+
+    /*
+     * Changing the file name from 'test_db.log' to 'test_db_moved.log.'
+     * In this scenario, it is assumed that the FluentBit has been terminated,
+     * and the file has been recreated with the same inode, with offsets equal
+     * to or greater than the previous file.
+     */
+    ret = rename(org_file[0], moved_file[0]);
+    TEST_CHECK(ret == 0);
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data,
+                               &moved_file[0],
+                               sizeof(moved_file)/sizeof(char *),
+                               FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", moved_file[0],
+                        "read_from_head", "true",
+                        "db", db,
+                        "db.sync", "full",
+                        "db.compare_filename", "true",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    /*
+     * Start the engine
+     * The file has been newly created, and due to the 'db.compare_filename'
+     * option being set to true, it compares filenames to consider it a new
+     * file even if the inode is the same. If the option is set to false,
+     * it can be assumed to be the same file as before.
+     */
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    ret = write_msg(ctx, msg_moved, strlen(msg_moved));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = write_msg(ctx, msg_end, strlen(msg_end));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    /* waiting to flush */
+    flb_time_msleep(500);
+
+    num = get_output_num();
+    if (!TEST_CHECK(num == 3))  {
+        /* 3 = msg_init + msg_moved + msg_end */
+        TEST_MSG("num error. expect=3 got=%d", num);
+    }
+
+    test_tail_ctx_destroy(ctx);
+    unlink(db);
+}
 #endif /* FLB_HAVE_SQLDB */
 
 /* Test list */
@@ -1521,7 +2193,9 @@ TEST_LIST = {
     {"exclude_path", flb_test_exclude_path},
     {"offset_key", flb_test_offset_key},
     {"skip_empty_lines", flb_test_skip_empty_lines},
+    {"skip_empty_lines_crlf", flb_test_skip_empty_lines_crlf},
     {"ignore_older", flb_test_ignore_older},
+    {"ignore_active_older_files", flb_test_in_tail_ignore_active_older_files},
 #ifdef FLB_HAVE_INOTIFY
     {"inotify_watcher_false", flb_test_inotify_watcher_false},
 #endif /* FLB_HAVE_INOTIFY */
@@ -1533,6 +2207,17 @@ TEST_LIST = {
 
 #ifdef FLB_HAVE_SQLDB
     {"db", flb_test_db},
+    {"db_delete_stale_file", flb_test_db_delete_stale_file},
+    {"db_compare_filename", flb_test_db_compare_filename},
+#endif
+
+#ifdef FLB_HAVE_UNICODE_ENCODER
+    {"utf16le_c", flb_test_in_tail_utf16le_c},
+    {"utf16be_c", flb_test_in_tail_utf16be_c},
+    {"utf16le_j", flb_test_in_tail_utf16le_j},
+    {"utf16be_j", flb_test_in_tail_utf16be_j},
+    {"utf16le_subdivision_flags", flb_test_in_tail_utf16le_subdivision_flags},
+    {"utf16be_subdivision_flags", flb_test_in_tail_utf16be_subdivision_flags},
 #endif
 
 #ifdef in_tail

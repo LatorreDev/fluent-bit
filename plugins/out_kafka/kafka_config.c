@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -51,7 +51,8 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     if (ret == -1) {
         flb_plg_error(ins, "unable to load configuration.");
         flb_free(ctx);
-        return -1;
+
+        return NULL;
     }
 
     /* rdkafka config context */
@@ -92,6 +93,9 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
             ctx->format = FLB_KAFKA_FMT_AVRO;
         }
 #endif
+        else if (strcasecmp(ctx->format_str, "raw") == 0) {
+            ctx->format = FLB_KAFKA_FMT_RAW;
+        }
     }
     else {
         ctx->format = FLB_KAFKA_FMT_JSON;
@@ -113,6 +117,14 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
         ctx->message_key_field_len = 0;
     }
 
+    /* Config: Log_Key */
+    if (ctx->raw_log_key) {
+        ctx->raw_log_key_len = strlen(ctx->raw_log_key);
+    }
+    else {
+        ctx->raw_log_key_len = 0;
+    }
+
     /* Config: Timestamp_Key */
     if (ctx->timestamp_key) {
         ctx->timestamp_key_len = strlen(ctx->timestamp_key);
@@ -123,6 +135,9 @@ struct flb_out_kafka *flb_out_kafka_create(struct flb_output_instance *ins,
     if (ctx->timestamp_format_str) {
         if (strcasecmp(ctx->timestamp_format_str, "iso8601") == 0) {
             ctx->timestamp_format = FLB_JSON_DATE_ISO8601;
+        }
+        else if (strcasecmp(ctx->timestamp_format_str, "iso8601_ns") == 0) {
+            ctx->timestamp_format = FLB_JSON_DATE_ISO8601_NS;
         }
     }
 
@@ -222,10 +237,6 @@ int flb_out_kafka_destroy(struct flb_out_kafka *ctx)
 
     if (ctx->topic_key) {
         flb_free(ctx->topic_key);
-    }
-
-    if (ctx->message_key) {
-        flb_free(ctx->message_key);
     }
 
     if (ctx->message_key_field) {

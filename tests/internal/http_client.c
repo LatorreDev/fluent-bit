@@ -9,9 +9,9 @@
 #include "flb_tests_internal.h"
 
 struct test_ctx {
-    struct flb_upstream      *u;
-    struct flb_upstream_conn *u_conn;
-    struct flb_config        *config;
+    struct flb_upstream   *u;
+    struct flb_connection *u_conn;
+    struct flb_config     *config;
 };
 
 struct test_ctx* test_ctx_create()
@@ -34,7 +34,7 @@ struct test_ctx* test_ctx_create()
         return NULL;
     }
 
-    ret_ctx->u = flb_upstream_create(ret_ctx->config, "127.0.0.1", 80, 0, NULL);
+    ret_ctx->u = flb_upstream_create(ret_ctx->config, "127.0.0.1", 80, FLB_IO_TCP_KA, NULL);
     if (!TEST_CHECK(ret_ctx->u != NULL)) {
         TEST_MSG("flb_upstream_create failed");
         flb_config_exit(ret_ctx->config);
@@ -42,16 +42,17 @@ struct test_ctx* test_ctx_create()
         return NULL;
     }
 
-    ret_ctx->u_conn = flb_malloc(sizeof(struct flb_upstream_conn));
+    ret_ctx->u_conn = flb_calloc(1, sizeof(struct flb_connection));
     if(!TEST_CHECK(ret_ctx->u_conn != NULL)) {
         flb_errno();
-        TEST_MSG("flb_malloc(flb_upstream_conn) failed");
+        TEST_MSG("flb_malloc(flb_connection) failed");
         flb_upstream_destroy(ret_ctx->u);
         flb_config_exit(ret_ctx->config);
         flb_free(ret_ctx);
         return NULL;
     }
-    ret_ctx->u_conn->u = ret_ctx->u;
+
+    ret_ctx->u_conn->upstream = ret_ctx->u;
 
     return ret_ctx;
 }
@@ -81,7 +82,7 @@ void test_http_buffer_increase()
     size_t s;
     struct test_ctx *ctx;
     struct flb_http_client *c;
-    struct flb_http_response *resp;
+    struct flb_http_client_response *resp;
 
     ctx = test_ctx_create();
     if (!TEST_CHECK(ctx != NULL)) {

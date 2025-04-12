@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ static int meminfo_configure(struct flb_ne *ctx)
     int parts;
     int len;
     char *p;
+    flb_sds_t tmp;
     char desc[] = "Memory information field ";
     struct cmt_gauge *g;
     struct mk_list *head;
@@ -100,12 +101,21 @@ static int meminfo_configure(struct flb_ne *ctx)
 
         /* Metric description */
         flb_sds_len_set(metric_desc, 0);
-        flb_sds_cat(metric_desc, desc, sizeof(desc) - 1);
+        ret = flb_sds_cat_safe(&metric_desc, desc, sizeof(desc) - 1);
+
+        if (ret != 0) {
+            flb_slist_destroy(&split_list);
+            goto error;
+        }
 
         if (parts == 2) {
             /* No unit */
-            flb_sds_cat(metric_desc, metric_name, flb_sds_len(metric_name));
-            flb_sds_cat(metric_desc, ".", 1);
+            tmp = flb_sds_printf(&metric_desc, "%s.", metric_name);
+
+            if (tmp == NULL) {
+                flb_slist_destroy(&split_list);
+                goto error;
+            }
 
             g = cmt_gauge_create(ctx->cmt, "node", "memory", metric_name,
                                  metric_desc,
@@ -117,9 +127,20 @@ static int meminfo_configure(struct flb_ne *ctx)
         }
         else if (parts == 3) {
             /* It has an extra 'kB' string in the line */
-            flb_sds_cat(metric_name, "_bytes", 6);
-            flb_sds_cat(metric_desc, metric_name, flb_sds_len(metric_name));
-            flb_sds_cat(metric_desc, ".", 1);
+            ret = flb_sds_cat_safe(&metric_name, "_bytes", 6);
+
+            if (ret != 0) {
+                flb_slist_destroy(&split_list);
+                goto error;
+            }
+
+            tmp = flb_sds_printf(&metric_desc, "%s.", metric_name);
+
+            if (tmp == NULL) {
+                flb_slist_destroy(&split_list);
+                goto error;
+            }
+
             g = cmt_gauge_create(ctx->cmt, "node", "memory", metric_name,
                                  metric_desc,
                                  0, NULL);
@@ -132,6 +153,7 @@ static int meminfo_configure(struct flb_ne *ctx)
             flb_slist_destroy(&split_list);
             continue;
         }
+
         flb_slist_destroy(&split_list);
 
         /*
@@ -185,7 +207,7 @@ static int meminfo_update(struct flb_ne *ctx)
         return -1;
     }
 
-    ts = cmt_time_now();
+    ts = cfl_time_now();
 
     mk_list_foreach(head, &list) {
         line = mk_list_entry(head, struct flb_slist_entry, _head);
@@ -262,22 +284,30 @@ static int meminfo_update(struct flb_ne *ctx)
     return 0;
 }
 
-int ne_meminfo_init(struct flb_ne *ctx)
+static int ne_meminfo_init(struct flb_ne *ctx)
 {
     meminfo_configure(ctx);
     return 0;
 }
 
-int ne_meminfo_update(struct flb_ne *ctx)
+static int ne_meminfo_update(struct flb_input_instance *ins, struct flb_config *config, void *in_context)
 {
+    struct flb_ne *ctx = (struct flb_ne *)in_context;
     meminfo_update(ctx);
     return 0;
 }
 
-int ne_meminfo_exit(struct flb_ne *ctx)
+static int ne_meminfo_exit(struct flb_ne *ctx)
 {
     if (ctx->meminfo_ht) {
         flb_hash_table_destroy(ctx->meminfo_ht);
     }
     return 0;
 }
+
+struct flb_ne_collector meminfo_collector = {
+    .name = "meminfo",
+    .cb_init = ne_meminfo_init,
+    .cb_update = ne_meminfo_update,
+    .cb_exit = ne_meminfo_exit
+};

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,6 +21,45 @@
 #include <fluent-bit/flb_kv.h>
 
 #include "syslog_conf.h"
+
+static int is_valid_severity(struct flb_output_instance *ins, int val, int format)
+{
+    if (format != FLB_SYSLOG_RFC5424 && format != FLB_SYSLOG_RFC3164) {
+        flb_plg_error(ins, "[%s] unknown syslog format.", __FUNCTION__);
+        return -1;
+    }
+
+    if (ins == NULL) {
+        flb_plg_error(ins, "[%s] arg is null. ins=%p", __FUNCTION__, ins);
+        return -1;
+    }
+    if (val < 0 || val > 7) {
+        flb_plg_error(ins, "[%s] invalid severity level %d. It should be 0-7.", __FUNCTION__, val);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int is_valid_facility(struct flb_output_instance *ins, int val, int format)
+{
+    if (format != FLB_SYSLOG_RFC5424 && format != FLB_SYSLOG_RFC3164) {
+        flb_plg_error(ins, "[%s] unknown syslog format.", __FUNCTION__);
+        return -1;
+    }
+
+    if (ins == NULL) {
+        flb_plg_error(ins, "[%s] arg is null. ins=%p", __FUNCTION__, ins);
+        return -1;
+    }
+
+    if (val < 0 || val > 23) {
+        flb_plg_error(ins, "[%s] invalid facility level %d. It should be 0-23.", __FUNCTION__, val);
+        return -1;
+    }
+    return 0;
+}
+
 
 struct flb_syslog *flb_syslog_config_create(struct flb_output_instance *ins,
                                             struct flb_config *config)
@@ -65,6 +104,7 @@ struct flb_syslog *flb_syslog_config_create(struct flb_output_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "unknown syslog mode %s", tmp);
+            flb_syslog_config_destroy(ctx);
             return NULL;
         }
     }
@@ -80,9 +120,28 @@ struct flb_syslog *flb_syslog_config_create(struct flb_output_instance *ins,
         }
         else {
             flb_plg_error(ctx->ins, "unknown syslog format %s", tmp);
+            flb_syslog_config_destroy(ctx);
             return NULL;
         }
     }
+
+    if (ctx->parsed_format == FLB_SYSLOG_RFC5424 && ctx->allow_longer_sd_id == FLB_TRUE) {
+        flb_plg_warn(ctx->ins, "Allow longer SD-ID. It may violate RFC5424.");
+    }
+
+    /* validate preset values */
+    ret = is_valid_severity(ctx->ins, ctx->severity_preset, ctx->parsed_format);
+    if (ret != 0) {
+        flb_syslog_config_destroy(ctx);
+        return NULL;
+    }
+
+    ret = is_valid_facility(ctx->ins, ctx->facility_preset, ctx->parsed_format);
+    if (ret != 0) {
+        flb_syslog_config_destroy(ctx);
+        return NULL;
+    }
+
 
     /* syslog maxsize */
     if (ctx->maxsize <= 0) {

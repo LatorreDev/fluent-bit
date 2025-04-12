@@ -6,21 +6,24 @@
 |-------------------|--------------------|
 | Unit Tests (master) | [![CI/Unit Tests](https://github.com/fluent/fluent-bit/actions/workflows/unit-tests.yaml/badge.svg?branch=master)](https://github.com/fluent/fluent-bit/actions/workflows/unit-tests.yaml) |
 | Integration Tests (master) | [![CI/Integration Tests](https://github.com/fluent/fluent-bit/actions/workflows/master-integration-test.yaml/badge.svg)](https://github.com/fluent/fluent-bit/actions/workflows/master-integration-test.yaml)|
+| Arm builds         | <a href="https://actuated.dev/"><img alt="Arm CI sponsored by Actuated" src="https://docs.actuated.dev/images/actuated-badge.png" width="120px"></img></a> |
 | Latest release |  [![CI/Build](https://github.com/fluent/fluent-bit/actions/workflows/staging-release.yaml/badge.svg)](https://github.com/fluent/fluent-bit/actions/workflows/staging-release.yaml)|
 
-## Project Description
+## About
 
-[Fluent Bit](http://fluentbit.io) is a fast Log Processor and Forwarder for Linux, Windows, Embedded Linux, MacOS and BSD family operating systems. It's part of the Graduated [Fluentd](http://fluentd.org) Ecosystem and a [CNCF](https://cncf.io) sub-project.
+![](documentation/fluentbit_ecosystem.png)
 
-Fluent Bit allows to collect log events or metrics from different sources, process them and deliver them to different backends such as [Fluentd](http://fluentd.org), Elasticsearch, Splunk, DataDog, Kafka, New Relic, Azure services, AWS services, Google services, NATS, InfluxDB or any custom HTTP end-point.
+[Fluent Bit](http://fluentbit.io) is a fast Log, Metrics and Traces Processor and Forwarder for Linux, Windows, Embedded Linux, MacOS and BSD family operating systems. It's part of the Graduated [Fluentd](http://fluentd.org) Ecosystem and a [CNCF](https://cncf.io) sub-project.
+
+Fluent Bit allows to collect different signal types such as logs, metrics and traces from different sources, process them and deliver them to different backends such as [Fluentd](http://fluentd.org), Elasticsearch, Splunk, DataDog, Kafka, New Relic, Azure services, AWS services, Google services, NATS, InfluxDB or any custom HTTP end-point.
 
 Fluent Bit comes with full SQL [Stream Processing](https://docs.fluentbit.io/manual/stream-processing/introduction) capabilities: data manipulation and analytics using SQL queries.
 
-Fluent Bit runs on x86_64, x86, arm32v7 and arm64v8 architectures.
+Fluent Bit runs on x86_64, x86, arm32v7, and arm64v8 architectures.
 
 ## Features
 
-- High Performance
+- High Performance at low CPU and Memory footprint
 - Data Parsing
   - Convert your unstructured messages using our parsers: [JSON](https://docs.fluentbit.io/manual/pipeline/parsers/json), [Regex](https://docs.fluentbit.io/manual/pipeline/parsers/regular-expression), [LTSV](https://docs.fluentbit.io/manual/pipeline/parsers/ltsv) and [Logfmt](https://docs.fluentbit.io/manual/pipeline/parsers/logfmt)
 - Reliability and Data Integrity
@@ -43,9 +46,9 @@ Fluent Bit runs on x86_64, x86, arm32v7 and arm64v8 architectures.
 
 ## Fluent Bit in Production
 
-[Fluent Bit](https://fluentbit.io) is used widely in production environments. In 2020 Fluent Bit was deployed more than **220 Million** times, and continues to be deploy over **1 million times a day**. The following is a preview of who uses Fluent Bit heavily in production:
+Fluent Bit is a widely adopted solution in production environments. As of 2024, Fluent Bit has surpassed 15 billion downloads and continues to be deployed over 10 million times daily. Below is a preview of some of the organizations that rely heavily on Fluent Bit in their production systems:
 
-> If your company uses Fluent Bit and is not listed, feel free to open a Github issue and we will add the logo.
+> If your company uses Fluent Bit and is not listed, feel free to open a GitHub issue and we will add the logo.
 
 ![users](documentation/fluentbit_users.png)
 
@@ -70,6 +73,14 @@ bin/fluent-bit -i cpu -o stdout -f 1
 
 If you are interested into more details, please refer to the [Build & Install](https://docs.fluentbit.io/manual/installation/sources/build-and-install) section.
 
+#### Requirements
+
+- CMake >= 3.0
+- Flex
+- Bison
+- YAML library/headers
+- OpenSSL library/headers
+
 #### Linux Packages
 
 We provide packages for most common Linux distributions:
@@ -88,6 +99,10 @@ tags [here](https://docs.fluentbit.io/manual/installation/docker).
 #### Windows Packages
 
 Fluent Bit is fully supported on Windows environments, get started with [these instructions](https://docs.fluentbit.io/manual/installation/windows).
+
+#### Running on s390x
+
+Fluent Bit runs on Linux on IBM Z(s390x), but the WASM filter plugin is not. For the LUA filter plugin, it runs when `libluajit` is installed on the system and fluent bit is built with `FLB_LUAJIT` and `FLB_PREFER_SYSTEM_LIB_LUAJIT` on.
 
 ### Plugins: Inputs, Filters and Outputs
 
@@ -169,16 +184,12 @@ Fluent Bit is fully supported on Windows environments, get started with [these i
 
 If you are interested in contributing to Fluent bit with bug fixes, new features or coding in general, please refer to the code [CONTRIBUTING](CONTRIBUTING.md) guidelines. You can also refer the Beginners Guide to contributing to Fluent Bit [here.](DEVELOPER_GUIDE.md)
 
-![Visualization of the codebase](./codebase-structure.svg)
 ## Community & Contact
 
 Feel free to join us on our Slack channel, Mailing List or IRC:
 
 - [Slack](http://slack.fluentd.org) (#fluent-bit channel)
-- [Mailing List](https://groups.google.com/forum/#!forum/fluent-bit)
-- [Discourse Forum](https://discuss.fluentd.org)
 - [Twitter](http://twitter.com/fluentbit)
-- [IRC](irc.freenode.net) #fluent-bit
 
 ## License
 
@@ -186,7 +197,7 @@ This program is under the terms of the [Apache License v2.0](http://www.apache.o
 
 ## Authors
 
-[Fluent Bit](http://fluentbit.io) is sponsored and maintained by several companies of the Cloud Native community, including all the major cloud providers.
+[Fluent Bit](http://fluentbit.io) is sponsored and maintained by several companies in the Cloud Native community, including all the major cloud providers.
 
 You can see a list of contributors [here](https://github.com/fluent/fluent-bit/graphs/contributors).
 

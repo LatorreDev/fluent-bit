@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -71,7 +71,7 @@ static int cb_chunks_append(struct flb_input_instance *in,
 
     mk_list_foreach_safe(head, tmp, &ctx->chunks) {
         chunk = mk_list_entry(head, struct sp_chunk, _head);
-        flb_input_chunk_append_raw(in,
+        flb_input_log_append(in,
                                    ctx->tag, flb_sds_len(ctx->tag),
                                    chunk->buf_data, chunk->buf_size);
         flb_free(chunk->buf_data);

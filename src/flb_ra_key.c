@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -55,6 +55,11 @@ static int msgpack_object_to_ra_value(msgpack_object o,
         result->type = FLB_RA_STRING;
         result->val.string = flb_sds_create_len((char *) o.via.str.ptr,
                                                 o.via.str.size);
+
+        /* Handle cases where flb_sds_create_len fails */
+        if (result->val.string == NULL) {
+            return -1;
+        }
         return 0;
     }
     else if (o.type == MSGPACK_OBJECT_MAP) {
@@ -116,12 +121,11 @@ static int msgpack_object_strcmp(msgpack_object o, char *str, int len)
 
 /* Lookup perfect match of sub-keys and map content */
 static int subkey_to_object(msgpack_object *map, struct mk_list *subkeys,
-                            msgpack_object **out_key, msgpack_object **out_val)
+                           msgpack_object **out_key, msgpack_object **out_val)
 {
     int i = 0;
     int levels;
     int matched = 0;
-    msgpack_object *found = NULL;
     msgpack_object *key = NULL;
     msgpack_object *val = NULL;
     msgpack_object cur;
@@ -130,6 +134,11 @@ static int subkey_to_object(msgpack_object *map, struct mk_list *subkeys,
 
     /* Expected number of map levels in the map */
     levels = mk_list_size(subkeys);
+
+    /* Early return if no subkeys */
+    if (levels == 0) {
+        return -1;
+    }
 
     cur = *map;
 
@@ -145,23 +154,30 @@ static int subkey_to_object(msgpack_object *map, struct mk_list *subkeys,
             }
 
             /* Index limit and ensure no overflow */
-            if (entry->array_id == INT_MAX ||
-                cur.via.array.size < entry->array_id + 1) {
+            if (entry->array_id == INT_MAX || entry->array_id >= cur.via.array.size) {
                 return -1;
             }
 
-            cur = cur.via.array.ptr[entry->array_id];
-            goto next;
+            val = &cur.via.array.ptr[entry->array_id];
+            cur = *val;
+            key = NULL; /* fill NULL since the type is array. */
+            matched++;
+
+            if (levels == matched) {
+                break;
+            }
+
+            continue;
         }
 
+        /* Handle map objects */
         if (cur.type != MSGPACK_OBJECT_MAP) {
             break;
         }
 
         i = ra_key_val_id(entry->str, cur);
         if (i == -1) {
-            found = NULL;
-            continue;
+            continue;  /* Try next entry */
         }
 
         key = &cur.via.map.ptr[i].key;
@@ -169,14 +185,10 @@ static int subkey_to_object(msgpack_object *map, struct mk_list *subkeys,
 
         /* A bit obvious, but it's better to validate data type */
         if (key->type != MSGPACK_OBJECT_STR) {
-            found = NULL;
-            continue;
+            continue;  /* Try next entry */
         }
 
-        found = key;
-        cur = cur.via.map.ptr[i].val;
-
-    next:
+        cur = *val;
         matched++;
 
         if (levels == matched) {
@@ -185,12 +197,12 @@ static int subkey_to_object(msgpack_object *map, struct mk_list *subkeys,
     }
 
     /* No matches */
-    if (!found || (matched > 0 && levels != matched)) {
+    if (matched == 0 || (matched > 0 && levels != matched)) {
         return -1;
     }
 
-    *out_key = (msgpack_object *) key;
-    *out_val = (msgpack_object *) val;
+    *out_key = key;
+    *out_val = val;
 
     return 0;
 }

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ static int fetch_metadata(struct flb_stackdriver *ctx,
     int ret;
     int ret_code;
     size_t b_sent;
-    struct flb_upstream_conn *metadata_conn;
+    struct flb_connection *metadata_conn;
     struct flb_http_client *c;
 
     /* If runtime test mode is enabled, add test data */

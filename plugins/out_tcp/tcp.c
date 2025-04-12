@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_config_map.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 
 #include <stdio.h>
@@ -52,10 +53,67 @@ static int cb_tcp_init(struct flb_output_instance *ins,
 }
 
 static int compose_payload(struct flb_out_tcp *ctx,
+                           const char *tag, int tag_len,
                            const void *in_data, size_t in_size,
                            void **out_payload, size_t *out_size)
 {
+    int ret;
+    flb_sds_t buf = NULL;
     flb_sds_t json = NULL;
+    flb_sds_t str;
+    msgpack_object map;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+
+    /* raw message key by using a record accessor */
+    if (ctx->ra_raw_message_key) {
+        ret = flb_log_event_decoder_init(&log_decoder, (char *) in_data, in_size);
+
+        if (ret != FLB_EVENT_DECODER_SUCCESS) {
+            flb_plg_error(ctx->ins,
+                          "Log event decoder initialization error : %d", ret);
+
+            return -1;
+        }
+
+        buf = flb_sds_create_size(in_size);
+        if (!buf) {
+            flb_log_event_decoder_destroy(&log_decoder);
+            return FLB_ERROR;
+        }
+
+        while ((ret = flb_log_event_decoder_next(
+                        &log_decoder,
+                        &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+
+            map = *log_event.body;
+
+            str = flb_ra_translate(ctx->ra_raw_message_key, (char *) tag, tag_len, map, NULL);
+            if (!str) {
+                continue;
+            }
+
+            ret = flb_sds_cat_safe(&buf, str, flb_sds_len(str));
+            if (ret != 0) {
+                flb_plg_error(ctx->ins, "failed to compose payload from '%s'", str);
+            }
+            flb_sds_destroy(str);
+
+            /* append a new line */
+            flb_sds_cat_safe(&buf, "\n", 1);
+        }
+
+        flb_log_event_decoder_destroy(&log_decoder);
+
+        if (flb_sds_len(buf) == 0) {
+            flb_sds_destroy(buf);
+            return FLB_ERROR;
+        }
+
+        *out_payload = buf;
+        *out_size = flb_sds_len(buf);
+        return FLB_OK;
+    }
 
     if (ctx->out_format == FLB_PACK_JSON_FORMAT_NONE) {
         /* nothing to do */
@@ -88,17 +146,11 @@ static void cb_tcp_flush(struct flb_event_chunk *event_chunk,
     int ret = FLB_ERROR;
     size_t bytes_sent;
     struct flb_upstream *u;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_out_tcp *ctx = out_context;
     void *out_payload = NULL;
     size_t out_size = 0;
     (void) i_ins;
-
-    ret = compose_payload(ctx, event_chunk->data, event_chunk->size,
-                          &out_payload, &out_size);
-    if (ret != FLB_OK) {
-        return FLB_OUTPUT_RETURN(ret);
-    }
 
     /* Get upstream context and connection */
     u = ctx->u;
@@ -109,7 +161,20 @@ static void cb_tcp_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
-    if (ctx->out_format == FLB_PACK_JSON_FORMAT_NONE) {
+    ret = compose_payload(ctx,
+                          event_chunk->tag, flb_sds_len(event_chunk->tag),
+                          event_chunk->data, event_chunk->size,
+                          &out_payload, &out_size);
+    if (ret != FLB_OK) {
+        flb_upstream_conn_release(u_conn);
+        return FLB_OUTPUT_RETURN(ret);
+    }
+
+    if (ctx->ra_raw_message_key) {
+        ret = flb_io_net_write(u_conn, out_payload, out_size, &bytes_sent);
+        flb_sds_destroy(out_payload);
+    }
+    else if (ctx->out_format == FLB_PACK_JSON_FORMAT_NONE) {
         ret = flb_io_net_write(u_conn,
                                event_chunk->data, event_chunk->size,
                                &bytes_sent);
@@ -157,6 +222,12 @@ static struct flb_config_map config_map[] = {
      "Specify the name of the date field in output."
     },
 
+    {
+     FLB_CONFIG_MAP_STR, "raw_message_key", NULL,
+     0, FLB_TRUE, offsetof(struct flb_out_tcp, raw_message_key),
+     "use a raw message key for the message."
+    },
+
     /* EOF */
     {0}
 };
@@ -165,6 +236,7 @@ static int cb_tcp_format_test(struct flb_config *config,
                               struct flb_input_instance *ins,
                               void *plugin_context,
                               void *flush_ctx,
+                              int event_type,
                               const char *tag, int tag_len,
                               const void *data, size_t bytes,
                               void **out_data, size_t *out_size)
@@ -172,7 +244,7 @@ static int cb_tcp_format_test(struct flb_config *config,
     struct flb_out_tcp *ctx = plugin_context;
     int ret;
 
-    ret = compose_payload(ctx, data, bytes, out_data, out_size);
+    ret = compose_payload(ctx, tag, tag_len, data, bytes, out_data, out_size);
     if (ret != FLB_OK) {
         flb_error("ret=%d", ret);
         return -1;

@@ -1,6 +1,7 @@
 set(src
   cio_os.c
   cio_log.c
+  cio_file.c
   cio_memfs.c
   cio_chunk.c
   cio_meta.c
@@ -27,7 +28,7 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
 else()
   set(src
     ${src}
-    cio_file.c
+    cio_file_unix.c
     )
 endif()
 
@@ -41,7 +42,7 @@ endif()
 
 if (CIO_LIB_SHARED)
   add_library(chunkio-shared SHARED ${src})
-  target_link_libraries(chunkio-static ${libs})
+  target_link_libraries(chunkio-shared ${libs})
   if(CIO_SANITIZE_ADDRESS)
     add_sanitizers(chunkio-shared)
   endif()

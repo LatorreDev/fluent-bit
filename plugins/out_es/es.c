@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 #include <fluent-bit/flb_gzip.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_ra_key.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 
 #include <time.h>
@@ -63,8 +64,8 @@ static flb_sds_t add_aws_auth(struct flb_http_client *c,
     flb_http_add_header(c, "User-Agent", 10, "aws-fluent-bit-plugin", 21);
 
     signature = flb_signv4_do(c, FLB_TRUE, FLB_TRUE, time(NULL),
-                              ctx->aws_region, "es",
-                              0,
+                              ctx->aws_region, ctx->aws_service_name,
+                              S3_MODE_SIGNED_PAYLOAD, ctx->aws_unsigned_headers,
                               ctx->aws_provider);
     if (!signature) {
         flb_plg_error(ctx->ins, "could not sign request with sigv4");
@@ -232,6 +233,45 @@ static flb_sds_t es_get_id_value(struct flb_elasticsearch *ctx,
     return tmp_str;
 }
 
+static int compose_index_header(struct flb_elasticsearch *ctx,
+                                int es_index_custom_len,
+                                char *logstash_index, size_t logstash_index_size,
+                                char *separator_str,
+                                struct tm *tm)
+{
+    int ret;
+    int len;
+    char *p;
+    size_t s;
+
+    /* Compose Index header */
+    if (es_index_custom_len > 0) {
+        p = logstash_index + es_index_custom_len;
+    } else {
+        p = logstash_index + flb_sds_len(ctx->logstash_prefix);
+    }
+    len = p - logstash_index;
+    ret = snprintf(p, logstash_index_size - len, "%s",
+                   separator_str);
+    if (ret > logstash_index_size - len) {
+        /* exceed limit */
+        return -1;
+    }
+    p += strlen(separator_str);
+    len += strlen(separator_str);
+
+    s = strftime(p, logstash_index_size - len,
+                 ctx->logstash_dateformat, tm);
+    if (s==0) {
+        /* exceed limit */
+        return -1;
+    }
+    p += s;
+    *p++ = '\0';
+
+    return 0;
+}
+
 /*
  * Convert the internal Fluent Bit data representation to the required
  * one by Elasticsearch.
@@ -242,6 +282,7 @@ static int elasticsearch_format(struct flb_config *config,
                                 struct flb_input_instance *ins,
                                 void *plugin_context,
                                 void *flush_ctx,
+                                int event_type,
                                 const char *tag, int tag_len,
                                 const void *data, size_t bytes,
                                 void **out_data, size_t *out_size)
@@ -253,7 +294,6 @@ static int elasticsearch_format(struct flb_config *config,
     size_t s = 0;
     size_t off = 0;
     size_t off_prev = 0;
-    char *p;
     char *es_index;
     char logstash_index[256];
     char time_formatted[256];
@@ -263,10 +303,10 @@ static int elasticsearch_format(struct flb_config *config,
     size_t out_buf_len = 0;
     flb_sds_t tmp_buf;
     flb_sds_t id_key_str = NULL;
-    msgpack_unpacked result;
-    msgpack_object root;
+    // msgpack_unpacked result;
+    // msgpack_object root;
     msgpack_object map;
-    msgpack_object *obj;
+    // msgpack_object *obj;
     flb_sds_t j_index;
     struct es_bulk *bulk;
     struct tm tm;
@@ -276,6 +316,8 @@ static int elasticsearch_format(struct flb_config *config,
     uint16_t hash[8];
     int es_index_custom_len;
     struct flb_elasticsearch *ctx = plugin_context;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
 
     j_index = flb_sds_create_size(ES_BULK_HEADER);
     if (j_index == NULL) {
@@ -283,52 +325,28 @@ static int elasticsearch_format(struct flb_config *config,
         return -1;
     }
 
-    /* Iterate the original buffer and perform adjustments */
-    msgpack_unpacked_init(&result);
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-    /* Perform some format validation */
-    ret = msgpack_unpack_next(&result, data, bytes, &off);
-    if (ret != MSGPACK_UNPACK_SUCCESS) {
-        msgpack_unpacked_destroy(&result);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
         flb_sds_destroy(j_index);
-        return -1;
-    }
 
-    /* We 'should' get an array */
-    if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-        /*
-         * If we got a different format, we assume the caller knows what he is
-         * doing, we just duplicate the content in a new buffer and cleanup.
-         */
-        msgpack_unpacked_destroy(&result);
-        flb_sds_destroy(j_index);
-        return -1;
-    }
-
-    root = result.data;
-    if (root.via.array.size == 0) {
-        msgpack_unpacked_destroy(&result);
-        flb_sds_destroy(j_index);
         return -1;
     }
 
     /* Create the bulk composer */
     bulk = es_bulk_create(bytes);
     if (!bulk) {
-        msgpack_unpacked_destroy(&result);
+        flb_log_event_decoder_destroy(&log_decoder);
         flb_sds_destroy(j_index);
         return -1;
     }
 
-    off = 0;
-
-    msgpack_unpacked_destroy(&result);
-    msgpack_unpacked_init(&result);
-
     /* Copy logstash prefix if logstash format is enabled */
     if (ctx->logstash_format == FLB_TRUE) {
-        memcpy(logstash_index, ctx->logstash_prefix, flb_sds_len(ctx->logstash_prefix));
-        logstash_index[flb_sds_len(ctx->logstash_prefix)] = '\0';
+        strncpy(logstash_index, ctx->logstash_prefix, sizeof(logstash_index));
+        logstash_index[sizeof(logstash_index) - 1] = '\0';
     }
 
     /*
@@ -371,23 +389,16 @@ static int elasticsearch_format(struct flb_config *config,
     }
 
     /* Iterate each record and do further formatting */
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
-
-        /* Each array must have two entries: time and record */
-        root = result.data;
-        if (root.via.array.size != 2) {
-            continue;
-        }
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
 
         /* Only pop time from record if current_time_index is disabled */
         if (ctx->current_time_index == FLB_FALSE) {
-            flb_time_pop_from_msgpack(&tms, &result, &obj);
+            flb_time_copy(&tms, &log_event.timestamp);
         }
 
-        map   = root.via.array.ptr[1];
+        map   = *log_event.body;
         map_size = map.via.map.size;
 
         es_index_custom_len = 0;
@@ -443,19 +454,16 @@ static int elasticsearch_format(struct flb_config *config,
 
         es_index = ctx->index;
         if (ctx->logstash_format == FLB_TRUE) {
-            /* Compose Index header */
-            if (es_index_custom_len > 0) {
-                p = logstash_index + es_index_custom_len;
-            } else {
-                p = logstash_index + flb_sds_len(ctx->logstash_prefix);
+            ret = compose_index_header(ctx, es_index_custom_len,
+                                       &logstash_index[0], sizeof(logstash_index),
+                                       ctx->logstash_prefix_separator, &tm);
+            if (ret < 0) {
+                /* retry with default separator */
+                compose_index_header(ctx, es_index_custom_len,
+                                     &logstash_index[0], sizeof(logstash_index),
+                                     "-", &tm);
             }
-            *p++ = '-';
 
-            len = p - logstash_index;
-            s = strftime(p, sizeof(logstash_index) - len - 1,
-                         ctx->logstash_dateformat, &tm);
-            p += s;
-            *p++ = '\0';
             es_index = logstash_index;
             if (ctx->generate_id == FLB_FALSE) {
                 if (ctx->suppress_type_name) {
@@ -498,7 +506,7 @@ static int elasticsearch_format(struct flb_config *config,
          */
         ret = es_pack_map_content(&tmp_pck, map, ctx);
         if (ret == -1) {
-            msgpack_unpacked_destroy(&result);
+            flb_log_event_decoder_destroy(&log_decoder);
             msgpack_sbuffer_destroy(&tmp_sbuf);
             es_bulk_destroy(bulk);
             flb_sds_destroy(j_index);
@@ -552,7 +560,7 @@ static int elasticsearch_format(struct flb_config *config,
         out_buf = flb_msgpack_raw_to_json_sds(tmp_sbuf.data, tmp_sbuf.size);
         msgpack_sbuffer_destroy(&tmp_sbuf);
         if (!out_buf) {
-            msgpack_unpacked_destroy(&result);
+            flb_log_event_decoder_destroy(&log_decoder);
             es_bulk_destroy(bulk);
             flb_sds_destroy(j_index);
             return -1;
@@ -580,14 +588,14 @@ static int elasticsearch_format(struct flb_config *config,
         off_prev = off;
         if (ret == -1) {
             /* We likely ran out of memory, abort here */
-            msgpack_unpacked_destroy(&result);
+            flb_log_event_decoder_destroy(&log_decoder);
             *out_size = 0;
             es_bulk_destroy(bulk);
             flb_sds_destroy(j_index);
             return -1;
         }
     }
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
 
     /* Set outgoing data */
     *out_data = bulk->ptr;
@@ -639,7 +647,7 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
 {
     int i, j, k;
     int ret;
-    int check = FLB_FALSE;
+    int check = 0;
     int root_type;
     char *out_buf;
     size_t off = 0;
@@ -659,21 +667,24 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
      */
     /* Convert JSON payload to msgpack */
     ret = flb_pack_json(c->resp.payload, c->resp.payload_size,
-                        &out_buf, &out_size, &root_type);
+                        &out_buf, &out_size, &root_type, NULL);
     if (ret == -1) {
         /* Is this an incomplete HTTP Request ? */
         if (c->resp.payload_size <= 0) {
-            return FLB_TRUE;
+            check |= FLB_ES_STATUS_IMCOMPLETE;
+            return check;
         }
 
         /* Lookup error field */
         if (strstr(c->resp.payload, "\"errors\":false,\"items\":[")) {
-            return FLB_FALSE;
+            check |= FLB_ES_STATUS_SUCCESS;
+            return check;
         }
 
         flb_plg_error(ctx->ins, "could not pack/validate JSON response\n%s",
                       c->resp.payload);
-        return FLB_TRUE;
+        check |= FLB_ES_STATUS_BAD_RESPONSE;
+        return check;
     }
 
     /* Lookup error field */
@@ -682,14 +693,15 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
     if (ret != MSGPACK_UNPACK_SUCCESS) {
         flb_plg_error(ctx->ins, "Cannot unpack response to find error\n%s",
                       c->resp.payload);
-        return FLB_TRUE;
+        check |= FLB_ES_STATUS_ERROR_UNPACK;
+        return check;
     }
 
     root = result.data;
     if (root.type != MSGPACK_OBJECT_MAP) {
         flb_plg_error(ctx->ins, "unexpected payload type=%i",
                       root.type);
-        check = FLB_TRUE;
+        check |= FLB_ES_STATUS_BAD_TYPE;
         goto done;
     }
 
@@ -698,7 +710,7 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
         if (key.type != MSGPACK_OBJECT_STR) {
             flb_plg_error(ctx->ins, "unexpected key type=%i",
                           key.type);
-            check = FLB_TRUE;
+            check |= FLB_ES_STATUS_INVAILD_ARGUMENT;
             goto done;
         }
 
@@ -707,14 +719,14 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
             if (val.type != MSGPACK_OBJECT_BOOLEAN) {
                 flb_plg_error(ctx->ins, "unexpected 'error' value type=%i",
                               val.type);
-                check = FLB_TRUE;
+                check |= FLB_ES_STATUS_BAD_TYPE;
                 goto done;
             }
 
             /* If error == false, we are OK (no errors = FLB_FALSE) */
             if (!val.via.boolean) {
                 /* no errors */
-                check = FLB_FALSE;
+                check |= FLB_ES_STATUS_SUCCESS;
                 goto done;
             }
         }
@@ -723,7 +735,7 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
             if (val.type != MSGPACK_OBJECT_ARRAY) {
                 flb_plg_error(ctx->ins, "unexpected 'items' value type=%i",
                               val.type);
-                check = FLB_TRUE;
+                check |= FLB_ES_STATUS_BAD_TYPE;
                 goto done;
             }
 
@@ -732,14 +744,14 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
                 if (item.type != MSGPACK_OBJECT_MAP) {
                     flb_plg_error(ctx->ins, "unexpected 'item' outer value type=%i",
                                   item.type);
-                    check = FLB_TRUE;
+                    check |= FLB_ES_STATUS_BAD_TYPE;
                     goto done;
                 }
 
                 if (item.via.map.size != 1) {
                     flb_plg_error(ctx->ins, "unexpected 'item' size=%i",
                                   item.via.map.size);
-                    check = FLB_TRUE;
+                    check |= FLB_ES_STATUS_INVAILD_ARGUMENT;
                     goto done;
                 }
 
@@ -747,7 +759,7 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
                 if (item.type != MSGPACK_OBJECT_MAP) {
                     flb_plg_error(ctx->ins, "unexpected 'item' inner value type=%i",
                                   item.type);
-                    check = FLB_TRUE;
+                    check |= FLB_ES_STATUS_BAD_TYPE;
                     goto done;
                 }
 
@@ -756,7 +768,7 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
                     if (item_key.type != MSGPACK_OBJECT_STR) {
                         flb_plg_error(ctx->ins, "unexpected key type=%i",
                                       item_key.type);
-                        check = FLB_TRUE;
+                        check |= FLB_ES_STATUS_BAD_TYPE;
                         goto done;
                     }
 
@@ -766,13 +778,16 @@ static int elasticsearch_error_check(struct flb_elasticsearch *ctx,
                         if (item_val.type != MSGPACK_OBJECT_POSITIVE_INTEGER) {
                             flb_plg_error(ctx->ins, "unexpected 'status' value type=%i",
                                           item_val.type);
-                            check = FLB_TRUE;
+                            check |= FLB_ES_STATUS_BAD_TYPE;
                             goto done;
+                        }
+                        /* Check for success responses */
+                        if (item_val.via.i64 == 200 || item_val.via.i64 == 201) {
+                            check |= FLB_ES_STATUS_SUCCESS;
                         }
                         /* Check for errors other than version conflict (document already exists) */
                         if (item_val.via.i64 != 409) {
-                            check = FLB_TRUE;
-                            goto done;
+                            check |= FLB_ES_STATUS_ERROR;
                         }
                     }
                 }
@@ -798,7 +813,7 @@ static void cb_es_flush(struct flb_event_chunk *event_chunk,
     size_t out_size;
     size_t b_sent;
     struct flb_elasticsearch *ctx = out_context;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *c;
     flb_sds_t signature = NULL;
     int compressed = FLB_FALSE;
@@ -812,6 +827,7 @@ static void cb_es_flush(struct flb_event_chunk *event_chunk,
     /* Convert format */
     ret = elasticsearch_format(config, ins,
                                ctx, NULL,
+                               event_chunk->type,
                                event_chunk->tag, flb_sds_len(event_chunk->tag),
                                event_chunk->data, event_chunk->size,
                                &out_buf, &out_size);
@@ -911,23 +927,35 @@ static void cb_es_flush(struct flb_event_chunk *event_chunk,
              * and lookup the 'error' field.
              */
             ret = elasticsearch_error_check(ctx, c);
-            if (ret == FLB_TRUE) {
+            if (ret & FLB_ES_STATUS_SUCCESS) {
+                flb_plg_debug(ctx->ins, "Elasticsearch response\n%s",
+                              c->resp.payload);
+            }
+            else {
                 /* we got an error */
                 if (ctx->trace_error) {
                     /*
                      * If trace_error is set, trace the actual
-                     * input/output to Elasticsearch that caused the problem.
+                     * response from Elasticsearch explaining the problem.
+                     * Trace_Output can be used to see the request. 
                      */
-                    flb_plg_debug(ctx->ins, "error caused by: Input\n%s\n",
-                                  pack);
-                    flb_plg_error(ctx->ins, "error: Output\n%s",
-                                  c->resp.payload);
+                    if (pack_size < 4000) {
+                        flb_plg_debug(ctx->ins, "error caused by: Input\n%.*s\n",
+                                      (int) pack_size, pack);
+                    }
+                    if (c->resp.payload_size < 4000) {
+                        flb_plg_error(ctx->ins, "error: Output\n%s",
+                                      c->resp.payload);
+                    } else {
+                        /*
+                        * We must use fwrite since the flb_log functions
+                        * will truncate data at 4KB
+                        */
+                        fwrite(c->resp.payload, 1, c->resp.payload_size, stderr);
+                        fflush(stderr);
+                    }
                 }
                 goto retry;
-            }
-            else {
-                flb_plg_debug(ctx->ins, "Elasticsearch response\n%s",
-                              c->resp.payload);
             }
         }
         else {
@@ -955,6 +983,78 @@ static void cb_es_flush(struct flb_event_chunk *event_chunk,
 
     flb_upstream_conn_release(u_conn);
     FLB_OUTPUT_RETURN(FLB_RETRY);
+}
+
+static int elasticsearch_response_test(struct flb_config *config,
+                                       void *plugin_context,
+                                       int status,
+                                       const void *data, size_t bytes,
+                                       void **out_data, size_t *out_size)
+{
+    int ret = 0;
+    struct flb_elasticsearch *ctx = plugin_context;
+    struct flb_connection *u_conn;
+    struct flb_http_client *c;
+    size_t b_sent;
+
+    /* Not retrieve upstream connection */
+    u_conn = NULL;
+
+    /* Compose HTTP Client request (dummy client) */
+    c = flb_http_dummy_client(u_conn, FLB_HTTP_POST, ctx->uri,
+                              NULL, 0, NULL, 0, NULL, 0);
+
+    flb_http_buffer_size(c, ctx->buffer_size);
+
+    /* Just stubbing the HTTP responses */
+    flb_http_set_response_test(c, "response", data, bytes, status, NULL, NULL);
+
+    ret = flb_http_do(c, &b_sent);
+    if (ret != 0) {
+        flb_plg_warn(ctx->ins, "http_do=%i URI=%s", ret, ctx->uri);
+        goto error;
+    }
+    if (ret != 0) {
+        flb_plg_warn(ctx->ins, "http_do=%i URI=%s", ret, ctx->uri);
+        goto error;
+    }
+    else {
+        /* The request was issued successfully, validate the 'error' field */
+        flb_plg_debug(ctx->ins, "HTTP Status=%i URI=%s", c->resp.status, ctx->uri);
+        if (c->resp.status != 200 && c->resp.status != 201) {
+            if (c->resp.payload_size > 0) {
+                flb_plg_error(ctx->ins, "HTTP status=%i URI=%s, response:\n%s\n",
+                              c->resp.status, ctx->uri, c->resp.payload);
+            }
+            else {
+                flb_plg_error(ctx->ins, "HTTP status=%i URI=%s",
+                              c->resp.status, ctx->uri);
+            }
+            goto error;
+        }
+
+        if (c->resp.payload_size > 0) {
+            /*
+             * Elasticsearch payload should be JSON, we convert it to msgpack
+             * and lookup the 'error' field.
+             */
+            ret = elasticsearch_error_check(ctx, c);
+        }
+        else {
+            goto error;
+        }
+    }
+
+    /* Cleanup */
+    flb_http_client_destroy(c);
+
+    return ret;
+
+error:
+    /* Cleanup */
+    flb_http_client_destroy(c);
+
+    return -2;
 }
 
 static int cb_es_exit(void *data, struct flb_config *config)
@@ -1041,6 +1141,17 @@ static struct flb_config_map config_map[] = {
      0, FLB_FALSE, 0,
      "External ID for the AWS IAM Role specified with `aws_role_arn`"
     },
+    {
+     FLB_CONFIG_MAP_STR, "aws_service_name", "es",
+     0, FLB_TRUE, offsetof(struct flb_elasticsearch, aws_service_name),
+     "AWS Service Name"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "aws_profile", NULL,
+     0, FLB_TRUE, offsetof(struct flb_elasticsearch, aws_profile),
+     "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually stored in "
+     "$HOME/.aws/ directory."
+    },
 #endif
 
     /* Logstash compatibility */
@@ -1056,6 +1167,11 @@ static struct flb_config_map config_map[] = {
      "and the date, e.g: If Logstash_Prefix is equals to 'mydata' your index will "
      "become 'mydata-YYYY.MM.DD'. The last string appended belongs to the date "
      "when the data is being generated"
+    },
+    {
+     FLB_CONFIG_MAP_STR, "logstash_prefix_separator", "-",
+     0, FLB_TRUE, offsetof(struct flb_elasticsearch, logstash_prefix_separator),
+     "Set a separator between logstash_prefix and date."
     },
     {
      FLB_CONFIG_MAP_STR, "logstash_prefix_key", NULL,
@@ -1187,6 +1303,7 @@ struct flb_output_plugin out_es_plugin = {
 
     /* Test */
     .test_formatter.callback = elasticsearch_format,
+    .test_response.callback = elasticsearch_response_test,
 
     /* Plugin flags */
     .flags          = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,

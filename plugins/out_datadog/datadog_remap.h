@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,10 +22,12 @@
 
 #include "datadog.h"
 
+typedef int (*dd_attr_remap_to_tag_fn)(const char*, msgpack_object, flb_sds_t*);
+
 struct dd_attr_tag_remapping {
     char* origin_attr_name; /* original attribute name */
     char* remap_tag_name;   /* tag name to remap to */
-    void (*remap_to_tag) (const char*, msgpack_object, flb_sds_t);  /* remapping function */
+    dd_attr_remap_to_tag_fn remap_to_tag;  /* remapping function */
 };
 
 extern const struct dd_attr_tag_remapping remapping[];

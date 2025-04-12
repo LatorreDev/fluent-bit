@@ -37,15 +37,52 @@ static void test_sds_printf()
     flb_sds_destroy(s);
 }
 
+/* https://github.com/fluent/fluent-bit/issues/7143 */
+static void test_sds_printf_7143_off_by_1()
+{
+    flb_sds_t tmp;
+    flb_sds_t test;
+    flb_sds_t test2;
+    int len;
+
+    /* 66 char final string, not impacted by bug */
+    test = flb_sds_create_size(64);
+    TEST_CHECK(test != NULL);
+    tmp = flb_sds_printf(&test, "A0123456789 %s", "this-is-54-chars-1234567890-abcdefghijklmnopqrstuvwxyz");
+    TEST_CHECK(tmp != NULL);
+    len = flb_sds_len(test);
+    TEST_CHECK(len == 66);
+    TEST_CHECK(test[len -1] == 'z');
+    flb_sds_destroy(test);
+
+    /* 65 char final string, impacted by bug */
+    test2 = flb_sds_create_size(64);
+    TEST_CHECK(test2 != NULL);
+    tmp = flb_sds_printf(&test2, "0123456789 %s", "this-is-54-chars-1234567890-abcdefghijklmnopqrstuvwxyz");
+    TEST_CHECK(tmp != NULL);
+    len = flb_sds_len(test2);
+    TEST_CHECK(len == 65);
+    TEST_CHECK(test2[len -1] == 'z');
+    flb_sds_destroy(test2);
+
+}
+
 static void test_sds_cat_utf8()
 {
+    int ret;
     flb_sds_t s;
     char *utf8_str = "\xe8\x9f\xb9\xf0\x9f\xa6\x80";
+    char *expected = "\\u87f9\\ud83e\\udd80";
 
     s = flb_sds_create("");
     flb_sds_cat_utf8(&s, utf8_str, strlen(utf8_str));
 
-    TEST_CHECK(strcmp(s, "\\u87f9\\u1f980") == 0);
+    ret = strcmp(s, expected);
+    TEST_CHECK(ret == 0);
+    if (ret != 0) {
+        printf("Expected: %s\n", expected);
+        printf("Received: %s\n", s);
+    }
     flb_sds_destroy(s);
 }
 
@@ -53,5 +90,6 @@ TEST_LIST = {
     { "sds_usage" , test_sds_usage},
     { "sds_printf", test_sds_printf},
     { "sds_cat_utf8", test_sds_cat_utf8},
+    { "test_sds_printf_7143_off_by_1", test_sds_printf_7143_off_by_1},
     { 0 }
 };

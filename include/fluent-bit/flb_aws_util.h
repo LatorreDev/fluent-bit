@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #ifndef FLB_AWS_UTIL_H
 
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_time.h>
 
 #define FLB_AWS_UTIL_H
 
@@ -80,7 +81,6 @@ struct flb_aws_client {
     char *proxy;
     int flags;
     flb_sds_t extra_user_agent;
-    int free_user_agent;
 
     /*
      * Additional headers which will be added to all requests.
@@ -103,6 +103,17 @@ struct flb_aws_client {
     /* Send all log messages as debug; used in AWS Cred Providers on init */
     int debug_only;
 };
+
+/* frees dynamic_headers */
+struct flb_http_client *flb_aws_client_request_basic_auth(
+                                               struct flb_aws_client *aws_client,
+                                               int method, const char *uri,
+                                               const char *body, size_t body_len,
+                                               struct flb_aws_header
+                                               *dynamic_headers,
+                                               size_t dynamic_headers_len,
+                                               char *header_name,
+                                               char* auth_token);
 
 /*
  * Frees the aws_client, the internal flb_http_client, error_code,
@@ -144,12 +155,19 @@ flb_sds_t flb_aws_xml_error(char *response, size_t response_len);
 flb_sds_t flb_aws_error(char *response, size_t response_len);
 
 /*
- * Similar to 'flb_aws_error', except it prints the JSON error type and message
- * to the user in a error log.
+ * Similar to 'flb_aws_error', except it prints the JSON error __type and message
+ * field values to the user in a error log.
  * 'api' is the name of the API that was called; this is used in the error log.
  */
 void flb_aws_print_error(char *response, size_t response_len,
                          char *api, struct flb_output_instance *ins);
+
+/*
+ * Error parsing for json APIs that respond with a
+ * Code and Message fields for error responses.
+ */
+void flb_aws_print_error_code(char *response, size_t response_len,
+                              char *api);
 
 /* Similar to 'flb_aws_print_error', but for APIs that return XML */
 void flb_aws_print_xml_error(char *response, size_t response_len,
@@ -163,8 +181,9 @@ flb_sds_t flb_json_get_val(char *response, size_t response_len, char *key);
 /*
  * Parses an XML document and returns the value of the given tag
  * Param `tag` should include angle brackets; ex "<code>"
+ * And param `end` should include end brackets: "</code>"
  */
-flb_sds_t flb_xml_get_val(char *response, size_t response_len, char *tag);
+flb_sds_t flb_aws_xml_get_val(char *response, size_t response_len, char *tag, char *tag_end);
 
 /*
  * Checks if a response contains an AWS Auth error
@@ -176,6 +195,14 @@ int flb_read_file(const char *path, char **out_buf, size_t *out_size);
 //* Constructs S3 object key as per the format. */
 flb_sds_t flb_get_s3_key(const char *format, time_t time, const char *tag,
                          char *tag_delimiter, uint64_t seq_index);
+
+/*
+ * This function is an extension to strftime which can support milliseconds with %3N,
+ * support nanoseconds with %9N or %L. The return value is the length of formatted
+ * time string.
+ */
+size_t flb_aws_strftime_precision(char **out_buf, const char *time_format,
+                                  struct flb_time *tms);
 
 #endif
 #endif /* FLB_HAVE_AWS */

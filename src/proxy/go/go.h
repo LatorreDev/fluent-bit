@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -56,7 +56,8 @@ int proxy_go_output_init(struct flb_plugin_proxy *proxy);
 int proxy_go_output_flush(struct flb_plugin_proxy_context *ctx,
                           const void *data, size_t size,
                           const char *tag, int tag_len);
-int proxy_go_output_destroy(void *data);
+int proxy_go_output_destroy(struct flb_plugin_proxy_context *ctx);
+void proxy_go_output_unregister(void *data);
 
 int proxy_go_input_register(struct flb_plugin_proxy *proxy,
                             struct flb_plugin_proxy_def *def);
@@ -66,5 +67,6 @@ int proxy_go_input_collect(struct flb_plugin_proxy *ctx,
                            void **collected_data, size_t *len);
 int proxy_go_input_cleanup(struct flb_plugin_proxy *ctx,
                            void *allocated_data);
-int proxy_go_input_destroy(void *data);
+int proxy_go_input_destroy(struct flb_plugin_input_proxy_context *ctx);
+void proxy_go_input_unregister(void *data);
 #endif

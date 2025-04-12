@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ static int scrape_metrics(struct flb_config *config, struct flb_in_metrics *ctx)
     struct cmt *cmt;
 
     /* Update internal metric */
-    ts = cmt_time_now();
+    ts = cfl_time_now();
     name = (char *) flb_input_name(ctx->ins);
     cmt_counter_inc(ctx->c, ts, 1, (char *[]) {name});
 
@@ -118,6 +118,7 @@ static int in_metrics_init(struct flb_input_instance *in,
             flb_plg_error(ctx->ins,
                           "could not set collector on start for Fluent Bit "
                           "metrics plugin");
+            flb_free(ctx);
             return -1;
         }
         ctx->coll_fd_start = ret;
@@ -131,6 +132,7 @@ static int in_metrics_init(struct flb_input_instance *in,
     if (ret == -1) {
         flb_plg_error(ctx->ins,
                       "could not set collector for Fluent Bit metrics plugin");
+        flb_free(ctx);
         return -1;
     }
     ctx->coll_fd_runtime = ret;
@@ -198,5 +200,4 @@ struct flb_input_plugin in_fluentbit_metrics_plugin = {
     .cb_pause     = in_metrics_pause,
     .cb_resume    = in_metrics_resume,
     .cb_exit      = in_metrics_exit,
-    .event_type   = FLB_INPUT_METRICS
 };

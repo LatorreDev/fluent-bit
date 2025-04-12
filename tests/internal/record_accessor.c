@@ -23,6 +23,8 @@
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_sds_list.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/record_accessor/flb_ra_parser.h>
 #include <msgpack.h>
@@ -44,7 +46,7 @@ static int create_map(char *input_json, msgpack_object *out_map,
         return -1;
     }
     len = strlen(input_json);
-    ret = flb_pack_json(input_json, len, out_buf, &out_size, &type);
+    ret = flb_pack_json(input_json, len, out_buf, &out_size, &type, NULL);
     if (!TEST_CHECK(ret == 0)) {
         TEST_MSG("can't convert. input=%s", input_json);
         exit(EXIT_FAILURE);
@@ -145,7 +147,7 @@ void cb_translate()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -217,7 +219,7 @@ void cb_translate_tag()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -272,7 +274,7 @@ void cb_dots_subkeys()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -340,7 +342,7 @@ void cb_array_id()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -410,7 +412,7 @@ void cb_get_kv_pair()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -740,7 +742,7 @@ void cb_update_key()
     flb_ra_destroy(ra);
     flb_free(out_buf);
 }
-  
+
 void cb_dash_key()
 {
     int len;
@@ -762,7 +764,7 @@ void cb_dash_key()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -822,7 +824,7 @@ void cb_dot_and_slash_key()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -931,7 +933,7 @@ void cb_key_order_lookup()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -970,7 +972,7 @@ void cb_issue_4917()
     json = "{\"tool\": \"fluent\", \"sub\": {\"s1\": {\"s2\": \"bit\"}}}";
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -1458,7 +1460,7 @@ void cb_ra_translate_check()
 
     /* Convert to msgpack */
     len = strlen(json);
-    ret = flb_pack_json(json, len, &out_buf, &out_size, &type);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
     if (ret == -1) {
         exit(EXIT_FAILURE);
@@ -1496,6 +1498,721 @@ void cb_ra_translate_check()
     msgpack_unpacked_destroy(&result);
 }
 
+/*
+ * https://github.com/fluent/fluent-bit/issues/5936
+ *  If the last nested element is an array, record accessor can't get its value.
+ */
+void cb_issue_5936_last_array()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON message */
+    json ="{ \"key\": {\"nested\":[\"val0\", \"val1\"]}}";
+
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter */
+    fmt = flb_sds_create("$key['nested'][1]");
+    fmt_out = "val1";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+struct char_list_ra_str{
+    char **strs;
+    char *expect;
+};
+
+void cb_ra_create_str_from_list()
+{
+    char *case1[] = {"a", NULL};
+    char *case2[] = {"aa", "bb", "cc", NULL};
+
+    struct char_list_ra_str testcases[] = {
+        { .strs = &case1[0], .expect = "$a"},
+        { .strs = &case2[0], .expect = "$aa['bb']['cc']"},
+    };
+    size_t case_size = sizeof(testcases)/sizeof(struct char_list_ra_str);
+    int case_i;
+    struct flb_sds_list *list = NULL;
+    flb_sds_t ret_str;
+    char *str;
+    int i;
+    int ret;
+
+    for (case_i = 0; case_i < case_size; case_i++) {
+        list = flb_sds_list_create();
+        if (!TEST_CHECK(list != NULL)) {
+            TEST_MSG("%d: flb_sds_list_create failed", case_i);
+            exit(EXIT_FAILURE);
+        }
+        i = 0;
+        while(testcases[case_i].strs[i] != NULL) {
+            str = testcases[case_i].strs[i];
+            ret = flb_sds_list_add(list, str, strlen(str));
+            if (!TEST_CHECK(ret == 0)) {
+                TEST_MSG("%d: flb_sds_list_add failed", case_i);
+                flb_sds_list_destroy(list);
+                exit(EXIT_FAILURE);
+            }
+            i++;
+        }
+
+        ret_str = flb_ra_create_str_from_list(list);
+        if (!TEST_CHECK(ret_str != NULL)) {
+            TEST_MSG("%d: flb_ra_create_str_from failed", case_i);
+            flb_sds_list_destroy(list);
+            exit(EXIT_FAILURE);
+        }
+        if (!TEST_CHECK(strcmp(testcases[case_i].expect, ret_str) == 0)) {
+            TEST_MSG("%d: strcmp error.got=%s expect=%s", case_i, ret_str, testcases[case_i].expect);
+        }
+
+        flb_sds_destroy(ret_str);
+        flb_sds_list_destroy(list);
+    }
+
+
+    /* Error if we pass empty list */
+    list = flb_sds_list_create();
+    if (!TEST_CHECK(list != NULL)) {
+        TEST_MSG("flb_sds_list_create failed");
+        exit(EXIT_FAILURE);
+    }
+    ret_str = flb_ra_create_str_from_list(list);
+    if (!TEST_CHECK(ret_str == NULL)) {
+        TEST_MSG("flb_ra_create_str_from should be failed");
+        flb_sds_list_destroy(list);
+        exit(EXIT_FAILURE);
+    }
+    flb_sds_list_destroy(list);
+}
+
+/*
+ * https://github.com/fluent/fluent-bit/issues/7330
+ */
+void cb_issue_7330_single_char()
+{
+    int ret;
+    int type;
+    char *json;
+    char *out_buf = NULL;
+    size_t out_size;
+    size_t off = 0;
+    flb_sds_t input = NULL;
+    flb_sds_t out_tag = NULL;
+    struct flb_regex_search regex_result;
+    struct flb_record_accessor *ra_tag = NULL;
+    msgpack_unpacked result;
+    msgpack_object map;
+
+    json = "{\"tool\":\"fluent\"}";
+    ret = flb_pack_json(json, strlen(json), &out_buf, &out_size, &type, NULL);
+    if (!TEST_CHECK(ret == 0)) {
+        TEST_MSG("flb_pack_json failed");
+        exit(EXIT_FAILURE);
+    }
+
+    input = flb_sds_create("b");
+    if (!TEST_CHECK(input != NULL)) {
+        goto issue_7330;
+    }
+
+    /* create flb_record_accessor from single character */
+    ra_tag = flb_ra_create(input, FLB_FALSE);
+    if (!TEST_CHECK(ra_tag != NULL)) {
+        TEST_MSG("flb_ra_create failed");
+        goto issue_7330;
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    out_tag = flb_ra_translate(ra_tag, "old", 3, map, &regex_result);
+    msgpack_unpacked_destroy(&result);
+    if (!TEST_CHECK(out_tag != NULL)) {
+        TEST_MSG("flb_ra_translate failed");
+        goto issue_7330;
+    }
+    else if (!TEST_CHECK(flb_sds_len(out_tag) > 0)) {
+        TEST_MSG("out_tag len error. len=%zd", flb_sds_len(out_tag));
+        goto issue_7330;
+    }
+
+ issue_7330:
+    if (input) {
+        flb_sds_destroy(input);
+    }
+    if (out_tag) {
+        flb_sds_destroy(out_tag);
+    }
+    if (out_buf) {
+        flb_free(out_buf);
+    }
+    if (ra_tag) {
+        flb_ra_destroy(ra_tag);
+    }
+}
+
+void cb_direct_array_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with direct array */
+    json = "{\"array\": [\"a\", \"b\", \"c\"]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter for direct array access */
+    fmt = flb_sds_create("$array[0]");
+    fmt_out = "a";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== direct array access test ==\n== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_nested_array_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with nested arrays */
+    json = "{\"matrix\": [[1, 2, 3], [4, 5, 6], [7, 8, 9]]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter for nested array access */
+    fmt = flb_sds_create("$matrix[1][2]");  /* Should access the value 6 */
+    fmt_out = "6";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== nested array access test ==\n== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_mixed_array_map_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with array containing maps */
+    json = "{\"records\": [{\"name\": \"John\", \"age\": 30}, {\"name\": \"Jane\", \"age\": 25}]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter for mixed array+map access */
+    fmt = flb_sds_create("$records[1]['name']");  /* Should access "Jane" */
+    fmt_out = "Jane";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== mixed array+map access test ==\n== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_direct_array_element_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    char *fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with direct array - matches the example in the issue */
+    json = "{\"array\": [\"a\", \"b\", \"c\"]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter for accessing the second element in the array */
+    fmt = flb_sds_create("$array[1]");  /* Should access the value "b" */
+    fmt_out = "b";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+    printf("== direct array element access test ==\n== input ==\n%s\n== output ==\n%s\n", str, fmt_out);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_array_index_overflow()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with array */
+    json = "{\"array\": [\"a\", \"b\", \"c\"]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter with out-of-bounds index */
+    fmt = flb_sds_create("$array[99]");  /* Access beyond array bounds */
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation - should return empty string for out-of-bounds */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+
+    if (str) {
+        TEST_CHECK(flb_sds_len(str) == 0);
+        flb_sds_destroy(str);
+    }
+
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_nonexistent_key_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON */
+    json = "{\"key1\": \"value1\", \"key2\": {\"nested\": \"value2\"}}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Formatter for nonexistent key */
+    fmt = flb_sds_create("$nonexistent_key");
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Unpack msgpack object */
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    /* Do translation - should return empty string for nonexistent key */
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+
+    if (str) {
+        TEST_CHECK(flb_sds_len(str) == 0);
+        flb_sds_destroy(str);
+    }
+
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    flb_free(out_buf);
+    msgpack_unpacked_destroy(&result);
+}
+
+void cb_wrong_type_access()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    flb_sds_t fmt;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with mixed types */
+    json = "{\"string\": \"text\", \"number\": 123, \"bool\": true, \"array\": [1,2,3]}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Array access on string - returns original string value */
+    fmt = flb_sds_create("$string[0]");
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+
+    if (str) {
+        TEST_CHECK(flb_sds_len(str) > 0);
+        TEST_CHECK(memcmp(str, "text", 4) == 0);
+        flb_sds_destroy(str);
+    }
+
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    msgpack_unpacked_destroy(&result);
+
+    /* Map access on number - returns number as string */
+    fmt = flb_sds_create("$number['key']");
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    off = 0;
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+
+    if (str) {
+        TEST_CHECK(flb_sds_len(str) > 0);
+        TEST_CHECK(memcmp(str, "123", 3) == 0);
+        flb_sds_destroy(str);
+    }
+
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    msgpack_unpacked_destroy(&result);
+
+    flb_free(out_buf);
+}
+
+void cb_nested_failure_recovery()
+{
+    int len;
+    int ret;
+    int type;
+    size_t off = 0;
+    char *out_buf;
+    size_t out_size;
+    char *json;
+    flb_sds_t fmt;
+    char *fmt_out;
+    flb_sds_t str;
+    msgpack_unpacked result;
+    msgpack_object map;
+    struct flb_record_accessor *ra;
+
+    /* Sample JSON with nested structure */
+    json = "{\"level1\": {\"level2\": {\"valid\": \"found\"}}}";
+
+    /* Convert to msgpack */
+    len = strlen(json);
+    ret = flb_pack_json(json, len, &out_buf, &out_size, &type, NULL);
+    TEST_CHECK(ret == 0);
+    if (ret == -1) {
+        exit(EXIT_FAILURE);
+    }
+
+    /* Test invalid intermediate path */
+    fmt = flb_sds_create("$level1['nonexistent']['key']");
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+
+    if (str) {
+        TEST_CHECK(flb_sds_len(str) == 0);
+        flb_sds_destroy(str);
+    }
+
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    msgpack_unpacked_destroy(&result);
+
+    /* Test valid nested path */
+    fmt = flb_sds_create("$level1['level2']['valid']");
+    fmt_out = "found";
+
+    ra = flb_ra_create(fmt, FLB_FALSE);
+    TEST_CHECK(ra != NULL);
+    if (!ra) {
+        exit(EXIT_FAILURE);
+    }
+
+    off = 0;
+    msgpack_unpacked_init(&result);
+    msgpack_unpack_next(&result, out_buf, out_size, &off);
+    map = result.data;
+
+    str = flb_ra_translate(ra, NULL, -1, map, NULL);
+    TEST_CHECK(str != NULL);
+    if (!str) {
+        exit(EXIT_FAILURE);
+    }
+
+    TEST_CHECK(flb_sds_len(str) == strlen(fmt_out));
+    TEST_CHECK(memcmp(str, fmt_out, strlen(fmt_out)) == 0);
+
+    flb_sds_destroy(str);
+    flb_sds_destroy(fmt);
+    flb_ra_destroy(ra);
+    msgpack_unpacked_destroy(&result);
+
+    flb_free(out_buf);
+}
+
 TEST_LIST = {
     { "keys"            , cb_keys},
     { "dash_key"        , cb_dash_key},
@@ -1518,5 +2235,16 @@ TEST_LIST = {
     { "add_root_key_val", cb_add_root_key_val},
     { "issue_4917"      , cb_issue_4917},
     { "flb_ra_translate_check" , cb_ra_translate_check},
+    { "issue_5936_last_array"      , cb_issue_5936_last_array},
+    { "ra_create_str_from_list", cb_ra_create_str_from_list},
+    { "issue_7330_single_character"  , cb_issue_7330_single_char},
+    { "direct_array_access", cb_direct_array_access },
+    { "nested_array_access", cb_nested_array_access },
+    { "mixed_array_map_access", cb_mixed_array_map_access },
+    { "direct_array_element_access", cb_direct_array_element_access },
+    { "array_index_overflow", cb_array_index_overflow },
+    { "nonexistent_key_access", cb_nonexistent_key_access },
+    { "wrong_type_access", cb_wrong_type_access },
+    { "nested_failure_recovery", cb_nested_failure_recovery },
     { NULL }
 };

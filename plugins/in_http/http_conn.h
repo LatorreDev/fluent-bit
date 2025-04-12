@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,14 +21,13 @@
 #define FLB_IN_HTTP_CONN
 
 #include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_connection.h>
+
 #include <monkey/mk_http.h>
 #include <monkey/mk_http_parser.h>
 #include <monkey/mk_utils.h>
 
 struct http_conn {
-    struct mk_event event;      /* Built-in event data for mk_events */
-    int fd;                     /* socket connection */
-
     /* Buffer */
     char *buf_data;             /* Buffer data                       */
     int  buf_len;               /* Data length                       */
@@ -41,12 +40,13 @@ struct http_conn {
     struct mk_http_parser parser;
     struct mk_http_request request;
     struct mk_http_session session;
+    struct flb_connection *connection;
 
     void *ctx;                  /* Plugin parent context             */
     struct mk_list _head;       /* link to flb_http->connections     */
 };
 
-struct http_conn *http_conn_add(int fd, struct flb_http *ctx);
+struct http_conn *http_conn_add(struct flb_connection *connection, struct flb_http *ctx);
 int http_conn_del(struct http_conn *conn);
 void http_conn_release_all(struct flb_http *ctx);
 

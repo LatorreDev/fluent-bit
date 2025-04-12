@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,14 +28,15 @@
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_upstream_queue.h>
+#include <fluent-bit/flb_stream.h>
 
-#ifdef FLB_HAVE_TLS
-#endif
+#include <cmetrics/cmetrics.h>
+#include <cmetrics/cmt_gauge.h>
 
 /*
  * Upstream creation FLAGS set by Fluent Bit sub-components
  * ========================================================
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  * --- flb_io.h ---
  *   #define  FLB_IO_TCP      1
@@ -47,47 +48,40 @@
 
 /* Upstream handler */
 struct flb_upstream {
-    int flags;
-    int tcp_port;
-    char *tcp_host;
-    int proxied_port;
-    char *proxied_host;
-    char *proxy_username;
-    char *proxy_password;
+    struct flb_stream          base;
 
-    /* Networking setup for timeouts and network interfaces */
-    struct flb_net_setup net;
+    char                      *tcp_host;
+    int                        tcp_port;
+
+    char                      *proxied_host;
+    int                        proxied_port;
+    char                      *proxy_username;
+    char                      *proxy_password;
 
     /*
      * If an upstream context has been created in HA mode, this flag is
      * set to True and the field 'ha_ctx' will reference a HA upstream
      * context.
      */
-    int ha_mode;
-    void *ha_ctx;
+    int                        ha_mode;
+    void                      *ha_ctx;
+
+    struct cmt_gauge          *cmt_total_connections;
+    struct cmt_gauge          *cmt_busy_connections;
+    const char                *cmt_total_connections_label;
+    const char                *cmt_busy_connections_label;
 
     /*
      * If the connections will be in separate threads, this flag is
      * enabled and all lists management are protected through mutexes.
      */
-    int thread_safe;
-    pthread_mutex_t mutex_lists;
-
-    void *parent_upstream;
+    void                     *parent_upstream;
     struct flb_upstream_queue queue;
-
-#ifdef FLB_HAVE_TLS
-    struct flb_tls *tls;
-#endif
-
-    struct flb_config *config;
-    struct mk_list _head;
 };
-
 
 static inline int flb_upstream_is_shutting_down(struct flb_upstream *u)
 {
-    return u->config->is_shutting_down;
+    return flb_stream_is_shutting_down(&u->base);
 }
 
 void flb_upstream_queue_init(struct flb_upstream_queue *uq);
@@ -111,5 +105,19 @@ int flb_upstream_is_async(struct flb_upstream *u);
 void flb_upstream_thread_safe(struct flb_upstream *u);
 struct mk_list *flb_upstream_get_config_map(struct flb_config *config);
 int flb_upstream_needs_proxy(const char *host, const char *proxy, const char *no_proxy);
+
+void flb_upstream_set_total_connections_label(
+        struct flb_upstream *stream,
+        const char *label_value);
+void flb_upstream_set_total_connections_gauge(
+        struct flb_upstream *stream,
+        struct cmt_gauge *gauge_instance);
+
+void flb_upstream_set_busy_connections_label(
+        struct flb_upstream *stream,
+        const char *label_value);
+void flb_upstream_set_busy_connections_gauge(
+        struct flb_upstream *stream,
+        struct cmt_gauge *gauge_instance);
 
 #endif

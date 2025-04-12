@@ -7,11 +7,17 @@ set(src
   flb_hs.c
   flb_hs_endpoints.c
   flb_hs_utils.c
+  flb_http_server.c
+  flb_http_server_http1.c
+  flb_http_server_http2.c
   )
 
 # api/v1
 add_subdirectory(api/v1)
 
+# api/v2
+add_subdirectory(api/v2)
+
 include_directories(${MONKEY_INCLUDE_DIR})
 add_library(flb-http-server STATIC ${src})
-target_link_libraries(flb-http-server monkey-core-static api-v1)
+target_link_libraries(flb-http-server monkey-core-static api-v1 api-v2)

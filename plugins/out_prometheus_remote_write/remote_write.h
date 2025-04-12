@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,12 +26,27 @@
 #define FLB_PROMETHEUS_REMOTE_WRITE_MIME_PROTOBUF_LITERAL    "application/x-protobuf"
 #define FLB_PROMETHEUS_REMOTE_WRITE_VERSION_HEADER_NAME      "X-Prometheus-Remote-Write-Version"
 #define FLB_PROMETHEUS_REMOTE_WRITE_VERSION_LITERAL          "0.1.0"
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+#define FLB_PROMETHEUS_REMOTE_WRITE_CREDENTIAL_PREFIX "aws_"
+#endif
+#endif
 
 /* Plugin context */
 struct prometheus_remote_write_context {
     /* HTTP Auth */
     char *http_user;
     char *http_passwd;
+
+    /* AWS Auth */
+#ifdef FLB_HAVE_SIGNV4
+#ifdef FLB_HAVE_AWS
+    int has_aws_auth;
+    struct flb_aws_provider *aws_provider;
+    const char *aws_region;
+    const char *aws_service;
+#endif
+#endif
 
     /* Proxy */
     const char *proxy;
@@ -43,7 +58,9 @@ struct prometheus_remote_write_context {
     char *host;
     int port;
 
-    /* Log the response paylod */
+    const char *compression;
+
+    /* Log the response payload */
     int log_response_payload;
 
     /* config reader for 'add_label' */

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -78,9 +78,12 @@ struct flb_metrics *flb_metrics_create(const char *title)
 {
     int ret;
     struct flb_metrics *metrics;
+    size_t title_len = 0;
+    char *allocated_title = NULL;
+    size_t threshold = FLB_METRIC_LENGTH_LIMIT;
 
     /* Create a metrics parent context */
-    metrics = flb_malloc(sizeof(struct flb_metrics));
+    metrics = flb_calloc(1, sizeof(struct flb_metrics));
     if (!metrics) {
         flb_errno();
         return NULL;
@@ -102,20 +105,33 @@ struct flb_metrics *flb_metrics_create(const char *title)
 int flb_metrics_title(const char *title, struct flb_metrics *metrics)
 {
     int ret;
+    int len;
 
-    ret = snprintf(metrics->title, sizeof(metrics->title) - 1, "%s", title);
-    if (ret == -1) {
+    len  = strlen(title);
+    if (len > FLB_METRIC_LENGTH_LIMIT) {
+        flb_warn("[%s] title '%s' was truncated", __FUNCTION__, title);
+        len = FLB_METRIC_LENGTH_LIMIT;
+    }
+
+    if (metrics->title) {
+        flb_sds_destroy(metrics->title);
+    }
+
+    metrics->title = flb_sds_create_len(title, len);
+    if (!metrics->title) {
         flb_errno();
         return -1;
     }
-    metrics->title_len = strlen(metrics->title);
+
     return 0;
 }
 
 int flb_metrics_add(int id, const char *title, struct flb_metrics *metrics)
 {
     int ret;
+    int len;
     struct flb_metric *m;
+    size_t threshold = FLB_METRIC_LENGTH_LIMIT;
 
     /* Create context */
     m = flb_malloc(sizeof(struct flb_metric));
@@ -124,15 +140,19 @@ int flb_metrics_add(int id, const char *title, struct flb_metrics *metrics)
         return -1;
     }
     m->val = 0;
+    len = strlen(title);
 
-    /* Write title */
-    ret = snprintf(m->title, sizeof(m->title) - 1, "%s", title);
-    if (ret == -1) {
+    if (len > threshold) {
+        len = threshold;
+        flb_warn("[%s] title '%s' was truncated", __FUNCTION__, title);
+    }
+
+    m->title = flb_sds_create_len(title, len);
+    if (!m->title) {
         flb_errno();
         flb_free(m);
         return -1;
     }
-    m->title_len = strlen(m->title);
 
     /* Assign an ID */
     if (id >= 0) {
@@ -140,6 +160,7 @@ int flb_metrics_add(int id, const char *title, struct flb_metrics *metrics)
         if (id_exists(id, metrics) == FLB_TRUE) {
             flb_error("[metrics] id=%i already exists for metric '%s'",
                       id, metrics->title);
+            flb_sds_destroy(m->title);
             flb_free(m);
             return -1;
         }
@@ -179,10 +200,12 @@ int flb_metrics_destroy(struct flb_metrics *metrics)
     mk_list_foreach_safe(head, tmp, &metrics->list) {
         m = mk_list_entry(head, struct flb_metric, _head);
         mk_list_del(&m->_head);
+        flb_sds_destroy(m->title);
         flb_free(m);
         count++;
     }
 
+    flb_sds_destroy(metrics->title);
     flb_free(metrics);
     return count;
 }
@@ -220,8 +243,8 @@ int flb_metrics_dump_values(char **out_buf, size_t *out_size,
 
     mk_list_foreach(head, &me->list) {
         m = mk_list_entry(head, struct flb_metric, _head);
-        msgpack_pack_str(&mp_pck, m->title_len);
-        msgpack_pack_str_body(&mp_pck, m->title, m->title_len);
+        msgpack_pack_str(&mp_pck, flb_sds_len(m->title));
+        msgpack_pack_str_body(&mp_pck, m->title, flb_sds_len(m->title));
         msgpack_pack_uint64(&mp_pck, m->val);
     }
 
@@ -310,6 +333,25 @@ static int attach_build_info(struct flb_config *ctx, struct cmt *cmt, uint64_t t
     return 0;
 }
 
+static int attach_hot_reload_info(struct flb_config *ctx, struct cmt *cmt, uint64_t ts,
+                                  char *hostname)
+{
+    double val;
+    struct cmt_gauge *g;
+
+    g = cmt_gauge_create(cmt, "fluentbit", "", "hot_reloaded_times",
+                         "Collect the count of hot reloaded times.",
+                         1, (char *[]) {"hostname"});
+    if (!g) {
+        return -1;
+    }
+
+    val = (double) ctx->hot_reloaded_count;
+
+    cmt_gauge_set(g, ts, val, 1, (char *[]) {hostname});
+    return 0;
+}
+
 /* Append internal Fluent Bit metrics to context */
 int flb_metrics_fluentbit_add(struct flb_config *ctx, struct cmt *cmt)
 {
@@ -318,7 +360,7 @@ int flb_metrics_fluentbit_add(struct flb_config *ctx, struct cmt *cmt)
     char hostname[128];
 
     /* current timestamp */
-    ts = cmt_time_now();
+    ts = cfl_time_now();
 
     /* get hostname */
     ret = gethostname(hostname, sizeof(hostname) - 1);
@@ -330,6 +372,7 @@ int flb_metrics_fluentbit_add(struct flb_config *ctx, struct cmt *cmt)
     attach_uptime(ctx, cmt, ts, hostname);
     attach_process_start_time_seconds(ctx, cmt, ts, hostname);
     attach_build_info(ctx, cmt, ts, hostname);
+    attach_hot_reload_info(ctx, cmt, ts, hostname);
 
     return 0;
 }

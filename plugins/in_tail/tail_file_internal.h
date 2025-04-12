@@ -24,6 +24,9 @@
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_gzip.h>
+#include <fluent-bit/flb_compression.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 
 #ifdef FLB_HAVE_PARSER
 #include <fluent-bit/multiline/flb_ml.h>
@@ -38,7 +41,8 @@ struct flb_tail_file {
     /* file lookup info */
     int fd;
     int64_t size;
-    int64_t offset;
+    int64_t offset;             /* this represents the raw file offset, not
+                                   the input data offset (see stream_offset) */
     int64_t last_line;
     uint64_t  dev_id;
     uint64_t  inode;
@@ -51,6 +55,9 @@ struct flb_tail_file {
     size_t orig_name_len;
     time_t rotated;
     int64_t pending_bytes;
+    size_t stream_offset;       /* this represents the logical data offset
+                                   which for compressed files could be higher
+                                   than the file size or offset */
 
     /* dynamic tag for this file */
     int tag_len;
@@ -62,7 +69,6 @@ struct flb_tail_file {
     int mult_firstline_append;  /* bool: mult firstline appendable ?     */
     int mult_skipping;          /* skipping because ignode_older than ?  */
     int mult_keys;              /* total number of buffered keys         */
-
 
     int mult_records;           /* multiline records counter mult_sbuf   */
     msgpack_sbuffer mult_sbuf;  /* temporary msgpack buffer              */
@@ -78,14 +84,14 @@ struct flb_tail_file {
 
     /* multiline engine: file stream_id and local buffers */
     uint64_t ml_stream_id;
-    msgpack_sbuffer ml_sbuf;  /* temporary msgpack buffer              */
-    msgpack_packer ml_pck;    /* temporary msgpack packer              */
 
     /* content parsing, positions and buffer */
     size_t parsed;
     size_t buf_len;
     size_t buf_size;
     char *buf_data;
+
+    struct flb_decompression_context *decompression_context;
 
     /*
      * This value represent the number of bytes procesed by process_content()
@@ -113,6 +119,15 @@ struct flb_tail_file {
 
     uint64_t hash_bits;
     flb_sds_t hash_key;
+
+    /* There are dedicated log event encoders for
+     * single and multi line events because I am respecting
+     * the old behavior which resulted in grouping both types
+     * of logs in tail_file.c but I don't know if this is
+     * strictly necessary.
+     */
+    struct flb_log_event_encoder *ml_log_event_encoder;
+    struct flb_log_event_encoder *sl_log_event_encoder;
 
     /* reference */
     int tail_mode;

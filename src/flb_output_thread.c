@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_output_thread.h>
 #include <fluent-bit/flb_thread_pool.h>
+#include <fluent-bit/flb_notification.h>
 
 static pthread_once_t local_thread_instance_init = PTHREAD_ONCE_INIT;
 FLB_TLS_DEFINE(struct flb_out_thread_instance, local_thread_instance);
@@ -70,7 +71,7 @@ static inline int handle_output_event(struct flb_config *config,
 
     bytes = flb_pipe_r(fd, &val, sizeof(val));
     if (bytes == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -96,7 +97,7 @@ static inline int handle_output_event(struct flb_config *config,
      */
     ret = flb_pipe_w(ch_parent, &val, sizeof(val));
     if (ret == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -116,7 +117,7 @@ static int upstream_thread_create(struct flb_out_thread_instance *th_ins,
     struct flb_upstream *th_u;
 
     mk_list_foreach(head, &ins->upstreams) {
-        u = mk_list_entry(head, struct flb_upstream, _head);
+        u = mk_list_entry(head, struct flb_upstream, base._head);
 
         th_u = flb_calloc(1, sizeof(struct flb_upstream));
         if (!th_u) {
@@ -125,7 +126,7 @@ static int upstream_thread_create(struct flb_out_thread_instance *th_ins,
         }
         th_u->parent_upstream = u;
         flb_upstream_queue_init(&th_u->queue);
-        mk_list_add(&th_u->_head, &th_ins->upstreams);
+        mk_list_add(&th_u->base._head, &th_ins->upstreams);
     }
 
     return 0;
@@ -138,7 +139,7 @@ int count_upstream_busy_connections(struct flb_out_thread_instance *th_ins)
     struct flb_upstream *u;
 
     mk_list_foreach(head, &th_ins->upstreams) {
-        u = mk_list_entry(head, struct flb_upstream, _head);
+        u = mk_list_entry(head, struct flb_upstream, base._head);
         c += mk_list_size(&u->queue.busy_queue);
     }
 
@@ -152,7 +153,7 @@ static void upstream_thread_destroy(struct flb_out_thread_instance *th_ins)
     struct flb_upstream *th_u;
 
     mk_list_foreach_safe(head, tmp, &th_ins->upstreams) {
-        th_u = mk_list_entry(head, struct flb_upstream, _head);
+        th_u = mk_list_entry(head, struct flb_upstream, base._head);
         flb_upstream_destroy(th_u);
     }
 }
@@ -176,12 +177,14 @@ static void output_thread(void *data)
     struct mk_event *event;
     struct flb_sched *sched;
     struct flb_task *task;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_output_instance *ins;
     struct flb_output_flush *out_flush;
     struct flb_out_thread_instance *th_ins = data;
     struct flb_out_flush_params *params;
+    struct flb_sched_timer_coro_cb_params *sched_params;
     struct flb_net_dns dns_ctx;
+    struct flb_notification *notification;
 
     /* Register thread instance */
     flb_output_thread_instance_set(th_ins);
@@ -229,6 +232,8 @@ static void output_thread(void *data)
     snprintf(tmp, sizeof(tmp) - 1, "flb-out-%s-w%i", ins->name, thread_id);
     mk_utils_worker_rename(tmp);
 
+    memset(&event_local, 0, sizeof(struct mk_event));
+
     /* Channel used by flush callbacks to notify it return status */
     ret = mk_event_channel_create(th_ins->evl,
                                   &th_ins->ch_thread_events[0],
@@ -241,13 +246,18 @@ static void output_thread(void *data)
     }
     event_local.type = FLB_ENGINE_EV_OUTPUT;
 
+    if (ins->p->cb_worker_init) {
+        ret = ins->p->cb_worker_init(ins->context, ins->config);
+    }
+
     flb_plg_info(th_ins->ins, "worker #%i started", thread_id);
 
     /* Thread event loop */
     while (running) {
         mk_event_wait(th_ins->evl);
         flb_event_priority_live_foreach(event, th_ins->evl_bktq, th_ins->evl,
-                                      FLB_ENGINE_LOOP_MAX_ITER) {
+                                         FLB_ENGINE_LOOP_MAX_ITER) {
+
             /*
              * FIXME
              * -----
@@ -265,14 +275,23 @@ static void output_thread(void *data)
                  */
                 flb_sched_event_handler(sched->config, event);
             }
+            else if (event->type & FLB_ENGINE_EV_SCHED_CORO) {
+                /*
+                 * Note that this scheduler event handler has more features
+                 * designed to be used from the parent thread, on this specific
+                 * use case we just care about simple timers created on this
+                 * thread or threaded by some output plugin.
+                 */
+                flb_sched_event_handler(sched->config, event);
+
+            }
             else if (event->type == FLB_ENGINE_EV_THREAD_OUTPUT) {
                 /* Read the task reference */
                 n = flb_pipe_r(event->fd, &task, sizeof(struct flb_task *));
                 if (n <= 0) {
-                    flb_errno();
+                    flb_pipe_error();
                     continue;
                 }
-
                 /*
                  * If the address receives 0xdeadbeef, means the thread must
                  * be terminated.
@@ -283,16 +302,17 @@ static void output_thread(void *data)
                                  thread_id);
                     continue;
                 }
-
-                /* Start the co-routine with the flush callback */
-                out_flush = flb_output_flush_create(task,
-                                                    task->i_ins,
-                                                    th_ins->ins,
-                                                    th_ins->config);
-                if (!out_flush) {
-                    continue;
+                else {
+                    /* Start the co-routine with the flush callback */
+                    out_flush = flb_output_flush_create(task,
+                                                        task->i_ins,
+                                                        th_ins->ins,
+                                                        th_ins->config);
+                    if (!out_flush) {
+                        continue;
+                    }
+                    flb_coro_resume(out_flush->coro);
                 }
-                flb_coro_resume(out_flush->coro);
             }
             else if (event->type == FLB_ENGINE_EV_CUSTOM) {
                 event->handler(event);
@@ -302,10 +322,11 @@ static void output_thread(void *data)
                  * Check if we have some co-routine associated to this event,
                  * if so, resume the co-routine
                  */
-                u_conn = (struct flb_upstream_conn *) event;
-                if (u_conn->coro) {
-                    flb_trace("[engine] resuming coroutine=%p", u_conn->coro);
-                    flb_coro_resume(u_conn->coro);
+                u_conn = (struct flb_connection *) event;
+
+                if (u_conn->coroutine) {
+                    flb_trace("[engine] resuming coroutine=%p", u_conn->coroutine);
+                    flb_coro_resume(u_conn->coroutine);
                 }
             }
             else if (event->type == FLB_ENGINE_EV_OUTPUT) {
@@ -318,6 +339,15 @@ static void output_thread(void *data)
                  */
                 handle_output_event(th_ins->config, ins->ch_events[1], event->fd);
             }
+            else if(event->type == FLB_ENGINE_EV_NOTIFICATION) {
+                ret = flb_notification_receive(event->fd, &notification);
+
+                if (ret == 0) {
+                    ret = flb_notification_deliver(notification);
+
+                    flb_notification_cleanup(notification);
+                }
+            }
             else {
                 flb_plg_warn(ins, "unhandled event type => %i\n", event->type);
             }
@@ -327,6 +357,7 @@ static void output_thread(void *data)
 
         /* Destroy upstream connections from the 'pending destroy list' */
         flb_upstream_conn_pending_destroy_list(&th_ins->upstreams);
+
         flb_sched_timer_cleanup(sched);
 
         /* Check if we should stop the event loop */
@@ -341,6 +372,14 @@ static void output_thread(void *data)
         }
     }
 
+    if (ins->p->cb_worker_exit) {
+        ret = ins->p->cb_worker_exit(ins->context, ins->config);
+    }
+
+    mk_event_channel_destroy(th_ins->evl,
+                             th_ins->ch_thread_events[0],
+                             th_ins->ch_thread_events[1],
+                             &event_local);
     /*
      * Final cleanup, destroy all resources associated with:
      *
@@ -359,7 +398,30 @@ static void output_thread(void *data)
     params = FLB_TLS_GET(out_flush_params);
     if (params) {
         flb_free(params);
+        FLB_TLS_SET(out_flush_params, NULL);
     }
+
+    sched_params = (struct flb_sched_timer_coro_cb_params *) FLB_TLS_GET(sched_timer_coro_cb_params);
+    if (sched_params != NULL) {
+        flb_free(sched_params);
+        FLB_TLS_SET(sched_timer_coro_cb_params, NULL);
+    }
+
+
+    mk_event_channel_destroy(th_ins->evl,
+                             th_ins->ch_parent_events[0],
+                             th_ins->ch_parent_events[1],
+                             th_ins);
+
+    if (th_ins->notification_channels_initialized == FLB_TRUE) {
+        mk_event_channel_destroy(th_ins->evl,
+                                 th_ins->notification_channels[0],
+                                 th_ins->notification_channels[1],
+                                 &th_ins->notification_event);
+
+        th_ins->notification_channels_initialized = FLB_FALSE;
+    }
+
     mk_event_loop_destroy(th_ins->evl);
     flb_bucket_queue_destroy(th_ins->evl_bktq);
 
@@ -388,7 +450,7 @@ int flb_output_thread_pool_flush(struct flb_task *task,
     n = flb_pipe_w(th_ins->ch_parent_events[1], &task, sizeof(struct flb_task*));
 
     if (n == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -480,6 +542,32 @@ int flb_output_thread_pool_create(struct flb_config *config,
         th_ins->event.type = FLB_ENGINE_EV_THREAD_OUTPUT;
         th_ins->event.priority = FLB_ENGINE_PRIORITY_THREAD;
 
+        if (i == 0) {
+            ret = mk_event_channel_create(th_ins->evl,
+                                        &th_ins->notification_channels[0],
+                                        &th_ins->notification_channels[1],
+                                        &th_ins->notification_event);
+            if (ret == -1) {
+                flb_plg_error(th_ins->ins, "could not create notification channel");
+
+                mk_event_channel_destroy(th_ins->evl,
+                                        th_ins->ch_parent_events[0],
+                                        th_ins->ch_parent_events[1],
+                                        th_ins);
+
+                mk_event_loop_destroy(th_ins->evl);
+                flb_bucket_queue_destroy(th_ins->evl_bktq);
+                flb_free(th_ins);
+
+                continue;
+            }
+
+            th_ins->notification_channels_initialized = FLB_TRUE;
+            th_ins->notification_event.type = FLB_ENGINE_EV_NOTIFICATION;
+
+            ins->notification_channel = th_ins->notification_channels[1];
+        }
+
         /* Spawn the thread */
         th = flb_tp_thread_create(tp, output_thread, th_ins, config);
         if (!th) {
@@ -543,7 +631,7 @@ void flb_output_thread_pool_destroy(struct flb_output_instance *ins)
         th_ins = th->params.data;
         n = flb_pipe_w(th_ins->ch_parent_events[1], &stop, sizeof(stop));
         if (n < 0) {
-            flb_errno();
+            flb_pipe_error();
             flb_plg_error(th_ins->ins, "could not signal worker thread");
             flb_free(th_ins);
             continue;

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -117,7 +117,30 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
     if (tmp) {
         ctx->sts_endpoint = (char *) tmp;
     }
-
+    /*
+     * Sets the port number for the Kinesis output plugin.
+     *
+     * This function uses the port number already set in the output instance's host structure.
+     * If the port is not set (0), the default HTTPS port is used.
+     *
+     * @param ins The output instance.
+     * @param ctx The Kinesis output plugin context.
+     */
+    flb_plg_debug(ins, "Retrieved port from ins->host.port: %d", ins->host.port);
+    
+    if (ins->host.port >= FLB_KINESIS_MIN_PORT && ins->host.port <= FLB_KINESIS_MAX_PORT) {
+        ctx->port = ins->host.port;
+        flb_plg_debug(ins, "Setting port to: %d", ctx->port);
+    }
+    else if (ins->host.port == 0) {
+        ctx->port = FLB_KINESIS_DEFAULT_HTTPS_PORT;
+        flb_plg_debug(ins, "Port not set. Using default HTTPS port: %d", ctx->port);
+    }
+    else {
+        flb_plg_error(ins, "Invalid port number: %d. Must be between %d and %d", 
+                      ins->host.port, FLB_KINESIS_MIN_PORT, FLB_KINESIS_MAX_PORT);
+        goto error;
+    }
 
     tmp = flb_output_get_property("log_key", ins);
     if (tmp) {
@@ -138,21 +161,23 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
     }
 
     /* one tls instance for provider, one for cw client */
-    ctx->cred_tls = flb_tls_create(FLB_TRUE,
-                                     ins->tls_debug,
-                                     ins->tls_vhost,
-                                     ins->tls_ca_path,
-                                     ins->tls_ca_file,
-                                     ins->tls_crt_file,
-                                     ins->tls_key_file,
-                                     ins->tls_key_passwd);
+    ctx->cred_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                   FLB_TRUE,
+                                   ins->tls_debug,
+                                   ins->tls_vhost,
+                                   ins->tls_ca_path,
+                                   ins->tls_ca_file,
+                                   ins->tls_crt_file,
+                                   ins->tls_key_file,
+                                   ins->tls_key_passwd);
 
     if (!ctx->cred_tls) {
         flb_plg_error(ctx->ins, "Failed to create tls context");
         goto error;
     }
 
-    ctx->client_tls = flb_tls_create(FLB_TRUE,
+    ctx->client_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                     FLB_TRUE,
                                      ins->tls_debug,
                                      ins->tls_vhost,
                                      ins->tls_ca_path,
@@ -170,7 +195,8 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
                                                            (char *) ctx->region,
                                                            ctx->sts_endpoint,
                                                            NULL,
-                                                           flb_aws_client_generator());
+                                                           flb_aws_client_generator(),
+                                                           ctx->profile);
     if (!ctx->aws_provider) {
         flb_plg_error(ctx->ins, "Failed to create AWS Credential Provider");
         goto error;
@@ -193,14 +219,15 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
         }
 
         /* STS provider needs yet another separate TLS instance */
-        ctx->sts_tls = flb_tls_create(FLB_TRUE,
-                                     ins->tls_debug,
-                                     ins->tls_vhost,
-                                     ins->tls_ca_path,
-                                     ins->tls_ca_file,
-                                     ins->tls_crt_file,
-                                     ins->tls_key_file,
-                                     ins->tls_key_passwd);
+        ctx->sts_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                      FLB_TRUE,
+                                      ins->tls_debug,
+                                      ins->tls_vhost,
+                                      ins->tls_ca_path,
+                                      ins->tls_ca_file,
+                                      ins->tls_crt_file,
+                                      ins->tls_key_file,
+                                      ins->tls_key_passwd);
         if (!ctx->sts_tls) {
             flb_errno();
             goto error;
@@ -251,14 +278,14 @@ static int cb_kinesis_init(struct flb_output_instance *ins,
     ctx->kinesis_client->region = (char *) ctx->region;
     ctx->kinesis_client->retry_requests = ctx->retry_requests;
     ctx->kinesis_client->service = "kinesis";
-    ctx->kinesis_client->port = 443;
+    ctx->kinesis_client->port = ctx->port;
     ctx->kinesis_client->flags = 0;
     ctx->kinesis_client->proxy = NULL;
     ctx->kinesis_client->static_headers = &content_type_header;
     ctx->kinesis_client->static_headers_len = 1;
 
     struct flb_upstream *upstream = flb_upstream_create(config, ctx->endpoint,
-                                                        443, FLB_IO_TLS,
+                                                        ctx->port, FLB_IO_TLS,
                                                         ctx->client_tls);
     if (!upstream) {
         flb_plg_error(ctx->ins, "Connection initialization error");
@@ -467,6 +494,13 @@ static struct flb_config_map config_map[] = {
      "Instead, it enables an immediate retry with no delay for networking "
      "errors, which may help improve throughput when there are transient/random "
      "networking issues."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "profile", NULL,
+     0, FLB_TRUE, offsetof(struct flb_kinesis, profile),
+     "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually stored in "
+     "$HOME/.aws/ directory."
     },
 
     /* EOF */

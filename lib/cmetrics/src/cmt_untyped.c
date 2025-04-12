@@ -2,7 +2,7 @@
 
 /*  CMetrics
  *  ========
- *  Copyright 2021 Eduardo Silva <eduardo@calyptia.com>
+ *  Copyright 2021-2022 The CMetrics Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ struct cmt_untyped *cmt_untyped_create(struct cmt *cmt,
         cmt_errno();
         return NULL;
     }
-    mk_list_add(&untyped->_head, &cmt->untypeds);
+    cfl_list_add(&untyped->_head, &cmt->untypeds);
 
     ret = cmt_opts_init(&untyped->opts, ns, subsystem, name, help);
     if (ret == -1) {
@@ -86,7 +86,7 @@ struct cmt_untyped *cmt_untyped_create(struct cmt *cmt,
 
 int cmt_untyped_destroy(struct cmt_untyped *untyped)
 {
-    mk_list_del(&untyped->_head);
+    cfl_list_del(&untyped->_head);
     cmt_opts_exit(&untyped->opts);
 
     if (untyped->map) {
@@ -106,8 +106,8 @@ int cmt_untyped_set(struct cmt_untyped *untyped, uint64_t timestamp, double val,
                                 labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(untyped->cmt, "unable to retrieve metric: %s for untyped %s_%s_%s",
-                      untyped->map, untyped->opts.ns, untyped->opts.subsystem,
+        cmt_log_error(untyped->cmt, "unable to retrieve metric for untyped %s_%s_%s",
+                      untyped->opts.ns, untyped->opts.subsystem,
                       untyped->opts.name);
         return -1;
     }
@@ -130,8 +130,8 @@ int cmt_untyped_get_val(struct cmt_untyped *untyped,
                                  &val);
     if (ret == -1) {
         cmt_log_error(untyped->cmt,
-                      "unable to retrieve metric value: %s for untyped %s_%s_%s",
-                      untyped->map, untyped->opts.ns, untyped->opts.subsystem,
+                      "unable to retrieve metric value for untyped %s_%s_%s",
+                      untyped->opts.ns, untyped->opts.subsystem,
                       untyped->opts.name);
         return -1;
     }

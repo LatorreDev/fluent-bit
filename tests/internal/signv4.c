@@ -187,6 +187,8 @@ static struct request *http_request_create(char *request)
         start = sep + 1;
         br = strchr(start, '\n');
         if (!br) {
+            flb_sds_destroy(key);
+
             break;
         }
 
@@ -264,7 +266,7 @@ static struct flb_http_client *convert_request_file(char *request,
                                                     struct flb_config *config)
 {
     struct flb_upstream *u;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *c;
     struct mk_list *head;
     struct flb_kv *kv;
@@ -279,13 +281,13 @@ static struct flb_http_client *convert_request_file(char *request,
     }
 
     /* Fake upstream connection */
-    u_conn = flb_calloc(1, sizeof(struct flb_upstream_conn));
+    u_conn = flb_calloc(1, sizeof(struct flb_connection));
     if (!u_conn) {
         flb_errno();
         flb_upstream_destroy(u);
         flb_free(config);
     }
-    u_conn->u = u;
+    u_conn->upstream = u;
 
     /* Convert TXT HTTP request to our local 'request' structure */
     req = http_request_create(request);
@@ -376,7 +378,7 @@ static void aws_test_destroy(struct aws_test *awt)
     }
 
     if (awt->c) {
-        flb_upstream_destroy(awt->c->u_conn->u);
+        flb_upstream_destroy(awt->c->u_conn->upstream);
         flb_free(awt->c->u_conn);
         flb_http_client_destroy(awt->c);
     }
@@ -443,7 +445,8 @@ static struct aws_test *aws_test_create(char *path, char *context,
     return awt;
 
  error:
-    //aws_test_destroy(awt);
+    aws_test_destroy(awt);
+
     return NULL;
 }
 
@@ -604,7 +607,7 @@ static void aws_test_suite()
                                   FLB_TRUE,  /* normalize URI ? */
                                   FLB_FALSE, /* add x-amz-date header ? */
                                   t, region, service,
-                                  0,
+                                  0, NULL,
                                   provider);
         TEST_CHECK(signature != NULL);
         if (signature) {

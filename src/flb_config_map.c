@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <fluent-bit/flb_slist.h>
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_config_map.h>
+#include <cfl/cfl.h>
 
 static int check_list_size(struct mk_list *list, int type)
 {
@@ -284,6 +285,11 @@ struct mk_list *flb_config_map_create(struct flb_config *config,
 
         new->type = m->type;
         new->name = flb_sds_create(m->name);
+        if (new->name == NULL) {
+            flb_free(new);
+            flb_config_map_destroy(list);
+            return NULL;
+        }
 
         /* Translate default value */
         if (m->def_value) {
@@ -464,6 +470,12 @@ int flb_config_map_properties_check(char *context_name,
             continue;
         }
 
+        if (strcasecmp(kv->key, "active") == 0 ||
+            strcasecmp(kv->key, "condition") == 0) {
+            /* Accept special core properties */
+            continue;
+        }
+
         /* Lookup the key into the provided map */
         mk_list_foreach(m_head, map) {
             m = mk_list_entry(m_head, struct flb_config_map, _head);
@@ -572,11 +584,12 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
     int ret;
     int len;
     char *base;
-    char *m_bool;
+    int *m_bool;
     int *m_i_num;
     double *m_d_num;
     size_t *m_s_num;
     flb_sds_t *m_str;
+    struct cfl_variant **m_variant;
     struct flb_kv *kv;
     struct mk_list *head;
     struct mk_list *m_head;
@@ -639,10 +652,10 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
         }
         else if (m->type == FLB_CONFIG_MAP_TIME) {
             m_i_num = (int *) (base + m->offset);
-            *m_i_num = m->value.val.s_num;
+            *m_i_num = m->value.val.i_num;
         }
         else if (m->type == FLB_CONFIG_MAP_BOOL) {
-            m_bool = (char *) (base + m->offset);
+            m_bool = (int *) (base + m->offset);
             *m_bool = m->value.val.boolean;
         }
         else if (m->type >= FLB_CONFIG_MAP_CLIST ||
@@ -658,7 +671,14 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
      */
     mk_list_foreach(head, properties) {
         kv = mk_list_entry(head, struct flb_kv, _head);
+
         if (kv->val == NULL) {
+            continue;
+        }
+
+        /* Skip special core properties */
+        if (strcasecmp(kv->key, "condition") == 0 ||
+            strcasecmp(kv->key, "active") == 0) {
             continue;
         }
 
@@ -766,7 +786,7 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
                 *m_d_num = atof(kv->val);
             }
             else if (m->type == FLB_CONFIG_MAP_BOOL) {
-                m_bool = (char *) (base + m->offset);
+                m_bool = (int *) (base + m->offset);
                 ret = flb_utils_bool(kv->val);
                 if (ret == -1) {
                     flb_error("[config map] invalid value for boolean property '%s=%s'",
@@ -782,6 +802,13 @@ int flb_config_map_set(struct mk_list *properties, struct mk_list *map, void *co
             else if (m->type == FLB_CONFIG_MAP_TIME) {
                 m_i_num = (int *) (base + m->offset);
                 *m_i_num = flb_utils_time_to_seconds(kv->val);
+            }
+            else if (m->type == FLB_CONFIG_MAP_VARIANT) {
+                m_variant = (struct cfl_variant **) (base + m->offset);
+                *m_variant = (struct cfl_variant *)kv->val;
+                /* Ownership of the object belongs to the config section, set it
+                 * to NULL to prevent flb_kv_item_destroy to attempt freeing it */
+                kv->val = NULL;
             }
             else if (m->type >= FLB_CONFIG_MAP_CLIST ||
                      m->type <= FLB_CONFIG_MAP_SLIST_4) {

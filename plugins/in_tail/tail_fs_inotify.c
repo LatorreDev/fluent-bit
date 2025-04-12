@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,21 +43,30 @@ static int debug_event_mask(struct flb_tail_config *ctx,
                             uint32_t mask)
 {
     flb_sds_t buf;
+    int buf_size = 256;
 
     /* Only enter this function if debug mode is allowed */
     if (flb_log_check(FLB_LOG_DEBUG) == 0) {
         return 0;
     }
 
+    if (file) {
+        buf_size = file->name_len + 128;
+    }
+    
+    if (buf_size < 256) {
+        buf_size = 256;
+    }
+
     /* Create buffer */
-    buf = flb_sds_create_size(256);
+    buf = flb_sds_create_size(buf_size);
     if (!buf) {
         return -1;
     }
 
     /* Print info into sds */
     if (file) {
-        flb_sds_printf(&buf, "inode=%"PRIu64" events: ", file->inode);
+        flb_sds_printf(&buf, "inode=%"PRIu64", %s, events: ", file->inode, file->name);
     }
     else {
         flb_sds_printf(&buf, "events: ");
@@ -289,6 +298,53 @@ static int tail_fs_event(struct flb_input_instance *ins,
     return 0;
 }
 
+static int in_tail_progress_check_callback(struct flb_input_instance *ins,
+                                           struct flb_config *config, void *context)
+{
+    int ret = 0;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct flb_tail_config *ctx = context;
+    struct flb_tail_file *file;
+    int pending_data_detected;
+    struct stat st;
+
+    (void) config;
+
+    pending_data_detected = FLB_FALSE;
+
+    mk_list_foreach_safe(head, tmp, &ctx->files_event) {
+        file = mk_list_entry(head, struct flb_tail_file, _head);
+
+        if (file->offset < file->size) {
+            pending_data_detected = FLB_TRUE;
+
+            continue;
+        }
+
+        ret = fstat(file->fd, &st);
+        if (ret == -1) {
+            flb_errno();
+            flb_plg_error(ins, "fstat error");
+
+            continue;
+        }
+
+        if (file->offset < st.st_size) {
+            file->size = st.st_size;
+            file->pending_bytes = (file->size - file->offset);
+
+            pending_data_detected = FLB_TRUE;
+        }
+    }
+
+    if (pending_data_detected) {
+       tail_signal_pending(ctx);
+    }
+
+    return 0;
+}
+
 /* File System events based on Inotify(2). Linux >= 2.6.32 is suggested */
 int flb_tail_fs_inotify_init(struct flb_input_instance *in,
                      struct flb_tail_config *ctx, struct flb_config *config)
@@ -315,6 +371,17 @@ int flb_tail_fs_inotify_init(struct flb_input_instance *in,
         return -1;
     }
     ctx->coll_fd_fs1 = ret;
+
+    /* Register callback to check current tail offsets */
+    ret = flb_input_set_collector_time(in, in_tail_progress_check_callback,
+                                       ctx->progress_check_interval,
+                                       ctx->progress_check_interval_nsec,
+                                       config);
+    if (ret == -1) {
+        flb_tail_config_destroy(ctx);
+        return -1;
+    }
+    ctx->coll_fd_progress_check = ret;
 
     return 0;
 }

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,9 @@ extern "C" {
 #endif
 
 #include <monkey/mk_core.h>
+
+#include <cfl/cfl.h>
+
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_str.h>
@@ -38,6 +41,9 @@ extern "C" {
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_engine.h>
 #include <fluent-bit/flb_lib.h>
+
+/* External plugins */
+#define FLB_PUBLIC __attribute__((visibility("default")))
 
 #ifdef __cplusplus
 }

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 
 #ifdef FLB_SYSTEM_WINDOWS
 #define poll WSAPoll
+#include <winsock2.h>
 #else
 #include <sys/poll.h>
 #endif
@@ -49,12 +50,46 @@
 #include <monkey/mk_core.h>
 #include <ares.h>
 
+#ifdef FLB_SYSTEM_MACOS
+#ifdef _GNU_SOURCE
+#undef _GNU_SOURCE
+#endif
+/* Use POSIX version of strerror_r forcibly on macOS. */
+#include <string.h>
+#endif
+
 #ifndef SOL_TCP
 #define SOL_TCP IPPROTO_TCP
 #endif
 
 static pthread_once_t local_thread_net_dns_ctx_init = PTHREAD_ONCE_INIT;
 FLB_TLS_DEFINE(struct flb_net_dns, flb_net_dns_ctx);
+
+/* Defines an async DNS lookup context */
+struct flb_dns_lookup_context {
+    struct mk_event              response_event;                  /* c-ares socket event */
+    int                          ares_socket_registered;
+    struct ares_socket_functions ares_socket_functions;
+    int                         *udp_timeout_detected;
+    int                          ares_socket_created;
+    int                          ares_socket_type;
+    void                        *ares_channel;
+    int                         *result_code;
+    struct mk_event_loop        *event_loop;
+    struct flb_coro             *coroutine;
+    struct flb_sched_timer      *udp_timer;
+    int                          finished;
+    int                          dropped;
+    struct flb_net_dns          *dns_ctx;
+    struct addrinfo            **result;
+    /* result is a synthetized result, don't call freeaddrinfo on it */
+    struct mk_list               _head;
+};
+
+#define FLB_DNS_LOOKUP_CONTEXT_FOR_EVENT(event) \
+    ((struct flb_dns_lookup_context *) \
+        &((uint8_t *) event)[-offsetof(struct flb_dns_lookup_context, response_event)])
+
 
 /*
  * Initialize thread-local-storage, every worker thread has it owns
@@ -104,9 +139,15 @@ void flb_net_setup_init(struct flb_net_setup *net)
     net->dns_mode = NULL;
     net->dns_resolver = NULL;
     net->dns_prefer_ipv4 = FLB_FALSE;
+    net->dns_prefer_ipv6 = FLB_FALSE;
     net->keepalive = FLB_TRUE;
     net->keepalive_idle_timeout = 30;
     net->keepalive_max_recycle = 0;
+    net->tcp_keepalive = FLB_FALSE;
+    net->tcp_keepalive_time = -1;
+    net->tcp_keepalive_interval = -1;
+    net->tcp_keepalive_probes = -1;
+    net->accept_timeout = 10;
     net->connect_timeout = 10;
     net->io_timeout = 0; /* Infinite time */
     net->source_address = NULL;
@@ -182,6 +223,25 @@ int flb_net_socket_reset(flb_sockfd_t fd)
     return 0;
 }
 
+int flb_net_socket_share_port(flb_sockfd_t fd)
+{
+    int on = 1;
+    int ret;
+
+#ifdef SO_REUSEPORT
+    ret = setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+#else
+    ret = -1;
+#endif
+
+    if (ret == -1) {
+        flb_errno();
+        return -1;
+    }
+
+    return 0;
+}
+
 int flb_net_socket_tcp_nodelay(flb_sockfd_t fd)
 {
     int on = 1;
@@ -204,6 +264,16 @@ int flb_net_socket_nonblocking(flb_sockfd_t fd)
 #else
     if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) == -1) {
 #endif
+        flb_errno();
+        return -1;
+    }
+
+    return 0;
+}
+
+int flb_net_socket_rcv_buffer(flb_sockfd_t fd, int rcvbuf)
+{
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0) {
         flb_errno();
         return -1;
     }
@@ -257,6 +327,54 @@ int flb_net_socket_tcp_fastopen(flb_sockfd_t fd)
 {
     int qlen = 5;
     return setsockopt(fd, SOL_TCP, TCP_FASTOPEN, &qlen, sizeof(qlen));
+}
+
+
+/*
+ * Enable TCP keepalive
+ */
+int flb_net_socket_tcp_keepalive(flb_sockfd_t fd, struct flb_net_setup *net)
+{
+    int interval;
+    int enabled;
+    int probes;
+    int time;
+    int ret;
+
+    enabled = 1;
+
+    time = net->tcp_keepalive_time;
+    probes = net->tcp_keepalive_probes;
+    interval = net->tcp_keepalive_interval;
+
+    ret = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
+                     (const void *) &enabled, sizeof(enabled));
+
+    if (ret == 0 && time >= 0) {
+#ifdef __APPLE__
+        ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE,
+#else
+                ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE,
+#endif
+                (const void *) &time, sizeof(time));    }
+
+    if (ret == 0 && interval >= 0) {
+        ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL,
+                         (const void *) &interval, sizeof(interval));
+    }
+
+    if (ret == 0 && probes >= 0) {
+        ret = setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT,
+                         (const void *) &probes, sizeof(probes));
+    }
+
+    if (ret != 0) {
+        flb_error("[net] failed to configure TCP keepalive for connection #%i", fd);
+
+        ret = -1;
+    }
+
+    return ret;
 }
 
 flb_sockfd_t flb_net_socket_create(int family, int nonblock)
@@ -382,7 +500,7 @@ static int net_connect_sync(int fd, const struct sockaddr *addr, socklen_t addrl
 static int net_connect_async(int fd,
                              const struct sockaddr *addr, socklen_t addrlen,
                              char *host, int port, int connect_timeout,
-                             void *async_ctx, struct flb_upstream_conn *u_conn)
+                             void *async_ctx, struct flb_connection *u_conn)
 {
     int ret;
     int err;
@@ -391,7 +509,9 @@ static int net_connect_async(int fd,
     uint32_t mask;
     char so_error_buf[256];
     char *str;
-    struct flb_upstream *u = u_conn->u;
+    struct flb_upstream *u;
+
+    u = u_conn->upstream;
 
     /* connect(2) */
     ret = connect(fd, addr, addrlen);
@@ -439,11 +559,15 @@ static int net_connect_async(int fd,
 
     /* Register the connection socket into the main event loop */
     MK_EVENT_ZERO(&u_conn->event);
+
     ret = mk_event_add(u_conn->evl,
                        fd,
                        FLB_ENGINE_EV_THREAD,
-                       MK_EVENT_WRITE, &u_conn->event);
+                       MK_EVENT_WRITE,
+                       &u_conn->event);
+
     u_conn->event.priority = FLB_ENGINE_PRIORITY_CONNECT;
+
     if (ret == -1) {
         /*
          * If we failed here there no much that we can do, just
@@ -452,7 +576,7 @@ static int net_connect_async(int fd,
         return -1;
     }
 
-    u_conn->coro = async_ctx;
+    u_conn->coroutine = async_ctx;
 
     /*
      * Return the control to the parent caller, we need to wait for
@@ -463,7 +587,7 @@ static int net_connect_async(int fd,
     /* We want this field to hold NULL at all times unless we are explicitly
      * waiting to be resumed.
      */
-    u_conn->coro = NULL;
+    u_conn->coroutine = NULL;
 
     /* Save the mask before the event handler do a reset */
     mask = u_conn->event.mask;
@@ -506,7 +630,20 @@ static int net_connect_async(int fd,
             }
 
             /* Connection is broken, not much to do here */
+#if ((defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L) ||    \
+     (defined(_XOPEN_SOURCE) || _XOPEN_SOURCE - 0L >= 600L)) &&     \
+  (!defined(_GNU_SOURCE))
+            ret = strerror_r(error, so_error_buf, sizeof(so_error_buf));
+            if (ret == 0) {
+                str = so_error_buf;
+            }
+            else {
+                flb_errno();
+                return -1;
+            }
+#else
             str = strerror_r(error, so_error_buf, sizeof(so_error_buf));
+#endif
             flb_error("[net] TCP connection failed: %s:%i (%s)",
                       u->tcp_host, u->tcp_port, str);
             return -1;
@@ -938,12 +1075,9 @@ static struct flb_dns_lookup_context *flb_net_dns_lookup_context_create(
         return NULL;
     }
 
-    /* c-ares options: Set the transport layer to the desired protocol and
-     *                 the number of retries to 2
-     */
+    /* c-ares options: Set the transport layer to the desired protocol */
 
     optmask = ARES_OPT_FLAGS;
-    opts.tries = 2;
 
     if (dns_mode == FLB_DNS_USE_TCP) {
         opts.flags = ARES_FLAG_USEVC;
@@ -1173,7 +1307,7 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
                                  char *source_addr, int connect_timeout,
                                  int is_async,
                                  void *async_ctx,
-                                 struct flb_upstream_conn *u_conn)
+                                 struct flb_connection *u_conn)
 {
     int ret;
     int use_async_dns;
@@ -1201,8 +1335,8 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
 
     use_async_dns = is_async;
 
-    if (u_conn->u->net.dns_resolver != NULL) {
-        resolver_initial = toupper(u_conn->u->net.dns_resolver[0]);
+    if (u_conn->net->dns_resolver != NULL) {
+        resolver_initial = toupper(u_conn->net->dns_resolver[0]);
 
         if (resolver_initial == FLB_DNS_LEGACY) {
             use_async_dns = FLB_FALSE;
@@ -1212,7 +1346,8 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
     /* retrieve DNS info */
     if (use_async_dns) {
         ret = flb_net_getaddrinfo(host, _port, &hints, &res,
-                                  u_conn->u->net.dns_mode, connect_timeout);
+                                  u_conn->net->dns_mode,
+                                  connect_timeout);
     }
     else {
         ret = getaddrinfo(host, _port, &hints, &res);
@@ -1246,11 +1381,27 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
 
     sorted_res = res;
 
-    if (u_conn->u->net.dns_prefer_ipv4) {
+    if (u_conn->net->dns_prefer_ipv4) {
         sorted_res = flb_net_sort_addrinfo_list(res, AF_INET);
 
         if (sorted_res == NULL) {
-            flb_debug("[net] error sorting getaddrinfo results");
+            flb_debug("[net] error sorting ipv4 getaddrinfo results");
+
+            if (use_async_dns) {
+                flb_net_free_translated_addrinfo(res);
+            }
+            else {
+                freeaddrinfo(res);
+            }
+
+            return -1;
+        }
+    }
+    else if (u_conn->net->dns_prefer_ipv6) {
+        sorted_res = flb_net_sort_addrinfo_list(res, AF_INET6);
+
+        if (sorted_res == NULL) {
+            flb_debug("[net] error sorting ipv6 getaddrinfo results");
 
             if (use_async_dns) {
                 flb_net_free_translated_addrinfo(res);
@@ -1289,6 +1440,7 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
         /* Bind a specific network interface ? */
         if (source_addr != NULL) {
             ret = flb_net_bind_address(fd, source_addr);
+
             if (ret == -1) {
                 flb_warn("[net] falling back to random interface");
             }
@@ -1301,12 +1453,14 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
         flb_net_socket_tcp_nodelay(fd);
 
         /* Set receive timeout */
-        flb_net_socket_set_rcvtimeout(fd, u_conn->u->net.io_timeout);
+        flb_net_socket_set_rcvtimeout(fd, u_conn->net->io_timeout);
 
         if (u_conn) {
             u_conn->fd = fd;
             u_conn->event.fd = fd;
         }
+
+        flb_connection_set_remote_host(u_conn, rp->ai_addr);
 
         /* Perform TCP connection */
         if (is_async == FLB_TRUE) {
@@ -1340,6 +1494,7 @@ flb_sockfd_t flb_net_tcp_connect(const char *host, unsigned long port,
             /* If the connection failed, just abort and report the problem */
             flb_debug("[net] socket #%i could not connect to %s:%s",
                       fd, address, _port);
+
             if (u_conn) {
                 u_conn->fd = -1;
                 u_conn->event.fd = -1;
@@ -1474,7 +1629,7 @@ int flb_net_tcp_fd_connect(flb_sockfd_t fd, const char *host, unsigned long port
     return ret;
 }
 
-flb_sockfd_t flb_net_server(const char *port, const char *listen_addr)
+flb_sockfd_t flb_net_server(const char *port, const char *listen_addr, int share_port)
 {
     flb_sockfd_t fd = -1;
     int ret;
@@ -1500,6 +1655,10 @@ flb_sockfd_t flb_net_server(const char *port, const char *listen_addr)
             continue;
         }
 
+        if (share_port) {
+            flb_net_socket_share_port(fd);
+        }
+
         flb_net_socket_tcp_nodelay(fd);
         flb_net_socket_reset(fd);
 
@@ -1520,7 +1679,7 @@ flb_sockfd_t flb_net_server(const char *port, const char *listen_addr)
     return fd;
 }
 
-flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr)
+flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr, int share_port)
 {
     flb_sockfd_t fd = -1;
     int ret;
@@ -1546,6 +1705,10 @@ flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr)
             continue;
         }
 
+        if (share_port) {
+            flb_net_socket_share_port(fd);
+        }
+
         ret = flb_net_bind_udp(fd, rp->ai_addr, rp->ai_addrlen);
         if(ret == -1) {
             flb_warn("Cannot listen on %s port %s", listen_addr, port);
@@ -1562,6 +1725,77 @@ flb_sockfd_t flb_net_server_udp(const char *port, const char *listen_addr)
 
     return fd;
 }
+
+#ifdef FLB_HAVE_UNIX_SOCKET
+flb_sockfd_t flb_net_server_unix(const char *listen_path,
+                                 int stream_mode,
+                                 int backlog,
+                                 int share_port)
+{
+    size_t             address_length;
+    size_t             path_length;
+    struct sockaddr_un address;
+    int                ret;
+    flb_sockfd_t       fd;
+
+    if (stream_mode) {
+        fd = flb_net_socket_create(AF_UNIX, FLB_TRUE);
+    }
+    else {
+        fd = flb_net_socket_create_udp(AF_UNIX, FLB_TRUE);
+    }
+
+    if (fd != -1) {
+        memset(&address, 0, sizeof(struct sockaddr_un));
+
+        path_length = strlen(listen_path);
+
+        address_length = offsetof(struct sockaddr_un, sun_path) +
+                         path_length +
+                         1;
+
+        address.sun_family = AF_UNIX;
+
+        strncpy(address.sun_path, listen_path, sizeof(address.sun_path));
+
+        if (share_port) {
+            flb_net_socket_share_port(fd);
+        }
+
+        if (stream_mode) {
+            ret = flb_net_bind(fd,
+                               (const struct sockaddr *) &address,
+                               address_length,
+                               backlog);
+        }
+        else {
+            ret = flb_net_bind_udp(fd,
+                                   (const struct sockaddr *) &address,
+                                   address_length);
+        }
+
+        if(ret == -1) {
+            flb_warn("Cannot bind to or listen on %s", listen_path);
+
+            flb_socket_close(fd);
+        }
+    }
+    else {
+        flb_error("Error creating server socket");
+    }
+
+    return fd;
+}
+#else
+flb_sockfd_t flb_net_server_unix(const char *listen_path,
+                                 int stream_mode,
+                                 int backlog)
+{
+    flb_error("Unix sockets are not available in this platform");
+
+    return -1;
+}
+#endif
 
 int flb_net_bind(flb_sockfd_t fd, const struct sockaddr *addr,
                  socklen_t addrlen, int backlog)
@@ -1600,14 +1834,22 @@ int flb_net_bind_udp(flb_sockfd_t fd, const struct sockaddr *addr,
 flb_sockfd_t flb_net_accept(flb_sockfd_t server_fd)
 {
     flb_sockfd_t remote_fd;
-    struct sockaddr sock_addr;
-    socklen_t socket_size = sizeof(struct sockaddr);
+    struct sockaddr_storage sock_addr = { 0 };
+    socklen_t socket_size = sizeof(sock_addr);
+
+    /*
+     * sock_addr used to be a sockaddr struct, but this was too
+     * small of a structure to handle IPV6 addresses (#9053).
+     * This would cause accept() to not accept the connection (with no error),
+     * and a loop would occur continually trying to accept the connection.
+     * The sockaddr_storage can handle both IPV4 and IPV6.
+     */
 
 #ifdef FLB_HAVE_ACCEPT4
-    remote_fd = accept4(server_fd, &sock_addr, &socket_size,
+    remote_fd = accept4(server_fd, (struct sockaddr*)&sock_addr, &socket_size,
                         SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
-    remote_fd = accept(server_fd, &sock_addr, &socket_size);
+    remote_fd = accept(server_fd, (struct sockaddr*)&sock_addr, &socket_size);
     flb_net_socket_nonblocking(remote_fd);
 #endif
 
@@ -1651,36 +1893,440 @@ int flb_net_address_to_str(int family, const struct sockaddr *addr,
     return 0;
 }
 
-int flb_net_socket_ip_str(flb_sockfd_t fd, char **buf, int size, unsigned long *len)
+#ifdef FLB_COMPILE_UNUSED_FUNCTIONS
+static int net_socket_get_local_address(flb_sockfd_t fd,
+                                        struct sockaddr_storage *address)
 {
-    int ret;
-    struct sockaddr_storage addr;
-    socklen_t s_len = sizeof(addr);
+    socklen_t buffer_size;
+    int       result;
 
-    ret = getpeername(fd, (struct sockaddr *) &addr, &s_len);
-    if (ret == -1) {
+    buffer_size = sizeof(struct sockaddr_storage);
+
+    result = getsockname(fd, (struct sockaddr *) &address, &buffer_size);
+
+    if (result == -1) {
         return -1;
     }
 
+    return 0;
+}
+#endif
+
+static int net_socket_get_peer_address(flb_sockfd_t fd,
+                                       struct sockaddr_storage *address)
+{
+    socklen_t buffer_size;
+    int       result;
+
+    buffer_size = sizeof(struct sockaddr_storage);
+
+    result = getpeername(fd, (struct sockaddr *) address, &buffer_size);
+
+    if (result == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static unsigned short int net_address_port(struct sockaddr_storage *address)
+{
+    unsigned short int port;
+
+    if (address->ss_family == AF_INET) {
+        port = ((struct sockaddr_in *) address)->sin_port;
+    }
+    else if (address->ss_family == AF_INET6) {
+        port = ((struct sockaddr_in6 *) address)->sin6_port;
+    }
+    else {
+        port = 0;
+    }
+
+    return ntohs(port);
+}
+
+#ifdef FLB_HAVE_UNIX_SOCKET
+static int net_address_unix_socket_peer_pid_raw(flb_sockfd_t fd,
+                                                struct sockaddr_storage *address,
+                                                char *output_buffer,
+                                                int output_buffer_size,
+                                                size_t *output_data_size)
+{
+#if !defined(FLB_SYSTEM_MACOS) && !defined(FLB_SYSTEM_FREEBSD)
+    unsigned int peer_credentials_size;
+    struct ucred peer_credentials;
+#endif
+    size_t       required_buffer_size;
+    int          result = 0;
+
+    if (address->ss_family != AF_UNIX) {
+        return -1;
+    }
+
+    required_buffer_size  = 11; /* maximum 32 bit signed integer */
+    required_buffer_size += 1; /* string terminator */
+
+    if (required_buffer_size > output_buffer_size) {
+        return -1;
+    }
+
+#if !defined(FLB_SYSTEM_MACOS) && !defined(FLB_SYSTEM_FREEBSD)
+    peer_credentials_size = sizeof(struct ucred);
+
+    result = getsockopt(fd,
+                        SOL_SOCKET,
+                        SO_PEERCRED,
+                        &peer_credentials,
+                        &peer_credentials_size);
+
+    if (result != -1) {
+        *output_data_size = snprintf(output_buffer,
+                                     output_buffer_size,
+                                     "%ld",
+                                     (long) peer_credentials.pid);
+    }
+#else
+    *output_data_size = snprintf(output_buffer,
+                                 output_buffer_size,
+                                 FLB_NETWORK_ADDRESS_UNAVAILABLE);
+#endif
+
+    return result;
+}
+
+static int net_address_unix_socket_peer_pid_str(flb_sockfd_t fd,
+                                                struct sockaddr_storage *address,
+                                                char *output_buffer,
+                                                int output_buffer_size,
+                                                size_t *output_data_size)
+{
+    size_t  required_buffer_size;
+    size_t  peer_pid_length;
+    char    peer_pid[12];
+    int     result;
+
+    if (address->ss_family != AF_UNIX) {
+        return -1;
+    }
+
+    result = net_address_unix_socket_peer_pid_raw(fd,
+                                                  address,
+                                                  peer_pid,
+                                                  sizeof(peer_pid),
+                                                  &peer_pid_length);
+
+    if (result != 0) {
+        return -1;
+    }
+
+    required_buffer_size  = strlen(FLB_NETWORK_UNIX_SOCKET_PEER_ADDRESS_TEMPLATE);
+    required_buffer_size += peer_pid_length;
+    required_buffer_size -= 2; /* format string specifiers */
+    required_buffer_size += 1; /* string terminator */
+
+    if (required_buffer_size > output_buffer_size) {
+        *output_data_size = required_buffer_size;
+
+        return -1;
+    }
+
+    *output_data_size = snprintf(output_buffer,
+                                 output_buffer_size,
+                                 FLB_NETWORK_UNIX_SOCKET_PEER_ADDRESS_TEMPLATE,
+                                 peer_pid);
+
+    return 0;
+}
+#endif
+
+size_t flb_network_address_size(struct sockaddr_storage *address)
+{
+    if (address->ss_family == AF_INET) {
+        return sizeof(struct sockaddr_in);
+    }
+    else if (address->ss_family == AF_INET6) {
+        return sizeof(struct sockaddr_in6);
+    }
+#ifdef FLB_HAVE_UNIX_SOCKET
+    else if (address->ss_family == AF_UNIX) {
+        return sizeof(struct sockaddr_un);
+    }
+#endif
+
+    return 0;
+}
+
+static int net_address_ip_raw(flb_sockfd_t fd,
+                              struct sockaddr_storage *address,
+                              char *output_buffer,
+                              int output_buffer_size,
+                              size_t *output_data_size)
+{
+    char    peer_pid[12];
+    char   *address_data;
+    size_t  address_size;
+    int     result;
+
     errno = 0;
 
-    if (addr.ss_family == AF_INET) {
-        if ((inet_ntop(AF_INET, &((struct sockaddr_in *)&addr)->sin_addr,
-                      *buf, size)) == NULL) {
-            flb_error("socket_ip_str: Can't get the IP text form (%i)",
-                      errno);
+    if (address->ss_family == AF_UNSPEC) {
+        flb_debug("socket_ip_raw: uninitialized address");
+
+        return -1;
+    }
+    if (address->ss_family == AF_INET) {
+        address_data = ((char *) &((struct sockaddr_in *) address)->sin_addr);
+        address_size = sizeof(struct in_addr);
+    }
+    else if (address->ss_family == AF_INET6) {
+        address_data = ((char *) &((struct sockaddr_in6 *) address)->sin6_addr);
+        address_size = sizeof(struct in6_addr);
+    }
+#ifdef FLB_HAVE_UNIX_SOCKET
+    else if (address->ss_family == AF_UNIX) {
+        result = net_address_unix_socket_peer_pid_raw(fd,
+                                                      address,
+                                                      peer_pid,
+                                                      sizeof(peer_pid),
+                                                      &address_size);
+
+        if (result != 0) {
+            flb_debug("socket_ip_raw: error getting client process pid");
+
             return -1;
         }
+
+        address_data = peer_pid;
     }
-    else if (addr.ss_family == AF_INET6) {
-        if ((inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&addr)->sin6_addr,
-                       *buf, size)) == NULL) {
-            flb_error("socket_ip_str: Can't get the IP text form (%i)",
-                      errno);
-            return -1;
+#endif
+    else {
+        flb_debug("socket_ip_raw: unsupported address type (%i)",
+                  address->ss_family);
+
+        return -1;
+    }
+
+    if (output_buffer_size < address_size) {
+        flb_debug("socket_ip_raw: insufficient buffer size (%i < %zu)",
+                  output_buffer_size, address_size);
+
+        return -1;
+    }
+
+    memcpy(output_buffer, address_data, address_size);
+
+    if (output_data_size != NULL) {
+        *output_data_size = address_size;
+    }
+
+    return 0;
+}
+
+static int net_address_ip_str(flb_sockfd_t fd,
+                              struct sockaddr_storage *address,
+                              char *output_buffer,
+                              int output_buffer_size,
+                              size_t *output_data_size)
+{
+    void *address_data;
+    int   result;
+
+    errno = 0;
+
+    if (address->ss_family == AF_UNSPEC) {
+        *output_data_size = snprintf(output_buffer,
+                                     output_buffer_size,
+                                     FLB_NETWORK_ADDRESS_UNAVAILABLE);
+
+        return 0;
+    }
+    else if (address->ss_family == AF_INET) {
+        address_data = (void *) &((struct sockaddr_in *) address)->sin_addr;
+    }
+    else if (address->ss_family == AF_INET6) {
+        address_data = (void *) &((struct sockaddr_in6 *) address)->sin6_addr;
+    }
+#ifdef FLB_HAVE_UNIX_SOCKET
+    else if (address->ss_family == AF_UNIX) {
+        result = net_address_unix_socket_peer_pid_str(fd,
+                                                      address,
+                                                      output_buffer,
+                                                      output_buffer_size,
+                                                      output_data_size);
+
+        if (result != 0) {
+            flb_debug("socket_ip_str: error getting client process pid");
+        }
+
+        return result;
+    }
+#endif
+    else {
+        flb_debug("socket_ip_str: unsupported address type (%i)",
+                  address->ss_family);
+
+        return -1;
+    }
+
+    if ((inet_ntop(address->ss_family,
+                   address_data,
+                   output_buffer,
+                   output_buffer_size)) == NULL) {
+        flb_debug("socket_ip_str: Can't get the IP text form (%i)", errno);
+
+        return -1;
+    }
+
+    *output_data_size = strlen(output_buffer);
+
+    return 0;
+}
+
+int flb_net_socket_peer_address(flb_sockfd_t fd,
+                                struct sockaddr_storage *output_buffer)
+{
+    return net_socket_get_peer_address(fd, output_buffer);
+}
+
+int flb_net_socket_address_info(flb_sockfd_t fd,
+                                struct sockaddr_storage *address,
+                                unsigned short int *port_output_buffer,
+                                char *str_output_buffer,
+                                int str_output_buffer_size,
+                                size_t *str_output_data_size)
+{
+    int result;
+
+    result = net_address_ip_str(fd, address,
+                                str_output_buffer,
+                                str_output_buffer_size,
+                                str_output_data_size);
+
+    if (result == 0) {
+        if (port_output_buffer != NULL) {
+            *port_output_buffer = net_address_port(address);
         }
     }
 
-    *len = strlen(*buf);
+    return result;
+}
+
+int flb_net_socket_ip_peer_str(flb_sockfd_t fd,
+                               char *output_buffer,
+                               int output_buffer_size,
+                               size_t *output_data_size,
+                               int *output_address_family)
+{
+    struct sockaddr_storage address;
+    int                     result;
+
+    result = net_socket_get_peer_address(fd, &address);
+
+    if (result != 0) {
+        return -1;
+    }
+
+    if (address.ss_family == AF_UNIX) {
+
+    }
+
+    result = net_address_ip_str(fd, &address,
+                                output_buffer,
+                                output_buffer_size,
+                                output_data_size);
+
+    if (result == 0) {
+        if (output_address_family != NULL) {
+            *output_address_family = address.ss_family;
+        }
+    }
+
+    return result;
+}
+
+int flb_net_socket_peer_ip_raw(flb_sockfd_t fd,
+                               char *output_buffer,
+                               int output_buffer_size,
+                               size_t *output_data_size,
+                               int *output_address_family)
+{
+    struct sockaddr_storage address;
+    int                     result;
+
+    result = net_socket_get_peer_address(fd, &address);
+
+    if (result != 0) {
+        return -1;
+    }
+
+    result = net_address_ip_raw(fd, &address,
+                                output_buffer,
+                                output_buffer_size,
+                                output_data_size);
+
+    if (result == 0) {
+        if (output_address_family != NULL) {
+            *output_address_family = address.ss_family;
+        }
+    }
+
+    return result;
+}
+
+int flb_net_socket_peer_port(flb_sockfd_t fd,
+                             unsigned short int *output_buffer)
+{
+    struct sockaddr_storage address;
+    int                     result;
+
+    result = net_socket_get_peer_address(fd, &address);
+
+    if (result != 0) {
+        return -1;
+    }
+
+    *output_buffer = net_address_port(&address);
+
     return 0;
+}
+
+int flb_net_socket_peer_info(flb_sockfd_t fd,
+                             unsigned short int *port_output_buffer,
+                             struct sockaddr_storage *raw_output_buffer,
+                             char *str_output_buffer,
+                             int str_output_buffer_size,
+                             size_t *str_output_data_size)
+{
+    struct sockaddr_storage address;
+    int                     result;
+
+    result = net_socket_get_peer_address(fd, &address);
+
+    if (result != 0) {
+        return -1;
+    }
+
+    memcpy(raw_output_buffer,
+           &address,
+           sizeof(struct sockaddr_storage));
+
+    return flb_net_socket_address_info(fd,
+                                       &address,
+                                       port_output_buffer,
+                                       str_output_buffer,
+                                       str_output_buffer_size,
+                                       str_output_data_size);
+}
+
+uint64_t flb_net_htonll(uint64_t value)
+{
+#if defined(_WIN32)
+    /* use windows system provided htonll */
+    return htonll(value);
+#elif __BYTE_ORDER == __LITTLE_ENDIAN
+    return ((uint64_t) htonl(value & 0xFFFFFFFF) << 32) | htonl(value >> 32);
+#else
+    return value;
+#endif
 }

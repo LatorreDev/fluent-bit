@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 
 /* Syslog modes */
 #define FLB_SYSLOG_UNIX_TCP  1
@@ -31,6 +32,8 @@
 
 /* 32KB chunk size */
 #define FLB_SYSLOG_CHUNK   "32768"
+
+struct syslog_conn;
 
 /* Context / Config*/
 struct flb_syslog {
@@ -47,11 +50,12 @@ struct flb_syslog {
     flb_sds_t unix_path;
     flb_sds_t unix_perm_str;
     unsigned int unix_perm;
+    size_t receive_buffer_size;
 
     /* UDP buffer, data length and buffer size */
-    char *buffer_data;
-    size_t buffer_len;
-    size_t buffer_size;
+        // char *buffer_data;
+        // size_t buffer_len;
+        // size_t buffer_size;
 
     /* Buffers setup */
     size_t buffer_max_size;
@@ -60,11 +64,19 @@ struct flb_syslog {
     /* Configuration */
     flb_sds_t parser_name;
     struct flb_parser *parser;
+    flb_sds_t raw_message_key;
+    flb_sds_t source_address_key;
+
+    int dgram_mode_flag;
+    int collector_id;
+    struct mk_event *collector_event;
+    struct flb_downstream *downstream;
+    struct syslog_conn *dummy_conn;
 
     /* List for connections and event loop */
     struct mk_list connections;
-    struct mk_event_loop *evl;
     struct flb_input_instance *ins;
+    struct flb_log_event_encoder *log_encoder;
 };
 
 #endif

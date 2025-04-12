@@ -6,6 +6,7 @@ set(UNIT_TESTS_FILES
   pack.c
   pipe.c
   sds.c
+  sds_list.c
   hmac.c
   crypto.c
   hash.c
@@ -17,6 +18,7 @@ set(UNIT_TESTS_FILES
   http_client.c
   utils.c
   gzip.c
+  zstd.c
   random.c
   config_map.c
   mp.c
@@ -30,6 +32,22 @@ set(UNIT_TESTS_FILES
   bucket_queue.c
   flb_event_loop.c
   ring_buffer.c
+  regex.c
+  parser_json.c
+  parser_ltsv.c
+  parser_regex.c
+  parser_logfmt.c
+  env.c
+  log.c
+  log_event_decoder.c
+  log_event_encoder.c
+  processor.c
+  processor_conditional.c
+  uri.c
+  msgpack_append_message.c
+  conditionals.c
+  endianness.c
+  task_map.c
   )
 
 # Config format
@@ -51,6 +69,7 @@ if (NOT WIN32)
     ${UNIT_TESTS_FILES}
     gelf.c
     fstore.c
+    reload.c
     )
 endif()
 
@@ -72,6 +91,7 @@ if(FLB_RECORD_ACCESSOR)
   set(UNIT_TESTS_FILES
     ${UNIT_TESTS_FILES}
     record_accessor.c
+    cfl_record_accessor.c
     )
 endif()
 
@@ -130,6 +150,8 @@ if(FLB_LUAJIT)
 endif()
 
 set(UNIT_TESTS_DATA
+  data/tls/certificate.pem
+  data/tls/private_key.pem
   data/pack/json_single_map_001.json
   data/pack/json_single_map_002.json
   data/parser/json.conf
@@ -168,7 +190,7 @@ function(prepare_unit_tests TEST_PREFIX SOURCEFILES)
       add_sanitizers(${source_file_we})
 
       if(FLB_JEMALLOC)
-        target_link_libraries(${source_file_we} libjemalloc ${CMAKE_THREAD_LIBS_INIT})
+        target_link_libraries(${source_file_we} ${JEMALLOC_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
       else()
         target_link_libraries(${source_file_we} ${CMAKE_THREAD_LIBS_INIT})
       endif()
@@ -181,7 +203,7 @@ function(prepare_unit_tests TEST_PREFIX SOURCEFILES)
         target_link_libraries(${source_file_we} flb-sp)
       endif()
 
-      target_link_libraries(${source_file_we} fluent-bit-static)
+      target_link_libraries(${source_file_we} fluent-bit-static cfl-static)
 
       if(FLB_AVRO_ENCODER)
         target_link_libraries(${source_file_we} avro-static jansson)

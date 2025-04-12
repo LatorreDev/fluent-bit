@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,16 +33,30 @@
 &RoleSessionName=%s&RoleArn=%s"
 #define STS_ASSUME_ROLE_URI_BASE_LEN  54
 
+/*
+ * The STS APIs return an XML document with credentials.
+ * The part of the document we care about looks like this:
+ * <Credentials>
+ *    <AccessKeyId>akid</AccessKeyId>
+ *    <SecretAccessKey>skid</SecretAccessKey>
+ *    <SessionToken>token</SessionToken>
+ *    <Expiration>2019-11-09T13:34:41Z</Expiration>
+ * </Credentials>
+ */
 #define CREDENTIALS_NODE              "<Credentials>"
 #define CREDENTIALS_NODE_LEN          13
 #define ACCESS_KEY_NODE               "<AccessKeyId>"
 #define ACCESS_KEY_NODE_LEN           13
+#define ACCESS_KEY_NODE_END           "</AccessKeyId>"
 #define SECRET_KEY_NODE               "<SecretAccessKey>"
 #define SECRET_KEY_NODE_LEN           17
+#define SECRET_KEY_NODE_END           "</SecretAccessKey>"
 #define SESSION_TOKEN_NODE            "<SessionToken>"
 #define SESSION_TOKEN_NODE_LEN        14
+#define SESSION_TOKEN_NODE_END        "</SessionToken>"
 #define EXPIRATION_NODE               "<Expiration>"
 #define EXPIRATION_NODE_LEN           12
+#define EXPIRATION_NODE_END           "</Expiration>"
 
 #define TOKEN_FILE_ENV_VAR            "AWS_WEB_IDENTITY_TOKEN_FILE"
 #define ROLE_ARN_ENV_VAR              "AWS_ROLE_ARN"
@@ -58,7 +72,7 @@ static int sts_assume_role_request(struct flb_aws_client *sts_client,
                                    struct flb_aws_credentials **creds,
                                    char *uri,
                                    time_t *next_refresh);
-static flb_sds_t get_node(char *cred_node, char* node_name, int node_len);
+static flb_sds_t get_node(char *cred_node, char* node_name, int node_name_len, char* node_end);
 
 
 /*
@@ -121,7 +135,7 @@ struct flb_aws_credentials *get_credentials_fn_sts(struct flb_aws_provider
     }
 
     /* return a copy of the existing cached credentials */
-    creds = flb_malloc(sizeof(struct flb_aws_credentials));
+    creds = flb_calloc(1, sizeof(struct flb_aws_credentials));
     if (!creds) {
         goto error;
     }
@@ -200,7 +214,7 @@ void sync_fn_sts(struct flb_aws_provider *provider) {
 
     flb_debug("[aws_credentials] Sync called on the STS provider");
     /* Remove async flag */
-    implementation->sts_client->upstream->flags &= ~(FLB_IO_ASYNC);
+    flb_stream_disable_async_mode(&implementation->sts_client->upstream->base);
 
     /* we also need to call sync on the base_provider */
     base_provider->provider_vtable->sync(base_provider);
@@ -212,7 +226,7 @@ void async_fn_sts(struct flb_aws_provider *provider) {
 
     flb_debug("[aws_credentials] Async called on the STS provider");
     /* Add async flag */
-    implementation->sts_client->upstream->flags |= FLB_IO_ASYNC;
+    flb_stream_enable_async_mode(&implementation->sts_client->upstream->base);
 
     /* we also need to call async on the base_provider */
     base_provider->provider_vtable->async(base_provider);
@@ -294,6 +308,8 @@ struct flb_aws_provider *flb_sts_provider_create(struct flb_config *config,
         return NULL;
     }
 
+    pthread_mutex_init(&provider->lock, NULL);
+
     implementation = flb_calloc(1, sizeof(struct flb_aws_provider_sts));
     if (!implementation) {
         goto error;
@@ -342,7 +358,7 @@ struct flb_aws_provider *flb_sts_provider_create(struct flb_config *config,
         goto error;
     }
 
-    upstream->net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
+    upstream->base.net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
 
     implementation->sts_client->upstream = upstream;
     implementation->sts_client->host = implementation->endpoint;
@@ -491,14 +507,14 @@ void sync_fn_eks(struct flb_aws_provider *provider) {
     struct flb_aws_provider_eks *implementation = provider->implementation;
     flb_debug("[aws_credentials] Sync called on the EKS provider");
     /* remove async flag */
-    implementation->sts_client->upstream->flags &= ~(FLB_IO_ASYNC);
+    flb_stream_disable_async_mode(&implementation->sts_client->upstream->base);
 }
 
 void async_fn_eks(struct flb_aws_provider *provider) {
     struct flb_aws_provider_eks *implementation = provider->implementation;
     flb_debug("[aws_credentials] Async called on the EKS provider");
     /* add async flag */
-    implementation->sts_client->upstream->flags |= FLB_IO_ASYNC;
+    flb_stream_enable_async_mode(&implementation->sts_client->upstream->base);
 }
 
 void upstream_set_fn_eks(struct flb_aws_provider *provider,
@@ -564,7 +580,9 @@ struct flb_aws_provider *flb_eks_provider_create(struct flb_config *config,
         flb_errno();
         return NULL;
     }
-
+    
+    pthread_mutex_init(&provider->lock, NULL);
+    
     implementation = flb_calloc(1, sizeof(struct flb_aws_provider_eks));
 
     if (!implementation) {
@@ -637,7 +655,7 @@ struct flb_aws_provider *flb_eks_provider_create(struct flb_config *config,
         goto error;
     }
 
-    upstream->net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
+    upstream->base.net.connect_timeout = FLB_AWS_CREDENTIAL_NET_TIMEOUT;
 
     implementation->sts_client->upstream = upstream;
     implementation->sts_client->host = implementation->endpoint;
@@ -652,7 +670,7 @@ error:
 
 /* Generates string which can serve as a unique session name */
 char *flb_sts_session_name() {
-    unsigned char *random_data[SESSION_NAME_RANDOM_BYTE_LEN];
+    unsigned char random_data[SESSION_NAME_RANDOM_BYTE_LEN];
     char *session_name = NULL;
     int ret;
 
@@ -664,16 +682,15 @@ char *flb_sts_session_name() {
         return NULL;
     }
 
-    session_name = flb_malloc(sizeof(char) *
-                              (SESSION_NAME_RANDOM_BYTE_LEN + 1));
-    if (!session_name) {
+    session_name = flb_calloc(SESSION_NAME_RANDOM_BYTE_LEN + 1,
+                              sizeof(char));
+    if (session_name == NULL) {
         flb_errno();
 
         return NULL;
     }
 
     bytes_to_string(random_data, session_name, SESSION_NAME_RANDOM_BYTE_LEN);
-    session_name[SESSION_NAME_RANDOM_BYTE_LEN] = '\0';
 
     return session_name;
 }
@@ -826,24 +843,24 @@ struct flb_aws_credentials *flb_parse_sts_resp(char *response,
     }
 
     creds->access_key_id = get_node(cred_node, ACCESS_KEY_NODE,
-                                    ACCESS_KEY_NODE_LEN);
+                                    ACCESS_KEY_NODE_LEN, ACCESS_KEY_NODE_END);
     if (!creds->access_key_id) {
         goto error;
     }
 
     creds->secret_access_key = get_node(cred_node, SECRET_KEY_NODE,
-                                        SECRET_KEY_NODE_LEN);
+                                        SECRET_KEY_NODE_LEN, SECRET_KEY_NODE_END);
     if (!creds->secret_access_key) {
         goto error;
     }
 
     creds->session_token = get_node(cred_node, SESSION_TOKEN_NODE,
-                                    SESSION_TOKEN_NODE_LEN);
+                                    SESSION_TOKEN_NODE_LEN, SESSION_TOKEN_NODE_END);
     if (!creds->session_token) {
         goto error;
     }
 
-    tmp = get_node(cred_node, EXPIRATION_NODE, EXPIRATION_NODE_LEN);
+    tmp = get_node(cred_node, EXPIRATION_NODE, EXPIRATION_NODE_LEN, EXPIRATION_NODE_END);
     if (!tmp) {
         goto error;
     }
@@ -910,7 +927,7 @@ flb_sds_t flb_sts_uri(char *action, char *role_arn, char *session_name,
     return uri;
 }
 
-static flb_sds_t get_node(char *cred_node, char* node_name, int node_len)
+static flb_sds_t get_node(char *cred_node, char* node_name, int node_name_len, char* node_end)
 {
     char *node = NULL;
     char *end = NULL;
@@ -923,8 +940,8 @@ static flb_sds_t get_node(char *cred_node, char* node_name, int node_len)
                   node_name);
         return NULL;
     }
-    node += node_len;
-    end = strchr(node, '<');
+    node += node_name_len;
+    end = strstr(node, node_end);
     if (!end) {
         flb_error("[aws_credentials] Could not find end of '%s' node in "
                   "sts response", node_name);

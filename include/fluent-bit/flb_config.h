@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,6 +38,20 @@
 #define HEALTH_CHECK_PERIOD 60
 #define FLB_CONFIG_DEFAULT_TAG  "fluent_bit"
 
+#define FLB_CONFIG_DEFAULT_TASK_MAP_SIZE  2048
+#define FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_LIMIT  16384
+#define FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_GROWTH_SiZE 256
+
+/* The reason behind FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_LIMIT being set to 16384
+ * is that this is largest unsigned number expressable with 14 bits which is
+ * a limit imposed by the messaging mechanism used.
+ *
+ * As for FLB_CONFIG_DEFAULT_TASK_MAP_SIZE, 2048 was chosen to retain its
+ * original value and FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_GROWTH_SiZE is set
+ * to a multiple of 8 because entries in the task map are just task
+ * pointers.
+ */
+
 /* Main struct to hold the configuration of the runtime service */
 struct flb_config {
     struct mk_event ch_event;
@@ -47,7 +61,12 @@ struct flb_config {
     int is_shutting_down;     /* is the service shutting down ? */
     int is_running;           /* service running ?              */
     double flush;             /* Flush timeout                  */
-    int grace;                /* Maximum grace time on shutdown */
+
+    /*
+     * Maximum grace time on shutdown. If set to -1, the engine will
+     * shutdown when all remaining tasks are flushed
+     */
+    int grace;
     int grace_count;          /* Count of grace shutdown tries  */
     flb_pipefd_t flush_fd;    /* Timer FD associated to flush   */
     int convert_nan_to_null;  /* convert null to nan ?          */
@@ -66,6 +85,10 @@ struct flb_config {
 
     flb_pipefd_t ch_self_events[2]; /* channel to recieve thread tasks        */
 
+    int notification_channels_initialized;
+    flb_pipefd_t notification_channels[2];
+    struct mk_event notification_event;
+
     /* Channel event loop (just for ch_notif) */
     struct mk_event_loop *ch_evl;
 
@@ -73,6 +96,8 @@ struct flb_config {
 
     /* main configuration */
     struct flb_cf *cf_main;
+    /* command line configuration (handled by fluent-bit bin) */
+    struct flb_cf *cf_opts;
     struct mk_list cf_parsers_list;
 
     flb_sds_t program_name;      /* argv[0] */
@@ -82,6 +107,12 @@ struct flb_config {
      * absolute path for the directory that contains the file.
      */
     char *conf_path;
+
+    /* if the configuration come from the file system, store the given path */
+    flb_sds_t conf_path_file;
+
+    /* if the external plugins come from the file system, store the given paths from command line */
+    struct mk_list external_plugins;
 
     /* Event */
     struct mk_event event_flush;
@@ -95,6 +126,7 @@ struct flb_config {
     void *dso_plugins;
 
     /* Plugins references */
+    struct mk_list processor_plugins;
     struct mk_list custom_plugins;
     struct mk_list in_plugins;
     struct mk_list parser_plugins;      /* not yet implemented */
@@ -199,6 +231,7 @@ struct flb_config {
     char *dns_mode;
     char *dns_resolver;
     int   dns_prefer_ipv4;
+    int   dns_prefer_ipv6;
 
     /* Chunk I/O Buffering */
     void *cio;
@@ -208,8 +241,10 @@ struct flb_config {
     int   storage_metrics;          /* enable/disable storage metrics */
     int   storage_checksum;         /* checksum enabled */
     int   storage_max_chunks_up;    /* max number of chunks 'up' in memory */
+    int   storage_del_bad_chunks;   /* delete irrecoverable chunks */
     char *storage_bl_mem_limit;     /* storage backlog memory limit */
     struct flb_storage_metrics *storage_metrics_ctx; /* storage metrics context */
+    int   storage_trim_files;       /* enable/disable file trimming */
 
     /* Embedded SQL Database support (SQLite3) */
 #ifdef FLB_HAVE_SQLDB
@@ -221,9 +256,15 @@ struct flb_config {
     struct mk_list luajit_list;
 #endif
 
+    /* WASM environment's context */
+#ifdef FLB_HAVE_WASM
+    struct mk_list wasm_list;
+#endif
+
 #ifdef FLB_HAVE_STREAM_PROCESSOR
     char *stream_processor_file;            /* SP configuration file */
     void *stream_processor_ctx;             /* SP context */
+    int  stream_processor_str_conv;         /* SP enable converting from string to number */
 
     /*
      * Temporal list to hold tasks defined before the SP context is created
@@ -232,11 +273,29 @@ struct flb_config {
     struct mk_list stream_processor_tasks;
 #endif
 
+#ifdef FLB_HAVE_CHUNK_TRACE
+    int enable_chunk_trace;
+#endif /* FLB_HAVE_CHUNK_TRACE */
+
+    int enable_hot_reload;
+    int ensure_thread_safety_on_hot_reloading;
+    unsigned int hot_reloaded_count;
+    int shutdown_by_hot_reloading;
+    int hot_reloading;
+
+    /* Routing */
+    size_t route_mask_size;
+    size_t route_mask_slots;
+    uint64_t *route_empty_mask;
+
     /* Co-routines */
     unsigned int coro_stack_size;
 
     /* Upstream contexts created by plugins */
     struct mk_list upstreams;
+
+    /* Downstream contexts created by plugins */
+    struct mk_list downstreams;
 
     /*
      * Input table-id: table to keep a reference of thread-IDs used by the
@@ -248,7 +307,8 @@ struct flb_config {
     unsigned int sched_cap;
     unsigned int sched_base;
 
-    struct flb_task_map tasks_map[2048];
+    struct flb_task_map *task_map;
+    size_t task_map_size;
 
     int dry_run;
 };
@@ -261,6 +321,9 @@ const char *flb_config_prop_get(const char *key, struct mk_list *list);
 int flb_config_set_property(struct flb_config *config,
                             const char *k, const char *v);
 int flb_config_set_program_name(struct flb_config *config, char *name);
+int flb_config_load_config_format(struct flb_config *config, struct flb_cf *cf);
+int flb_config_task_map_resize(struct flb_config *config, size_t new_size);
+int flb_config_task_map_grow(struct flb_config *config);
 
 int set_log_level_from_env(struct flb_config *config);
 #ifdef FLB_HAVE_STATIC_CONF
@@ -289,6 +352,7 @@ enum conf_type {
 #define FLB_CONF_STR_PARSERS_FILE "Parsers_File"
 #define FLB_CONF_STR_PLUGINS_FILE "Plugins_File"
 #define FLB_CONF_STR_STREAMS_FILE "Streams_File"
+#define FLB_CONF_STR_STREAMS_STR_CONV "sp.convert_from_str_to_num"
 #define FLB_CONF_STR_CONV_NAN     "json.convert_nan_to_null"
 
 /* FLB_HAVE_HTTP_SERVER */
@@ -302,10 +366,18 @@ enum conf_type {
 #define FLB_CONF_STR_HC_PERIOD                              "HC_Period"
 #endif /* !FLB_HAVE_HTTP_SERVER */
 
+#ifdef FLB_HAVE_CHUNK_TRACE
+#define FLB_CONF_STR_ENABLE_CHUNK_TRACE      "Enable_Chunk_Trace"
+#endif /* FLB_HAVE_CHUNK_TRACE */
+
+#define FLB_CONF_STR_HOT_RELOAD        "Hot_Reload"
+#define FLB_CONF_STR_HOT_RELOAD_ENSURE_THREAD_SAFETY  "Hot_Reload.Ensure_Thread_Safety"
+
 /* DNS */
 #define FLB_CONF_DNS_MODE              "dns.mode"
 #define FLB_CONF_DNS_RESOLVER          "dns.resolver"
 #define FLB_CONF_DNS_PREFER_IPV4       "dns.prefer_ipv4"
+#define FLB_CONF_DNS_PREFER_IPV6       "dns.prefer_ipv6"
 
 /* Storage / Chunk I/O */
 #define FLB_CONF_STORAGE_PATH          "storage.path"
@@ -314,6 +386,9 @@ enum conf_type {
 #define FLB_CONF_STORAGE_CHECKSUM      "storage.checksum"
 #define FLB_CONF_STORAGE_BL_MEM_LIMIT  "storage.backlog.mem_limit"
 #define FLB_CONF_STORAGE_MAX_CHUNKS_UP "storage.max_chunks_up"
+#define FLB_CONF_STORAGE_DELETE_IRRECOVERABLE_CHUNKS \
+                                       "storage.delete_irrecoverable_chunks"
+#define FLB_CONF_STORAGE_TRIM_FILES    "storage.trim_files"
 
 /* Coroutines */
 #define FLB_CONF_STR_CORO_STACK_SIZE "Coro_Stack_Size"

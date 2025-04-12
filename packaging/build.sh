@@ -1,4 +1,5 @@
 #!/bin/bash
+# Build a specific Linux target using the local source code via a container image
 set -eux
 
 # Never rely on PWD so we can invoke from anywhere
@@ -9,6 +10,7 @@ FLB_DISTRO=${FLB_DISTRO:-}
 FLB_OUT_DIR=${FLB_OUT_DIR:-}
 FLB_NIGHTLY_BUILD=${FLB_NIGHTLY_BUILD:-}
 FLB_JEMALLOC=${FLB_JEMALLOC:-On}
+DOCKER=${FLB_DOCKER_CLI:-docker}
 
 # Use this to pass special arguments to docker build
 FLB_ARG=${FLB_ARG:-}
@@ -66,24 +68,37 @@ if [[ ! -f "$IMAGE_CONTEXT_DIR/Dockerfile" ]]; then
 fi
 
 # CMake configuration variables, override via environment rather than parameters
-CMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX:-/opt/td-agent-bit/}
-FLB_TD=${FLB_TD:-On}
+CMAKE_INSTALL_PREFIX=${CMAKE_INSTALL_PREFIX:-/opt/fluent-bit/}
+# This is required to ensure we set the defaults to off for 1.9 builds
+FLB_TD=${FLB_TD:-Off}
+# This is provided for simplifying the build pipeline
+FLB_UNICODE_ENCODER=${FLB_UNICODE_ENCODER:-On}
+
+if [ "${FLB_DISTRO}" = "centos/6" ] || [ "${FLB_DISTRO}" = "centos/7" ] ||
+       [ "${FLB_DISTRO}" = "centos/7.arm64v8" ]; then
+    FLB_UNICODE_ENCODER=Off
+fi
 
 echo "IMAGE_CONTEXT_DIR     => $IMAGE_CONTEXT_DIR"
 echo "CMAKE_INSTALL_PREFIX  => $CMAKE_INSTALL_PREFIX"
-echo "FLB_TD                => $FLB_TD"
 echo "FLB_NIGHTLY_BUILD     => $FLB_NIGHTLY_BUILD"
 echo "FLB_JEMALLOC          => $FLB_JEMALLOC"
+echo "FLB_UNICODE_ENCODER   => $FLB_UNICODE_ENCODER"
 
-export DOCKER_BUILDKIT=1
+if [ "${DOCKER}" = "docker" ]; then
+    export DOCKER_BUILDKIT=1
+else
+    export DOCKER_BUILDKIT=0
+fi
 
 # Build the main image - we do want word splitting
 # shellcheck disable=SC2086
-if ! docker build \
+if ! ${DOCKER} build \
     --build-arg CMAKE_INSTALL_PREFIX="$CMAKE_INSTALL_PREFIX" \
-    --build-arg FLB_TD="$FLB_TD" \
     --build-arg FLB_NIGHTLY_BUILD="$FLB_NIGHTLY_BUILD" \
     --build-arg FLB_JEMALLOC="$FLB_JEMALLOC" \
+    --build-arg FLB_TD="$FLB_TD" \
+    --build-arg FLB_UNICODE_ENCODER="$FLB_UNICODE_ENCODER" \
     $FLB_ARG \
     -t "$MAIN_IMAGE" \
     -f "$IMAGE_CONTEXT_DIR/Dockerfile" \
@@ -94,7 +109,7 @@ then
 fi
 
 # Compile and package
-if ! docker run \
+if ! ${DOCKER} run \
     -v "$volume":/output \
     "$MAIN_IMAGE"
 then

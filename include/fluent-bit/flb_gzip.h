@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,11 +21,23 @@
 #define FLB_GZIP_H
 
 #include <fluent-bit/flb_info.h>
-#include <stdio.h>
+#include <fluent-bit/flb_macros.h>
+#include <monkey/mk_http.h>
+
+struct flb_decompression_context;
 
 int flb_gzip_compress(void *in_data, size_t in_len,
                       void **out_data, size_t *out_len);
 int flb_gzip_uncompress(void *in_data, size_t in_len,
                         void **out_data, size_t *out_size);
+
+void *flb_gzip_decompression_context_create();
+void flb_gzip_decompression_context_destroy(void *context);
+
+int flb_gzip_decompressor_dispatch(struct flb_decompression_context *context,
+                                   void *out_data, size_t *out_size);
+
+int flb_is_http_session_gzip_compressed(struct mk_http_session *session);
+size_t flb_gzip_count(const char *data, size_t len, size_t **out_borders, size_t border_count);
 
 #endif

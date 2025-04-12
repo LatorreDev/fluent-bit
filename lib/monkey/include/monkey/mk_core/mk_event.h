@@ -67,14 +67,30 @@
 #define MK_EP_SOCKET_DONE     3
 /* ---- end ---- */
 
-#if defined(_WIN32)
-    #include "mk_event_libevent.h"
-#elif defined(MK_HAVE_EVENT_SELECT)
+
+#define MK_EVENT_IS_REGISTERED(event) ((event->status & MK_EVENT_REGISTERED) != 0)
+
+#if defined(MK_EVENT_LOOP_SELECT)
     #include "mk_event_select.h"
-#elif defined(__linux__) && !defined(LINUX_KQUEUE)
-    #include "mk_event_epoll.h"
-#else
+#elif defined(MK_EVENT_LOOP_POLL)
+    #include "mk_event_poll.h"
+#elif defined(MK_EVENT_LOOP_KQUEUE)
     #include "mk_event_kqueue.h"
+#elif defined(MK_EVENT_LOOP_EPOLL)
+    #include "mk_event_epoll.h"
+#elif defined(MK_EVENT_LOOP_LIBEVENT)
+    #include "mk_event_libevent.h"
+#else
+    /* do our best based on the operating system */
+    #if defined(__linux__)
+        #include "mk_event_epoll.h"
+    #elif defined(__FreeBSD__) || defined(__APPLE__) || defined(__DragonFly__) || defined(__OpenBSD__)
+        #include "mk_event_kqueue.h"
+    #elif defined(_WIN32)
+        #include "mk_event_libevent.h"
+    #else
+        #include "mk_event_select.h"
+    #endif
 #endif
 
 #if defined(_WIN32)
@@ -142,6 +158,8 @@ int mk_event_timeout_disable(struct mk_event_loop *loop, void *data);
 int mk_event_timeout_destroy(struct mk_event_loop *loop, void *data);
 int mk_event_channel_create(struct mk_event_loop *loop,
                             int *r_fd, int *w_fd, void *data);
+int mk_event_channel_destroy(struct mk_event_loop *loop,
+                             int r_fd, int w_fd, void *data);
 int mk_event_wait(struct mk_event_loop *loop);
 int mk_event_wait_2(struct mk_event_loop *loop, int timeout);
 int mk_event_translate(struct mk_event_loop *loop);

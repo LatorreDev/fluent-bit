@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,12 +37,16 @@ struct flb_output_plugin out_websocket_plugin;
 #define SECURED_BY "Fluent Bit"
 
 
-static int flb_ws_handshake(struct flb_upstream_conn *u_conn,
+static int flb_ws_handshake(struct flb_connection *u_conn,
                                     struct flb_out_ws *ctx)
 {
     int ret;
     size_t bytes_sent;
     struct flb_http_client *c;
+    struct mk_list *head;
+    struct flb_config_map_val *mv;
+    struct flb_slist_entry *key = NULL;
+    struct flb_slist_entry *val = NULL;
 
     if (!u_conn) {
         flb_error("[output_ws] upstream connection error");
@@ -62,6 +66,16 @@ static int flb_ws_handshake(struct flb_upstream_conn *u_conn,
     flb_http_add_header(c, "Connection", 10, "Upgrade", 7);
     flb_http_add_header(c, "Sec-WebSocket-Key", 17, "dGhlIHNhbXBsZSBub25jZQ==", 24);
     flb_http_add_header(c, "Sec-WebSocket-Version", 21, "13", 2);
+
+    /* Append additional headers from configuration */
+    flb_config_map_foreach(head, mv, ctx->headers) {
+        key = mk_list_entry_first(mv->val.list, struct flb_slist_entry, _head);
+        val = mk_list_entry_last(mv->val.list, struct flb_slist_entry, _head);
+
+        flb_http_add_header(c,
+                            key->str, flb_sds_len(key->str),
+                            val->str, flb_sds_len(val->str));
+    }
 
     /* Perform request*/
     ret = flb_http_do(c, &bytes_sent);
@@ -88,7 +102,7 @@ static void flb_ws_mask(char *data, int len, char *mask)
     }
 }
 
-static int flb_ws_sendDataFrameHeader(struct flb_upstream_conn *u_conn,
+static int flb_ws_sendDataFrameHeader(struct flb_connection *u_conn,
                                       struct flb_out_ws *ctx, const void *data, size_t bytes)
 {
     int ret = -1;
@@ -121,7 +135,7 @@ static int flb_ws_sendDataFrameHeader(struct flb_upstream_conn *u_conn,
             return -1;
         }
         data_frame_head[0] = 0x81;
-        data_frame_head[1] = 126 | 0x80;
+        data_frame_head[1] = (unsigned char) (126 | 0x80);
         data_frame_head[2] = (payloadSize >> 8) & 0xff;
         data_frame_head[3] = (payloadSize >> 0) & 0xff;
         data_frame_head[4] = masking_key[0];
@@ -137,7 +151,7 @@ static int flb_ws_sendDataFrameHeader(struct flb_upstream_conn *u_conn,
             return -1;
         }
         data_frame_head[0] = 0x81;
-        data_frame_head[1] = 127 | 0x80;
+        data_frame_head[1] = (unsigned char) (127 | 0x80);
         data_frame_head[2] = (payloadSize >> 56) & 0xff;
         data_frame_head[3] = (payloadSize >> 48) & 0xff;
         data_frame_head[4] = (payloadSize >> 40) & 0xff;
@@ -198,7 +212,7 @@ static void cb_ws_flush(struct flb_event_chunk *event_chunk,
     size_t bytes_sent;
     flb_sds_t json = NULL;
     struct flb_upstream *u;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_out_ws *ctx = out_context;
     time_t now;
 
@@ -314,6 +328,11 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_STR, "json_date_key", "date",
      0, FLB_TRUE, offsetof(struct flb_out_ws, json_date_key),
      "Specify the name of the date field in output"
+    },
+    {
+     FLB_CONFIG_MAP_SLIST_1, "header", NULL,
+     FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct flb_out_ws, headers),
+     "Add a HTTP header key/value pair to the initial HTTP request. Multiple headers can be set"
     },
     /* EOF */
     {0}

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@
 #include <fluent-bit/flb_env.h>
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_pack.h>
+#include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_sds_list.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_ra_key.h>
 #include <fluent-bit/record_accessor/flb_ra_parser.h>
@@ -216,7 +218,7 @@ static int ra_parse_buffer(struct flb_record_accessor *ra, flb_sds_t buf)
     }
 
     /* Append remaining string */
-    if (i - 1 > end && pre < i) {
+    if ((i - 1 > end && pre < i) || i == 1 /*allow single character*/) {
         end = flb_sds_len(buf);
         rp_str = ra_parse_string(ra, buf, pre, end);
         if (rp_str) {
@@ -245,18 +247,47 @@ void flb_ra_destroy(struct flb_record_accessor *ra)
     flb_free(ra);
 }
 
+int flb_ra_subkey_count(struct flb_record_accessor *ra)
+{
+    struct mk_list *head;
+    struct flb_ra_parser *rp;
+    int ret = -1;
+    int tmp;
+
+    if (ra == NULL) {
+        return -1;
+    }
+    mk_list_foreach(head, &ra->list) {
+        rp = mk_list_entry(head, struct flb_ra_parser, _head);
+        tmp = flb_ra_parser_subkey_count(rp);
+        if (tmp > ret) {
+            ret = tmp;
+        }
+    }
+
+    return ret;
+}
+
 struct flb_record_accessor *flb_ra_create(char *str, int translate_env)
 {
     int ret;
     size_t hint = 0;
     char *p;
     flb_sds_t buf = NULL;
+    flb_sds_t tmp_str;
     struct flb_env *env;
     struct mk_list *head;
     struct flb_ra_parser *rp;
     struct flb_record_accessor *ra;
 
-    p = str;
+    /* temporary copy of 'str' to workaround potential issues literal parsing */
+    tmp_str = flb_sds_create(str);
+    if (!tmp_str) {
+        flb_error("[record accessor] cannot allocate temporary buffer");
+        return NULL;
+    }
+
+    p = tmp_str;
     if (translate_env == FLB_TRUE) {
         /*
          * Check if some environment variable has been created as part of the
@@ -266,6 +297,7 @@ struct flb_record_accessor *flb_ra_create(char *str, int translate_env)
         env = flb_env_create();
         if (!env) {
             flb_error("[record accessor] cannot create environment context");
+            flb_sds_destroy(tmp_str);
             return NULL;
         }
 
@@ -274,6 +306,7 @@ struct flb_record_accessor *flb_ra_create(char *str, int translate_env)
         if (!buf) {
             flb_error("[record accessor] cannot translate string");
             flb_env_destroy(env);
+            flb_sds_destroy(tmp_str);
             return NULL;
         }
         flb_env_destroy(env);
@@ -288,18 +321,11 @@ struct flb_record_accessor *flb_ra_create(char *str, int translate_env)
         if (buf) {
             flb_sds_destroy(buf);
         }
-        return NULL;
-    }
-    ra->pattern = flb_sds_create(str);
-    if (!ra->pattern) {
-        flb_error("[record accessor] could not allocate pattern");
-        flb_free(ra);
-        if (buf) {
-            flb_sds_destroy(buf);
-        }
+        flb_sds_destroy(tmp_str);
         return NULL;
     }
 
+    ra->pattern = tmp_str;
     mk_list_init(&ra->list);
 
     /*
@@ -329,6 +355,90 @@ struct flb_record_accessor *flb_ra_create(char *str, int translate_env)
     }
     ra->size_hint = hint + 128;
     return ra;
+}
+
+/*
+    flb_ra_create_str_from_list returns record accessor string from string list.
+     e.g. {"aa", "bb", "cc", NULL} -> "$aa['bb']['cc']"
+    Return value should be freed using flb_sds_destroy after using.
+ */
+flb_sds_t flb_ra_create_str_from_list(struct flb_sds_list *str_list)
+{
+    int i = 0;
+    int ret_i = 0;
+    int offset = 0;
+
+    char *fmt = NULL;
+    char **strs = NULL;
+    flb_sds_t str;
+    flb_sds_t tmp_sds;
+
+    if (str_list == NULL || flb_sds_list_size(str_list) == 0) {
+        return NULL;
+    }
+
+    str = flb_sds_create_size(256);
+    if (str == NULL) {
+        flb_errno();
+        return NULL;
+    }
+
+    strs = flb_sds_list_create_str_array(str_list);
+    if (strs == NULL) {
+        flb_error("%s flb_sds_list_create_str_array failed", __FUNCTION__);
+        flb_sds_destroy(str);
+        return NULL;
+    }
+
+    while(strs[i] != NULL) {
+        if (i == 0) {
+            fmt = "$%s";
+        }
+        else {
+            fmt = "['%s']";
+        }
+
+        ret_i = snprintf(str+offset, flb_sds_alloc(str)-offset-1, fmt, strs[i]);
+        if (ret_i > flb_sds_alloc(str)-offset-1) {
+            tmp_sds = flb_sds_increase(str, ret_i);
+            if (tmp_sds == NULL) {
+                flb_errno();
+                flb_sds_list_destroy_str_array(strs);
+                flb_sds_destroy(str);
+                return NULL;
+            }
+            str = tmp_sds;
+            ret_i = snprintf(str+offset, flb_sds_alloc(str)-offset-1, fmt, strs[i]);
+            if (ret_i > flb_sds_alloc(str)-offset-1) {
+                flb_errno();
+                flb_sds_list_destroy_str_array(strs);
+                flb_sds_destroy(str);
+                return NULL;
+            }
+        }
+        offset += ret_i;
+        i++;
+    }
+    flb_sds_list_destroy_str_array(strs);
+
+    return str;
+}
+
+struct flb_record_accessor *flb_ra_create_from_list(struct flb_sds_list *str_list, int translate_env)
+{
+    flb_sds_t tmp = NULL;
+    struct flb_record_accessor *ret = NULL;
+
+    tmp = flb_ra_create_str_from_list(str_list);
+    if (tmp == NULL) {
+        flb_errno();
+        return NULL;
+    }
+
+    ret = flb_ra_create(tmp, translate_env);
+    flb_sds_destroy(tmp);
+
+    return ret;
 }
 
 void flb_ra_dump(struct flb_record_accessor *ra)
@@ -501,7 +611,7 @@ flb_sds_t flb_ra_translate(struct flb_record_accessor *ra,
  *
  * For safety, the function returns a newly created string that needs
  * to be destroyed by the caller.
- * 
+ *
  * Returns NULL if `check` is FLB_TRUE and any key lookup in the record failed
  */
 flb_sds_t flb_ra_translate_check(struct flb_record_accessor *ra,
@@ -645,8 +755,8 @@ static struct flb_ra_parser* get_ra_parser(struct flb_record_accessor *ra)
  * If 'record accessor' pattern matches an entry in the 'map', set the
  * reference in 'out_key' and 'out_val' for the entries in question.
  *
- * Returns FLB_TRUE if the pattern matched a kv pair, otherwise it returns
- * FLB_FALSE.
+ * Returns 0 if the pattern matched a kv pair, otherwise it returns
+ * -1.
  */
 int flb_ra_get_kv_pair(struct flb_record_accessor *ra, msgpack_object map,
                        msgpack_object **start_key,
@@ -656,7 +766,7 @@ int flb_ra_get_kv_pair(struct flb_record_accessor *ra, msgpack_object map,
 
     rp = get_ra_parser(ra);
     if (rp == NULL) {
-        return FLB_FALSE;
+        return -1;
     }
 
     return flb_ra_key_value_get(rp->key->name, map, rp->key->subkeys,

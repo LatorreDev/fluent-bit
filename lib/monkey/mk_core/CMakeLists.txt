@@ -10,12 +10,12 @@ set(src
 
 # Headers
 include_directories(../include/monkey/)
-include_directories(${PROJECT_BINARY_DIR}/include/monkey)
 
 # It set's a definition and register into the mk_core_info.h file */
 macro(MK_DEFINITION var)
   add_definitions(-D${var})
   set(MK_CORE_BUILD_FLAGS "${MK_CORE_BUILD_FLAGS}#ifndef ${var}\n#define ${var}\n#endif\n")
+  set(MK_CORE_INFO_DEFS "${MK_CORE_INFO_DEFS} ${var}")
 endmacro()
 
 # Set threading system
@@ -27,6 +27,9 @@ if (CMAKE_SYSTEM_NAME MATCHES "Windows")
     )
   add_subdirectory(deps/)
 else()
+  if (MK_EVENT_LOOP_LIBEVENT)
+    add_subdirectory(deps/)
+  endif()
   MK_DEFINITION(MK_THREADS_POSIX)
 endif()
 
@@ -87,12 +90,26 @@ if (HAVE_UNISTD_H)
   MK_DEFINITION(MK_HAVE_UNISTD_H)
 endif()
 
-# Lookup event-loop mechanism: do we need to fallback to select(2) ?
+# Check for a valid event loop mechanism
+
+# select(2)
 check_c_source_compiles("
-  #include <sys/epoll.h>
+  #include <stdio.h>
+  #include <sys/select.h>
   int main() {
-     return epoll_create(1);
-  }" HAVE_EPOLL)
+     fd_set rfds;
+     struct timeval tv;
+     return select(1, &rfds, NULL, NULL, &tv);
+  }" HAVE_SELECT)
+
+check_c_source_compiles("
+  #include <poll.h>
+  int main() {
+     struct pollfd fds[1];
+     fds[0].fd = 0;
+     fds[0].events = POLLIN;
+     return poll(fds, 1, 1);
+  }" HAVE_POLL)
 
 check_c_source_compiles("
   #include <sys/event.h>
@@ -100,10 +117,51 @@ check_c_source_compiles("
      return kqueue();
   }" HAVE_KQUEUE)
 
+check_c_source_compiles("
+  #include <sys/epoll.h>
+  int main() {
+     return epoll_create(1);
+  }" HAVE_EPOLL)
 
-if ((NOT HAVE_EPOLL AND NOT HAVE_KQUEUE) OR MK_USE_EVENT_SELECT)
-  message(STATUS "Event loop backend > select(2)")
-  MK_DEFINITION(MK_HAVE_EVENT_SELECT)
+if (MK_EVENT_LOOP_SELECT)
+  if (NOT HAVE_SELECT)
+    message(FATAL_ERROR "Event loop backend > select(2) not available")
+  else()
+    message(STATUS "Event loop backend > select(2)")
+    MK_DEFINITION(MK_EVENT_LOOP_SELECT)
+  endif()
+endif()
+
+if (MK_EVENT_LOOP_POLL)
+  if (NOT HAVE_POLL)
+    message(FATAL_ERROR "Event loop backend > poll(2) not available")
+  else()
+    message(STATUS "Event loop backend > poll(2)")
+    MK_DEFINITION(MK_EVENT_LOOP_POLL)
+  endif()
+endif()
+
+if (MK_EVENT_LOOP_KQUEUE)
+  if (NOT HAVE_KQUEUE)
+    message(FATAL_ERROR "Event loop backend > kqueue(2) not available")
+  else()
+    message(STATUS "Event loop backend > kqueue(2)")
+    MK_DEFINITION(MK_EVENT_LOOP_KQUEUE)
+  endif()
+endif()
+
+if (MK_EVENT_LOOP_EPOLL)
+  if (NOT HAVE_EPOLL)
+    message(FATAL_ERROR "Event loop backend > epoll(2) not available")
+  else()
+    message(STATUS "Event loop backend > epoll(2)")
+    MK_DEFINITION(MK_EVENT_LOOP_EPOLL)
+  endif()
+endif()
+
+if (MK_EVENT_LOOP_LIBEVENT)
+    message(STATUS "Event loop backend > libevent")
+    MK_DEFINITION(MK_EVENT_LOOP_LIBEVENT)
 endif()
 
 # Validate timerfd_create()
@@ -152,6 +210,6 @@ configure_file(
 add_library(mk_core STATIC ${src})
 target_link_libraries(mk_core ${CMAKE_THREAD_LIBS_INIT})
 
-if (CMAKE_SYSTEM_NAME MATCHES "Windows")
+if (MK_EVENT_LOOP_LIBEVENT)
   target_link_libraries(mk_core event)
 endif()

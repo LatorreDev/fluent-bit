@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ static int logfmt_parser(struct flb_parser *parser,
                          size_t *map_size)
 {
     int ret;
-    struct tm tm = {0};
+    struct flb_tm tm = {0};
     const unsigned char *key = NULL;
     size_t key_len = 0;
     const unsigned char *value = NULL;
@@ -77,6 +77,7 @@ static int logfmt_parser(struct flb_parser *parser,
     const unsigned char *end = c + in_size;
     int last_byte;
     int do_pack = FLB_TRUE;
+    int value_set = FLB_FALSE;
     int value_str = FLB_FALSE;
     int value_escape = FLB_FALSE;
 
@@ -98,17 +99,16 @@ static int logfmt_parser(struct flb_parser *parser,
         while ((c < end) && ident_byte[*c]) {
             c++;
         }
-        if (c == end) {
-            break;
-        }
 
         key_len = c - key;
         /* value */
         value_len = 0;
+        value_set = FLB_FALSE;
         value_str = FLB_FALSE;
         value_escape =  FLB_FALSE;
 
-        if (*c == '=') {
+        if (c < end && *c == '=') {
+            value_set = FLB_TRUE;
             c++;
             if (c < end) {
                 if (*c == '"') {
@@ -148,6 +148,12 @@ static int logfmt_parser(struct flb_parser *parser,
 
         if (key_len > 0) {
             int time_found = FLB_FALSE;
+            if (parser->logfmt_no_bare_keys && value_len == 0 && !value_set) {
+                if (!do_pack) {
+                    *map_size = 0;
+                }
+                return 0;
+            }
 
             if (parser->time_fmt && key_len == time_key_len &&
                 value_len > 0 &&
@@ -160,7 +166,7 @@ static int logfmt_parser(struct flb_parser *parser,
                                   parser->name, parser->time_fmt_full);
                         return -1;
                     }
-                    *time_lookup = flb_parser_tm2time(&tm);
+                    *time_lookup = flb_parser_tm2time(&tm, parser->time_system_timezone);
                 }
                 time_found = FLB_TRUE;
             }
@@ -182,7 +188,7 @@ static int logfmt_parser(struct flb_parser *parser,
                                 msgpack_pack_str(tmp_pck, 0);
                             }
                             else {
-                                msgpack_pack_nil(tmp_pck);
+                                msgpack_pack_true(tmp_pck);
                             }
                         }
                         else {

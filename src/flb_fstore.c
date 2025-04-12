@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@
 #include <fluent-bit/flb_sds.h>
 #include <chunkio/chunkio.h>
 
-static void log_cb(void *ctx, int level, const char *file, int line,
-                   const char *str)
+static int log_cb(struct cio_ctx *ctx, int level, const char *file, int line,
+                  char *str)
 {
     if (level == CIO_LOG_ERROR) {
         flb_error("[fstore] %s", str);
@@ -39,6 +39,8 @@ static void log_cb(void *ctx, int level, const char *file, int line,
     else if (level == CIO_LOG_DEBUG) {
         flb_debug("[fstore] %s", str);
     }
+
+    return 0;
 }
 
 /*
@@ -459,6 +461,8 @@ struct flb_fstore *flb_fstore_create(char *path, int store_type)
     flags = CIO_OPEN;
 
     /* Create Chunk I/O context */
+    cio_options_init(&opts);
+
     opts.root_path = path;
     opts.log_cb = log_cb;
     opts.flags = flags;

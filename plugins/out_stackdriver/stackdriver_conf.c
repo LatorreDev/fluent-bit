@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -180,10 +180,10 @@ static int parse_key_value_list(struct flb_stackdriver *ctx,
                                 struct mk_list *dest,
                                 int shouldTrim)
 {
-    int ret;
     char *p;
     flb_sds_t key;
     flb_sds_t val;
+    struct flb_kv *kv;
     struct mk_list *head;
     struct flb_slist_entry *entry;
 
@@ -219,11 +219,11 @@ static int parse_key_value_list(struct flb_stackdriver *ctx,
                 return -1;
             }
 
-            ret = flb_kv_item_create(dest, key, val);
+            kv = flb_kv_item_create(dest, key, val);
             flb_sds_destroy(key);
             flb_sds_destroy(val);
 
-            if (ret == -1) {
+            if (!kv) {
                 return -1;
             }
         }
@@ -262,6 +262,9 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
     const char *backwards_compatible_env_var;
     struct flb_stackdriver *ctx;
     size_t http_request_key_size;
+    struct cmt_histogram_buckets *buckets;
+    flb_sds_t cloud_logging_base_url_str;
+    size_t cloud_logging_base_url_size, cloud_logging_write_url_size;
 
     /* Allocate config context */
     ctx = flb_calloc(1, sizeof(struct flb_stackdriver));
@@ -271,12 +274,19 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
     }
     ctx->ins = ins;
     ctx->config = config;
-    
+
     ret = flb_output_config_map_set(ins, (void *)ctx);
     if (ret == -1) {
         flb_plg_error(ins, "unable to load configuration");
         flb_free(ctx);
         return NULL;
+    }
+
+    /* Compress (gzip) */
+    tmp = flb_output_get_property("compress", ins);
+    ctx->compress_gzip = FLB_FALSE;
+    if (tmp && strcasecmp(tmp, "gzip") == 0) {
+        ctx->compress_gzip = FLB_TRUE;
     }
 
     /* labels */
@@ -387,12 +397,13 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
             flb_stackdriver_conf_destroy(ctx);
             return NULL;
         }
-        
+
         /* Service Account Email */
         if (ctx->client_email == NULL) {
             tmp = getenv("SERVICE_ACCOUNT_EMAIL");
             if (tmp) {
                 ctx->creds->client_email = flb_sds_create(tmp);
+                ctx->client_email = ctx->creds->client_email;
             }
         }
 
@@ -401,11 +412,9 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
             tmp = getenv("SERVICE_ACCOUNT_SECRET");
             if (tmp) {
                 ctx->creds->private_key = flb_sds_create(tmp);
+                ctx->private_key = ctx->creds->private_key;
             }
         }
-
-        ctx->private_key = ctx->creds->private_key;
-        ctx->client_email = ctx->creds->client_email;
     }
 
     /*
@@ -453,6 +462,36 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
         }
     }
 
+    if (ctx->cloud_logging_base_url) {
+        /*
+         * An alternate base URL was specified in the config. To avoid the confusion of a user
+         * not knowing whether the trailing `/` should be present, check whether the user
+         * provided it and remove it if it is.
+         */
+        cloud_logging_base_url_size = flb_sds_len(ctx->cloud_logging_base_url);
+        if (FLB_SDS_HEADER(
+                ctx->cloud_logging_base_url
+            )->buf[cloud_logging_base_url_size-1] == '/') {
+            cloud_logging_base_url_size -= 1;
+        }
+        cloud_logging_base_url_str = flb_sds_create_size(cloud_logging_base_url_size);
+
+        /* Note: The size calculated from `flb_sds_len` does not include the null terminator character,
+         * `size` argument for `flb_sds_snprintf` needs to be the size including the null terminator.
+         * Hence the +1 added to each size argument here.
+         */
+        flb_sds_snprintf(&cloud_logging_base_url_str, cloud_logging_base_url_size+1,
+                         "%s", ctx->cloud_logging_base_url);
+        cloud_logging_write_url_size = cloud_logging_base_url_size + FLB_STD_WRITE_URI_SIZE;
+        ctx->cloud_logging_write_url = flb_sds_create_size(cloud_logging_write_url_size);
+        flb_sds_snprintf(&ctx->cloud_logging_write_url, cloud_logging_write_url_size+1,
+                         "%s%s", cloud_logging_base_url_str, FLB_STD_WRITE_URI);
+
+        flb_sds_destroy(cloud_logging_base_url_str);
+    } else {
+        ctx->cloud_logging_write_url = flb_sds_create(FLB_STD_WRITE_URL);
+    }
+
     set_resource_type(ctx);
 
     if (resource_api_has_required_labels(ctx) == FLB_FALSE) {
@@ -466,7 +505,7 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
             }
         }
 
-        else if (ctx->resource_type == RESOURCE_TYPE_GENERIC_NODE 
+        else if (ctx->resource_type == RESOURCE_TYPE_GENERIC_NODE
             || ctx->resource_type == RESOURCE_TYPE_GENERIC_TASK) {
 
             if (ctx->location == NULL) {
@@ -506,7 +545,6 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
         }
     }
 
-
     if (ctx->tag_prefix == NULL && ctx->resource_type == RESOURCE_TYPE_K8S) {
         /* allocate the flb_sds_t to tag_prefix_k8s so we can safely deallocate it */
         ctx->tag_prefix_k8s = flb_sds_create(ctx->resource);
@@ -537,21 +575,31 @@ struct flb_stackdriver *flb_stackdriver_conf_create(struct flb_output_instance *
                                                  "stackdriver",
                                                  "requests_total",
                                                  "Total number of requests.",
-                                                  1, (char *[]) {"status"});
+                                                  2, (char *[]) {"status", "name"});
 
     ctx->cmt_proc_records_total = cmt_counter_create(ins->cmt,
                                                      "fluentbit",
                                                      "stackdriver",
                                                      "proc_records_total",
                                                      "Total number of processed records.",
-                                                     1, (char *[]) {"status"});
+                                                     3, (char *[]) {"grpc_code" ,"status", "name"});
 
     ctx->cmt_retried_records_total = cmt_counter_create(ins->cmt,
                                                         "fluentbit",
                                                         "stackdriver",
                                                         "retried_records_total",
                                                         "Total number of retried records.",
-                                                        1, (char *[]) {"status"});
+                                                        2, (char *[]) {"status", "name"});
+
+    buckets = cmt_histogram_buckets_create(7, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0);
+    ctx->cmt_write_entries_latency = cmt_histogram_create(ins->cmt,
+                                                          "fluentbit",
+                                                          "stackdriver",
+                                                          "write_entries_latency",
+                                                          "Latency of Cloud Logging WriteLogEntries HTTP request.",
+                                                          buckets,
+                                                          1, (char *[]) {"name"});
+
 
     /* OLD api */
     flb_metrics_add(FLB_STACKDRIVER_SUCCESSFUL_REQUESTS,
@@ -593,7 +641,7 @@ int flb_stackdriver_conf_destroy(struct flb_stackdriver *ctx)
         }
         flb_free(ctx->creds);
     }
-    
+
     if (ctx->env) {
         if (ctx->env->creds_file) {
             flb_sds_destroy(ctx->env->creds_file);
@@ -614,7 +662,7 @@ int flb_stackdriver_conf_destroy(struct flb_stackdriver *ctx)
     if (ctx->metadata_server) {
         flb_sds_destroy(ctx->metadata_server);
     }
-    
+
     if (ctx->resource_type == RESOURCE_TYPE_K8S){
         flb_sds_destroy(ctx->namespace_name);
         flb_sds_destroy(ctx->pod_name);
@@ -622,7 +670,7 @@ int flb_stackdriver_conf_destroy(struct flb_stackdriver *ctx)
         flb_sds_destroy(ctx->node_name);
         flb_sds_destroy(ctx->local_resource_id);
     }
-    
+
     if (ctx->metadata_server_auth) {
         flb_sds_destroy(ctx->zone);
         flb_sds_destroy(ctx->instance_id);
@@ -643,13 +691,17 @@ int flb_stackdriver_conf_destroy(struct flb_stackdriver *ctx)
     if (ctx->regex) {
         flb_regex_destroy(ctx->regex);
     }
-    
+
     if (ctx->project_id) {
         flb_sds_destroy(ctx->project_id);
     }
-    
+
     if (ctx->tag_prefix_k8s) {
         flb_sds_destroy(ctx->tag_prefix_k8s);
+    }
+
+    if (ctx->cloud_logging_write_url) {
+        flb_sds_destroy(ctx->cloud_logging_write_url);
     }
 
     flb_kv_release(&ctx->config_labels);

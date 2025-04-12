@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_thread_storage.h>
 
+#define FLB_ENGINE_OUTPUT_EVENT_BATCH_SIZE 1
+
 int flb_engine_start(struct flb_config *config);
 int flb_engine_failed(struct flb_config *config);
 int flb_engine_flush(struct flb_config *config,
@@ -34,6 +36,7 @@ int flb_engine_exit(struct flb_config *config);
 int flb_engine_exit_status(struct flb_config *config, int status);
 int flb_engine_shutdown(struct flb_config *config);
 int flb_engine_destroy_tasks(struct mk_list *tasks);
+void flb_engine_reschedule_retries(struct flb_config *config);
 
 /* Engine event loop */
 void flb_engine_evl_init();

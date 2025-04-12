@@ -3,8 +3,8 @@ set(src
 
 add_library(flb-plugin-proxy-go STATIC ${src})
 if(FLB_JEMALLOC)
-  target_link_libraries(flb-plugin-proxy-go libjemalloc)
+  target_link_libraries(flb-plugin-proxy-go ${JEMALLOC_LIBRARIES})
 endif()
 if(FLB_REGEX)
-  target_link_libraries(flb-plugin-proxy-go libonigmo)
+  target_link_libraries(flb-plugin-proxy-go onigmo-static)
 endif()

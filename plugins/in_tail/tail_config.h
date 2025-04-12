@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_sqldb.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_log_event.h>
 #ifdef FLB_HAVE_REGEX
 #include <fluent-bit/flb_regex.h>
 #endif
@@ -68,6 +69,7 @@ struct flb_tail_config {
     int coll_fd_inactive;
     int coll_fd_dmode_flush;
     int coll_fd_mult_flush;
+    int coll_fd_progress_check;
 
     /* Backend collectors */
     int coll_fd_fs1;           /* used by fs_inotify & fs_stat */
@@ -83,7 +85,10 @@ struct flb_tail_config {
     int read_from_head;        /* read new files from head     */
     int rotate_wait;           /* sec to wait on rotated files */
     int watcher_interval;      /* watcher interval             */
-    int ignore_older;          /* ignore fields older than X seconds        */
+    int ignore_older;          /* ignore fields older than X seconds */
+    int ignore_active_older_files; /* ignore files that exceed the ignore
+                                    * older limit even if they are already
+                                    * being ingested */
     time_t last_pending;       /* last time a 'pending signal' was emitted' */
     struct mk_list *path_list; /* list of paths to scan (glob) */
     flb_sds_t path_key;        /* key name of file path        */
@@ -91,6 +96,12 @@ struct flb_tail_config {
     int   skip_long_lines;     /* skip long lines              */
     int   skip_empty_lines;    /* skip empty lines (off)       */
     int   exit_on_eof;         /* exit fluent-bit on EOF, test */
+#ifdef __linux__
+    int   file_cache_advise;   /* Use posix_fadvise for file access */
+#endif
+
+    int progress_check_interval;      /* watcher interval             */
+    int progress_check_interval_nsec; /* watcher interval             */
 
 #ifdef FLB_HAVE_INOTIFY
     int   inotify_watcher;     /* enable/disable inotify monitor */
@@ -102,6 +113,7 @@ struct flb_tail_config {
     struct flb_sqldb *db;
     int db_sync;
     int db_locking;
+    int compare_filename;
     flb_sds_t db_journal_mode;
     sqlite3_stmt *stmt_get_file;
     sqlite3_stmt *stmt_insert_file;
@@ -112,6 +124,10 @@ struct flb_tail_config {
 
     /* Parser / Format */
     struct flb_parser *parser;
+
+#ifdef FLB_HAVE_UNICODE_ENCODER
+    int preferred_input_encoding;
+#endif
 
     /* Multiline */
     int multiline;             /* multiline enabled ?  */
@@ -140,6 +156,9 @@ struct flb_tail_config {
 
     /* Plugin input instance */
     struct flb_input_instance *ins;
+
+    struct flb_log_event_encoder log_event_encoder;
+    struct flb_log_event_decoder log_event_decoder;
 
     /* Metrics */
     struct cmt_counter *cmt_files_opened;

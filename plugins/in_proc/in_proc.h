@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_log_event_encoder.h>
 #include <msgpack.h>
 
 #define DEFAULT_INTERVAL_SEC  "1"
@@ -52,7 +53,7 @@ struct flb_in_proc_mem_offset {
 };
 
 struct flb_in_proc_config {
-    uint8_t  alert;
+    int  alert;
     uint8_t  alive;
 
     /* Checking process */
@@ -65,12 +66,13 @@ struct flb_in_proc_config {
     int interval_nsec;
 
     /* Memory */
-    uint8_t mem;
+    int mem;
 
     /* File descriptor */
-    uint8_t fds;
+    int fds;
 
     struct flb_input_instance *ins;
+    struct flb_log_event_encoder *log_encoder;
 };
 
 #endif /*FLB_IN_PROC_H*/

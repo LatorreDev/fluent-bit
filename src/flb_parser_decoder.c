@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,9 @@
 #include <fluent-bit/flb_unescape.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_kv.h>
+
+#include <cfl/cfl.h>
+#include <cfl/cfl_kvlist.h>
 
 #include <msgpack.h>
 
@@ -55,7 +58,7 @@ static int decode_json(struct flb_parser_dec *dec,
         return -1;
     }
 
-    ret = flb_pack_json_recs(p, len, &buf, &size, &root_type, &records);
+    ret = flb_pack_json_recs(p, len, &buf, &size, &root_type, &records, NULL);
     if (ret != 0) {
         return -1;
     }
@@ -603,7 +606,7 @@ struct mk_list *flb_parser_decoder_list_create(struct flb_cf_section *section)
     int type;
     int backend;
     int size;
-    struct mk_list *head;
+    struct cfl_list *head;
     struct mk_list *list = NULL;
     struct mk_list *split;
     struct flb_split_entry *decoder;
@@ -611,7 +614,7 @@ struct mk_list *flb_parser_decoder_list_create(struct flb_cf_section *section)
     struct flb_split_entry *action;
     struct flb_parser_dec *dec;
     struct flb_parser_dec_rule *dec_rule;
-    struct flb_kv *entry;
+    struct cfl_kvpair *entry;
 
     /* Global list to be referenced by parent parser definition */
     list = flb_malloc(sizeof(struct mk_list));
@@ -621,8 +624,8 @@ struct mk_list *flb_parser_decoder_list_create(struct flb_cf_section *section)
     }
     mk_list_init(list);
 
-    mk_list_foreach(head, &section->properties) {
-        entry = mk_list_entry(head, struct flb_kv, _head);
+    cfl_list_foreach(head, &section->properties->list) {
+        entry = cfl_list_entry(head, struct cfl_kvpair, _head);
 
         /* Lookup for specific Decode rules */
         if (strcasecmp(entry->key, "decode_field") == 0) {
@@ -636,7 +639,7 @@ struct mk_list *flb_parser_decoder_list_create(struct flb_cf_section *section)
         }
 
         /* Split the value */
-        split = flb_utils_split(entry->val, ' ', 3);
+        split = flb_utils_split(entry->val->data.as_string, ' ', 3);
         if (!split) {
             flb_error("[parser] invalid number of parameters in decoder");
             flb_parser_decoder_list_destroy(list);

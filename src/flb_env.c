@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_log.h>
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_env.h>
+#include <fluent-bit/flb_file.h>
 
 #include <stdlib.h>
 
@@ -104,10 +105,49 @@ int flb_env_set(struct flb_env *env, const char *key, const char *val)
     int vlen;
     void *out_buf;
     size_t out_size;
+    flb_sds_t fs_buf = NULL;
 
     /* Get lengths */
     klen = strlen(key);
     vlen = strlen(val);
+
+    /* Check if the variable is a reference to a file */
+    if (vlen > 7 && strncmp(val, "file://", 7) == 0) {
+        /* skip  the file:// prefix */
+        vlen -= 7;
+        val += 7;
+
+        /* Check if the file exists */
+        if (access(val, R_OK) == -1) {
+            flb_error("[env] file %s not found", val);
+            return -1;
+        }
+        /* Read the file content */
+        fs_buf = flb_file_read(val);
+        if (!fs_buf) {
+            flb_error("[env] file %s could not be read", val);
+            return -1;
+        }
+
+        /* Set the new value */
+        val = fs_buf;
+        vlen = flb_sds_len(fs_buf);
+
+        /* check if we have an ending \r or \n */
+        if (vlen > 0 && (val[vlen - 1] == '\n' || val[vlen - 1] == '\r')) {
+            vlen--;
+            flb_sds_len_set(fs_buf, vlen);
+        }
+
+        /* Check if the file content is empty */
+        if (vlen == 0) {
+            flb_error("[env] file %s content is empty", val);
+            flb_sds_destroy(fs_buf);
+            return -1;
+        }
+
+        flb_debug("[env] file %s content read propery, length= %d", val, vlen);
+    }
 
     /* Check if the key is already set */
     id = flb_hash_table_get(env->ht, key, klen, &out_buf, &out_size);
@@ -118,6 +158,11 @@ int flb_env_set(struct flb_env *env, const char *key, const char *val)
 
     /* Register the new key */
     id = flb_hash_table_add(env->ht, key, klen, (void *) val, vlen);
+
+    if (fs_buf) {
+        flb_sds_destroy(fs_buf);
+    }
+
     return id;
 }
 
@@ -168,7 +213,7 @@ flb_sds_t flb_env_var_translate(struct flb_env *env, const char *value)
     const char *env_var = NULL;
     char *v_start = NULL;
     char *v_end = NULL;
-    char tmp[64];
+    char tmp[4096];
     flb_sds_t buf;
     flb_sds_t s;
 
@@ -195,7 +240,7 @@ flb_sds_t flb_env_var_translate(struct flb_env *env, const char *value)
 
         v_start += 2;
         v_len = v_end - v_start;
-        if (v_len <= 0) {
+        if (v_len <= 0 || v_len >= sizeof(tmp)) {
             break;
         }
 

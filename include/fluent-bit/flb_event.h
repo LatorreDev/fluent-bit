@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,8 +25,13 @@
 #include <fluent-bit/flb_input_chunk.h>
 
 /* Event types */
-#define FLB_EVENT_TYPE_LOG     FLB_INPUT_CHUNK_TYPE_LOG
-#define FLB_EVENT_TYPE_METRIC  FLB_INPUT_CHUNK_TYPE_METRIC
+#define FLB_EVENT_TYPE_LOGS       FLB_INPUT_CHUNK_TYPE_LOGS
+#define FLB_EVENT_TYPE_METRICS    FLB_INPUT_CHUNK_TYPE_METRICS
+#define FLB_EVENT_TYPE_TRACES     FLB_INPUT_CHUNK_TYPE_TRACES
+#define FLB_EVENT_TYPE_PROFILES   FLB_INPUT_CHUNK_TYPE_PROFILES
+#define FLB_EVENT_TYPE_BLOBS      FLB_INPUT_CHUNK_TYPE_BLOBS
+
+#define FLB_EVENT_TYPE_HAS_TRACE FLB_INPUT_CHUNK_HAS_TRACE
 
 /*
  * The flb_event_chunk structure is a full context used in the output plugins
@@ -36,9 +41,12 @@
 struct flb_event_chunk {
     int type;               /* event type */
     flb_sds_t tag;          /* tag associated */
-    const void *data;       /* event content */
+    void *data;             /* event content */
     size_t size;            /* size of event */
     size_t total_events;    /* total number of serialized events */
+#ifdef FLB_HAVE_CHUNK_TRACE
+    struct flb_chunk_trace *trace;
+#endif
 };
 
 struct flb_event_chunk *flb_event_chunk_create(int type,

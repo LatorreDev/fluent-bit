@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include <fluent-bit/flb_engine.h>
 #include <fluent-bit/flb_task.h>
 #include <fluent-bit/flb_event.h>
+#include <chunkio/chunkio.h>
 
 
 /* It creates a new output thread using a 'Retry' context */
@@ -75,11 +76,25 @@ int flb_engine_dispatch_retry(struct flb_task_retry *retry,
     flb_event_chunk_update(task->event_chunk, buf_data, buf_size);
 
     /* flush the task */
-    ret = flb_output_task_flush(task, retry->o_ins, config);
-    if (ret == -1) {
-        flb_task_retry_destroy(retry);
-        return -1;
+    if (retry->o_ins->flags & FLB_OUTPUT_SYNCHRONOUS) {
+        /*
+         * If the plugin doesn't allow for multiplexing.
+         * singleplex_enqueue deletes retry context on flush or delayed flush failure
+         */
+        ret = flb_output_task_singleplex_enqueue(retry->o_ins->singleplex_queue, retry,
+                                                 task, retry->o_ins, config);
+        if (ret == -1) {
+            return -1;
+        }
     }
+    else {
+        ret = flb_output_task_flush(task, retry->o_ins, config);
+        if (ret == -1) {
+            flb_task_retry_destroy(retry);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -103,6 +118,7 @@ static void test_run_formatter(struct flb_config *config,
                         i_ins,
                         o_ins->context,
                         flush_ctx,
+                        evc->type,
                         evc->tag, flb_sds_len(evc->tag),
                         evc->data, evc->size,
                         &out_buf, &out_size);
@@ -183,10 +199,20 @@ static int tasks_start(struct flb_input_instance *in,
             hits++;
 
             /*
-             * We have the Task and the Route, created a thread context for the
-             * data handling.
+             * If the plugin is in synchronous mode, enqueue the task and flush
+             * when appropriate.
              */
-            flb_output_task_flush(task, route->out, config);
+            if (out->flags & FLB_OUTPUT_SYNCHRONOUS) {
+                flb_output_task_singleplex_enqueue(route->out->singleplex_queue, NULL,
+                                                   task, route->out, config);
+            }
+            else {
+                /*
+                 * We have the Task and the Route, created a thread context for the
+                 * data handling.
+                 */
+                flb_output_task_flush(task, route->out, config);
+            }
 
             /*
             th = flb_output_thread(task,
@@ -245,6 +271,14 @@ int flb_engine_dispatch(uint64_t id, struct flb_input_instance *in,
             continue;
         }
 
+        if (flb_task_map_get_task_id(config) == -1) {
+            /*
+             * There isn't a task available, no more chunks can have a task
+             * assigned.
+             */
+            break;
+        }
+
         /* There is a match, get the buffer */
         buf_data = flb_input_chunk_flush(ic, &buf_size);
         if (buf_size == 0) {
@@ -287,6 +321,12 @@ int flb_engine_dispatch(uint64_t id, struct flb_input_instance *in,
              */
             if (t_err == FLB_TRUE) {
                 flb_input_chunk_release_lock(ic);
+
+                /*
+                 * If the Storage type is 'filesystem' we need to put
+                 * the file content down.
+                 */
+                flb_input_chunk_down(ic);
             }
             continue;
         }

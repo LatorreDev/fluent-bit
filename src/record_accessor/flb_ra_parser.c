@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,21 @@
 
 #include "ra_parser.h"
 #include "ra_lex.h"
+
+int flb_ra_parser_subkey_count(struct flb_ra_parser *rp)
+{
+    if (rp == NULL || rp->key == NULL) {
+        return -1;
+    }
+    else if (rp->type != FLB_RA_PARSER_KEYMAP) {
+        return 0;
+    }
+    else if(rp->key->subkeys == NULL) {
+        return -1;
+    }
+
+    return mk_list_size(rp->key->subkeys);
+}
 
 void flb_ra_parser_dump(struct flb_ra_parser *rp)
 {

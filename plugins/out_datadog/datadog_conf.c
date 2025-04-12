@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ struct flb_out_datadog *flb_datadog_conf_create(struct flb_output_instance *ins,
     struct flb_upstream *upstream;
     const char *api_key;
     const char *tmp;
+    flb_sds_t tmp_sds;
 
     int ret;
     char *protocol = NULL;
@@ -75,12 +76,18 @@ struct flb_out_datadog *flb_datadog_conf_create(struct flb_output_instance *ins,
     /* use TLS ? */
     if (ins->use_tls == FLB_TRUE) {
         io_flags = FLB_IO_TLS;
-        ctx->scheme = flb_sds_create("https://");
+        tmp_sds = flb_sds_create("https://");
     }
     else {
         io_flags = FLB_IO_TCP;
-        ctx->scheme = flb_sds_create("http://");
+        tmp_sds = flb_sds_create("http://");
     }
+    if (!tmp_sds) {
+        flb_errno();
+        flb_datadog_conf_destroy(ctx);
+        return NULL;
+    }
+    ctx->scheme = tmp_sds;
     flb_plg_debug(ctx->ins, "scheme: %s", ctx->scheme);
 
     /* configure URI */
@@ -111,6 +118,11 @@ struct flb_out_datadog *flb_datadog_conf_create(struct flb_output_instance *ins,
         ctx->nb_additional_entries++;
     }
 
+    tmp = flb_output_get_property("dd_hostname", ins);
+    if (tmp) {
+        ctx->nb_additional_entries++;
+    }
+
     tmp = flb_output_get_property("provider", ins);
     ctx->remap = tmp && (strlen(tmp) == strlen(FLB_DATADOG_REMAP_PROVIDER)) && \
         (strncmp(tmp, FLB_DATADOG_REMAP_PROVIDER, strlen(tmp)) == 0);
@@ -126,11 +138,17 @@ struct flb_out_datadog *flb_datadog_conf_create(struct flb_output_instance *ins,
 
     /* Get network configuration */
     if (!ins->host.name) {
-        ctx->host = flb_sds_create(FLB_DATADOG_DEFAULT_HOST);
+        tmp_sds = flb_sds_create(FLB_DATADOG_DEFAULT_HOST);
     }
     else {
-        ctx->host = flb_sds_create(ins->host.name);
+        tmp_sds = flb_sds_create(ins->host.name);
     }
+    if (!tmp_sds) {
+        flb_errno();
+        flb_datadog_conf_destroy(ctx);
+        return NULL;
+    }
+    ctx->host = tmp_sds;
     flb_plg_debug(ctx->ins, "host: %s", ctx->host);
 
     if (ins->host.port != 0) {

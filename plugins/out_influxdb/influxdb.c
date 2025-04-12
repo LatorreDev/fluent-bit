@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 
 #include <msgpack.h>
 
@@ -57,50 +58,38 @@ static void influxdb_tsmod(struct flb_time *ts, struct flb_time *dupe,
  * Convert the internal Fluent Bit data representation to the required one
  * by InfluxDB.
  */
-static char *influxdb_format(const char *tag, int tag_len,
-                             const void *data, size_t bytes, size_t *out_size,
-                             struct flb_influxdb *ctx)
+static int influxdb_format(struct flb_config *config,
+                           struct flb_input_instance *ins,
+                           void *plugin_context,
+                           void *flush_ctx,
+                           int event_type,
+                           const char *tag, int tag_len,
+                           const void *data, size_t bytes,
+                           void **out_data, size_t *out_size)
 {
     int i;
     int ret;
     int n_size;
     uint64_t seq = 0;
-    size_t off = 0;
-    char *buf;
     char *str = NULL;
     size_t str_size;
     char tmp[128];
-    msgpack_unpacked result;
-    msgpack_object root;
     msgpack_object map;
-    msgpack_object *obj;
     struct flb_time tm;
     struct influxdb_bulk *bulk = NULL;
     struct influxdb_bulk *bulk_head = NULL;
     struct influxdb_bulk *bulk_body = NULL;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    struct flb_influxdb *ctx = plugin_context;
 
+    ret = flb_log_event_decoder_init(&log_decoder, (char *) data, bytes);
 
-    /* Iterate the original buffer and perform adjustments */
-    msgpack_unpacked_init(&result);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
 
-    /* Perform some format validation */
-    ret = msgpack_unpack_next(&result, data, bytes, &off);
-    if (!ret) {
-        return NULL;
-    }
-
-    /* We 'should' get an array */
-    if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-        /*
-         * If we got a different format, we assume the caller knows what he is
-         * doing, we just duplicate the content in a new buffer and cleanup.
-         */
-        return NULL;
-    }
-
-    root = result.data;
-    if (root.via.array.size == 0) {
-        return NULL;
+        return -1;
     }
 
     /* Create the bulk composer */
@@ -119,23 +108,12 @@ static char *influxdb_format(const char *tag, int tag_len,
         goto error;
     }
 
-    off = 0;
-    msgpack_unpacked_destroy(&result);
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result, data, bytes, &off) == MSGPACK_UNPACK_SUCCESS) {
-        if (result.data.type != MSGPACK_OBJECT_ARRAY) {
-            continue;
-        }
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        flb_time_copy(&tm, &log_event.timestamp);
 
-        /* Each array must have two entries: time and record */
-        root = result.data;
-        if (root.via.array.size != 2) {
-            continue;
-        }
-
-
-        flb_time_pop_from_msgpack(&tm, &result, &obj);
-        map    = root.via.array.ptr[1];
+        map    = *log_event.body;
         n_size = map.via.map.size + 1;
 
         seq = ctx->seq;
@@ -198,11 +176,21 @@ static char *influxdb_format(const char *tag, int tag_len,
             }
             else if (v->type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
                 val = tmp;
-                val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRIu64, v->via.u64);
+                if (ctx->use_influxdb_integer) {
+                    val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRIu64 "i", v->via.u64);
+                }
+                else {
+                    val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRIu64, v->via.u64);
+                }
             }
             else if (v->type == MSGPACK_OBJECT_NEGATIVE_INTEGER) {
                 val = tmp;
-                val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRId64, v->via.i64);
+                if (ctx->use_influxdb_integer) {
+                    val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRId64 "i", v->via.i64);
+                }
+                else {
+                    val_len = snprintf(tmp, sizeof(tmp) - 1, "%" PRId64, v->via.i64);
+                }
             }
             else if (v->type == MSGPACK_OBJECT_FLOAT || v->type == MSGPACK_OBJECT_FLOAT32) {
                 val = tmp;
@@ -293,10 +281,10 @@ static char *influxdb_format(const char *tag, int tag_len,
         bulk_body->len = 0;
     }
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
 
+    *out_data = bulk->ptr;
     *out_size = bulk->len;
-    buf = bulk->ptr;
 
     /*
      * Note: we don't destroy the bulk as we need to keep the allocated
@@ -307,7 +295,7 @@ static char *influxdb_format(const char *tag, int tag_len,
     influxdb_bulk_destroy(bulk_head);
     influxdb_bulk_destroy(bulk_body);
 
-    return buf;
+    return 0;
 
 error:
     if (bulk != NULL) {
@@ -319,8 +307,10 @@ error:
     if (bulk_body != NULL) {
         influxdb_bulk_destroy(bulk_body);
     }
-    msgpack_unpacked_destroy(&result);
-    return NULL;
+
+    flb_log_event_decoder_destroy(&log_decoder);
+
+    return -1;
 }
 
 static int cb_influxdb_init(struct flb_output_instance *ins, struct flb_config *config,
@@ -441,7 +431,7 @@ static int format_metrics(struct flb_output_instance *ins,
 {
     int ret;
     size_t off = 0;
-    cmt_sds_t text;
+    cfl_sds_t text;
     struct cmt *cmt = NULL;
 
     /* get cmetrics context */
@@ -478,10 +468,11 @@ static void cb_influxdb_flush(struct flb_event_chunk *event_chunk,
     int is_metric = FLB_FALSE;
     size_t b_sent;
     size_t bytes_out;
+    void *out_buf;
     char *pack;
     char tmp[128];
     struct mk_list *head;
-    struct flb_upstream_conn *u_conn;
+    struct flb_connection *u_conn;
     struct flb_http_client *c;
     struct flb_config_map_val *mv;
     struct flb_slist_entry *key = NULL;
@@ -489,7 +480,7 @@ static void cb_influxdb_flush(struct flb_event_chunk *event_chunk,
     struct flb_influxdb *ctx = out_context;
 
     /* Convert format: metrics / logs */
-    if (event_chunk->type == FLB_EVENT_TYPE_METRIC) {
+    if (event_chunk->type == FLB_EVENT_TYPE_METRICS) {
         /* format metrics */
         ret = format_metrics(ctx->ins,
                              (char *) event_chunk->data,
@@ -502,12 +493,17 @@ static void cb_influxdb_flush(struct flb_event_chunk *event_chunk,
     }
     else {
         /* format logs */
-        pack = influxdb_format(event_chunk->tag, flb_sds_len(event_chunk->tag),
-                               event_chunk->data, event_chunk->size,
-                               &bytes_out, ctx);
-        if (!pack) {
+        ret = influxdb_format(config, i_ins,
+                              ctx, NULL,
+                              event_chunk->type,
+                              event_chunk->tag, flb_sds_len(event_chunk->tag),
+                              event_chunk->data, event_chunk->size,
+                              &out_buf, &bytes_out);
+        if (ret != 0) {
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
+
+        pack = (char *) out_buf;
     }
 
     /* Get upstream connection */
@@ -592,6 +588,10 @@ static int cb_influxdb_exit(void *data, struct flb_config *config)
 
     if (ctx->tag_keys) {
         flb_utils_split_free(ctx->tag_keys);
+    }
+
+    if (ctx->seq_name) {
+        flb_free(ctx->seq_name);
     }
 
     flb_upstream_destroy(ctx->u);
@@ -690,6 +690,12 @@ static struct flb_config_map config_map[] = {
      "Space separated list of keys that needs to be tagged."
     },
 
+    {
+     FLB_CONFIG_MAP_BOOL, "add_integer_suffix", "false",
+     0, FLB_TRUE, offsetof(struct flb_influxdb, use_influxdb_integer),
+     "Use influxdb line protocol's integer type suffix."
+    },
+
     /* EOF */
     {0}
 };
@@ -702,6 +708,7 @@ struct flb_output_plugin out_influxdb_plugin = {
     .cb_flush     = cb_influxdb_flush,
     .cb_exit      = cb_influxdb_exit,
     .config_map   = config_map,
+    .test_formatter.callback = influxdb_format,
     .flags        = FLB_OUTPUT_NET | FLB_IO_OPT_TLS,
     .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS
 };

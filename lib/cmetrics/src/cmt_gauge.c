@@ -2,7 +2,7 @@
 
 /*  CMetrics
  *  ========
- *  Copyright 2021 Eduardo Silva <eduardo@calyptia.com>
+ *  Copyright 2021-2022 The CMetrics Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ struct cmt_gauge *cmt_gauge_create(struct cmt *cmt,
         cmt_errno();
         return NULL;
     }
-    mk_list_add(&gauge->_head, &cmt->gauges);
+    cfl_list_add(&gauge->_head, &cmt->gauges);
 
     /* Initialize options */
     ret = cmt_opts_init(&gauge->opts, ns, subsystem, name, help);
@@ -82,7 +82,7 @@ struct cmt_gauge *cmt_gauge_create(struct cmt *cmt,
 
 int cmt_gauge_destroy(struct cmt_gauge *gauge)
 {
-    mk_list_del(&gauge->_head);
+    cfl_list_del(&gauge->_head);
     cmt_opts_exit(&gauge->opts);
     if (gauge->map) {
         cmt_map_destroy(gauge->map);
@@ -99,8 +99,8 @@ int cmt_gauge_set(struct cmt_gauge *gauge, uint64_t timestamp, double val,
     metric = cmt_map_metric_get(&gauge->opts, gauge->map, labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(gauge->cmt, "unable to retrieve metric: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+        cmt_log_error(gauge->cmt, "unable to retrieve metric for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }
@@ -117,8 +117,8 @@ int cmt_gauge_inc(struct cmt_gauge *gauge, uint64_t timestamp,
     metric = cmt_map_metric_get(&gauge->opts, gauge->map, labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(gauge->cmt, "unable to retrieve metric: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+        cmt_log_error(gauge->cmt, "unable to retrieve metric for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }
@@ -134,8 +134,8 @@ int cmt_gauge_dec(struct cmt_gauge *gauge, uint64_t timestamp,
     metric = cmt_map_metric_get(&gauge->opts, gauge->map, labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(gauge->cmt, "unable to retrieve metric: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+        cmt_log_error(gauge->cmt, "unable to retrieve metric for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }
@@ -151,8 +151,8 @@ int cmt_gauge_add(struct cmt_gauge *gauge, uint64_t timestamp, double val,
     metric = cmt_map_metric_get(&gauge->opts, gauge->map, labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(gauge->cmt, "unable to retrieve metric: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+        cmt_log_error(gauge->cmt, "unable to retrieve metric for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }
@@ -168,8 +168,8 @@ int cmt_gauge_sub(struct cmt_gauge *gauge, uint64_t timestamp, double val,
     metric = cmt_map_metric_get(&gauge->opts, gauge->map, labels_count, label_vals,
                                 CMT_TRUE);
     if (!metric) {
-        cmt_log_error(gauge->cmt, "unable to retrieve metric: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+        cmt_log_error(gauge->cmt, "unable to retrieve metric for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }
@@ -188,8 +188,8 @@ int cmt_gauge_get_val(struct cmt_gauge *gauge,
                                  &val);
     if (ret == -1) {
         cmt_log_error(gauge->cmt,
-                      "unable to retrieve metric value: %s for gauge %s_%s_%s",
-                      gauge->map, gauge->opts.ns, gauge->opts.subsystem,
+                      "unable to retrieve metric value for gauge %s_%s_%s",
+                      gauge->opts.ns, gauge->opts.subsystem,
                       gauge->opts.name);
         return -1;
     }

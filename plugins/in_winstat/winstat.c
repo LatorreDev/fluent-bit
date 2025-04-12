@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -243,7 +243,7 @@ static int in_winstat_collect(struct flb_input_instance *in,
     msgpack_pack_str(&mp_pck, uptime_len);
     msgpack_pack_str_body(&mp_pck, cache->uptime_human, uptime_len);
 
-    flb_input_chunk_append_raw(in, NULL, 0, mp_sbuf.data, mp_sbuf.size);
+    flb_input_log_append(in, NULL, 0, mp_sbuf.data, mp_sbuf.size);
     msgpack_sbuffer_destroy(&mp_sbuf);
 
     return 0;

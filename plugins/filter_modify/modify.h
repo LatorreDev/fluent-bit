@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,7 +34,9 @@ enum FLB_FILTER_MODIFY_RULETYPE {
   REMOVE_WILDCARD,
   REMOVE_REGEX,
   COPY,
-  HARD_COPY
+  HARD_COPY,
+  MOVE_TO_START,
+  MOVE_TO_END
 };
 
 enum FLB_FILTER_MODIFY_CONDITIONTYPE {

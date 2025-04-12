@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include <fluent-bit/flb_slist.h>
 #include <fluent-bit/flb_sds.h>
 #include <monkey/mk_core.h>
+#include <cfl/cfl.h>
 
 /* Configuration types */
 #define FLB_CONFIG_MAP_STR         0    /* string */
@@ -47,16 +48,19 @@
 #define FLB_CONFIG_MAP_SLIST_3   43   /* split up to 3 nodes + remaining data */
 #define FLB_CONFIG_MAP_SLIST_4   44   /* split up to 4 nodes + remaining data */
 
+#define FLB_CONFIG_MAP_VARIANT   50   /* variant that wraps a kvlist or array */
+
 #define FLB_CONFIG_MAP_MULT       1
 
 struct flb_config_map_val {
     union {
         int i_num;                    /* FLB_CONFIG_MAP_INT */
-        char boolean;                 /* FLB_CONFIG_MAP_BOOL */
+        int boolean;                  /* FLB_CONFIG_MAP_BOOL */
         double d_num;                 /* FLB_CONFIG_MAP_DOUBLE */
         size_t s_num;                 /* FLB_CONFIG_MAP_SIZE */
         flb_sds_t str;                /* FLB_CONFIG_MAP_STR */
         struct mk_list *list;         /* FLB_CONFIG_MAP_CLIST and FLB_CONFIG_MAP_SLIST */
+        struct cfl_variant *variant;  /* FLB_CONFIG_MAP_VARIANT */
     } val;
     struct mk_list *mult;
     struct mk_list _head;             /* Link to list if this entry is a 'multiple' entry */

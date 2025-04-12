@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,9 +23,7 @@
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_utils.h>
-
 #include <msgpack.h>
-
 
 #include "mqtt.h"
 #include "mqtt_prot.h"
@@ -131,19 +129,16 @@ static int mqtt_data_append(char *topic, size_t topic_len,
 {
     int i;
     int ret;
-    int n_size;
     int root_type;
     size_t out;
     size_t off = 0;
     char *pack;
     msgpack_object root;
     msgpack_unpacked result;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer mp_sbuf;
     struct flb_in_mqtt_config *ctx = in_context;
 
     /* Convert our incoming JSON to MsgPack */
-    ret = flb_pack_json(msg, msg_len, &pack, &out, &root_type);
+    ret = flb_pack_json(msg, msg_len, &pack, &out, &root_type, NULL);
     if (ret != 0) {
         flb_plg_warn(ctx->ins, "MQTT Packet incomplete or is not JSON");
         return -1;
@@ -153,43 +148,75 @@ static int mqtt_data_append(char *topic, size_t topic_len,
     msgpack_unpacked_init(&result);
     if (msgpack_unpack_next(&result, pack, out, &off) != MSGPACK_UNPACK_SUCCESS) {
         msgpack_unpacked_destroy(&result);
+        flb_free(pack);
         return -1;
     }
 
     if (result.data.type != MSGPACK_OBJECT_MAP){
         msgpack_unpacked_destroy(&result);
+        flb_free(pack);
         return -1;
     }
     root = result.data;
 
-    /* Initialize local msgpack buffer */
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
-    /* Pack data */
-    msgpack_pack_array(&mp_pck, 2);
-    flb_pack_time_now(&mp_pck);
+    ret = flb_log_event_encoder_begin_record(ctx->log_encoder);
 
-    n_size = root.via.map.size;
-    msgpack_pack_map(&mp_pck, n_size + 1);
-    msgpack_pack_str(&mp_pck, 5);
-    msgpack_pack_str_body(&mp_pck, "topic", 5);
-    msgpack_pack_str(&mp_pck, topic_len);
-    msgpack_pack_str_body(&mp_pck, topic, topic_len);
-
-    /* Re-pack original KVs */
-    for (i = 0; i < n_size; i++) {
-        msgpack_pack_object(&mp_pck, root.via.map.ptr[i].key);
-        msgpack_pack_object(&mp_pck, root.via.map.ptr[i].val);
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_set_current_timestamp(ctx->log_encoder);
     }
 
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_append_body_values(
+                ctx->log_encoder,
+                FLB_LOG_EVENT_CSTRING_VALUE("topic"),
+                FLB_LOG_EVENT_STRING_VALUE(topic, topic_len));
+    }
 
-    flb_input_chunk_append_raw(ctx->ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
-    msgpack_sbuffer_destroy(&mp_sbuf);
+    if (ctx->payload_key) {
+        flb_log_event_encoder_append_body_string_length(ctx->log_encoder, flb_sds_len(ctx->payload_key));
+        flb_log_event_encoder_append_body_string_body(ctx->log_encoder, ctx->payload_key,
+                                                      flb_sds_len(ctx->payload_key));
+        flb_log_event_encoder_body_begin_map(ctx->log_encoder);
+    }
+
+    /* Re-pack original KVs */
+    for (i = 0;
+         i < root.via.map.size &&
+         ret == FLB_EVENT_ENCODER_SUCCESS;
+         i++) {
+        ret = flb_log_event_encoder_append_body_values(
+                ctx->log_encoder,
+                FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&root.via.map.ptr[i].key),
+                FLB_LOG_EVENT_MSGPACK_OBJECT_VALUE(&root.via.map.ptr[i].val));
+    }
+
+    if (ctx->payload_key) {
+        flb_log_event_encoder_body_commit_map(ctx->log_encoder);
+    }
+
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        ret = flb_log_event_encoder_commit_record(ctx->log_encoder);
+    }
+
+    if (ret == FLB_EVENT_ENCODER_SUCCESS) {
+        flb_input_log_append(ctx->ins, NULL, 0,
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
+        ret = 0;
+    }
+    else {
+        flb_plg_error(ctx->ins, "log event encoding error : %d", ret);
+
+        ret = -1;
+    }
+
+    flb_log_event_encoder_reset(ctx->log_encoder);
 
     msgpack_unpacked_destroy(&result);
     flb_free(pack);
-    return 0;
+
+    return ret;
 }
 
 
@@ -203,6 +230,7 @@ static int mqtt_handle_connect(struct mqtt_conn *conn)
 {
     int i;
     int ret;
+    size_t sent;
     char buf[4] = {0, 0, 0, 0};
     struct flb_in_mqtt_config *ctx = conn->ctx;
 
@@ -212,9 +240,14 @@ static int mqtt_handle_connect(struct mqtt_conn *conn)
     buf[i] = MQTT_CONN_ACCEPTED;
 
     /* write CONNACK message */
-    ret = write(conn->event.fd, buf, 4);
+    ret = flb_io_net_write(conn->connection,
+                           (void *) buf,
+                           4,
+                           &sent);
+
     flb_plg_trace(ctx->ins, "[fd=%i] CMD CONNECT (connack=%i bytes)",
-                  conn->event.fd, ret);
+                  conn->connection->fd, ret);
+
     return ret;
 }
 
@@ -226,6 +259,7 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
     int topic;
     int topic_len;
     uint8_t qos;
+    size_t sent;
     uint16_t hlen;
     uint16_t packet_id;
     char buf[4];
@@ -273,7 +307,12 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
         /* Set the identifier that we are replying to */
         buf[2] = (packet_id >> 8) & 0xff;
         buf[3] = (packet_id & 0xff);
-        write(conn->event.fd, buf, 4);
+
+        /* This operation should be checked */
+        flb_io_net_write(conn->connection,
+                         (void *) buf,
+                         4,
+                         &sent);
     }
 
     /* Message */
@@ -283,7 +322,7 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
                      conn->ctx);
 
     flb_plg_trace(ctx->ins, "[fd=%i] CMD PUBLISH",
-                  conn->event.fd);
+                  conn->connection->fd);
     return 0;
 }
 
@@ -291,23 +330,27 @@ static int mqtt_handle_publish(struct mqtt_conn *conn)
 static int mqtt_handle_ping(struct mqtt_conn *conn)
 {
     int ret;
+    size_t sent;
     char buf[2] = {0, 0};
     struct flb_in_mqtt_config *ctx = conn->ctx;
 
     mqtt_packet_header(MQTT_PINGRESP, 0 , (char *) &buf);
 
     /* write PINGRESP message */
-    ret = write(conn->event.fd, buf, 2);
+
+    ret = flb_io_net_write(conn->connection,
+                           (void *) buf,
+                           2,
+                           &sent);
 
     flb_plg_trace(ctx->ins, "[fd=%i] CMD PING (pong=%i bytes)",
-                  conn->event.fd, ret);
+                  conn->connection->fd, ret);
     return ret;
 }
 
 int mqtt_prot_parser(struct mqtt_conn *conn)
 {
     int ret;
-    int bytes = 0;
     int length = 0;
     int pos = conn->buf_pos;
     int mult;
@@ -322,7 +365,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
             if (BUF_AVAIL() < 2) {
                 conn->buf_pos = pos;
                 flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
-                              conn->event.fd);
+                              conn->connection->fd);
                 return MQTT_MORE;
             }
 
@@ -330,7 +373,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
             conn->packet_type = BUFC() >> 4;
             if (conn->status == MQTT_NEW && conn->packet_type != MQTT_CONNECT) {
                 flb_plg_trace(ctx->ins, "[fd=%i] error, expecting MQTT_CONNECT",
-                              conn->event.fd);
+                              conn->connection->fd);
                 return MQTT_ERROR;
             }
             conn->packet_length = conn->buf_pos;
@@ -339,16 +382,15 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
             /* Get the remaining length */
             mult   = 1;
             length = 0;
-            bytes  = 0;
+
             do {
                 if (conn->buf_pos + 1 > conn->buf_len) {
                     conn->buf_pos = pos;
                     flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
-                                  conn->event.fd);
+                                  conn->connection->fd);
                     return MQTT_MORE;
                 }
 
-                bytes++;
                 length += (BUFC() & 127) * mult;
                 mult *= 128;
                 if (mult > 128*128*128) {
@@ -358,7 +400,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
                 if (length + 2 > (conn->buf_len - pos)) {
                     conn->buf_pos = pos;
                     flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
-                                  conn->event.fd);
+                                  conn->connection->fd);
                     return MQTT_MORE;
                 }
 
@@ -366,7 +408,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
                     if (conn->buf_len - 2 < length) {
                         conn->buf_pos = pos;
                         flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
-                                      conn->event.fd);
+                                      conn->connection->fd);
                         return MQTT_MORE;
                     }
                     else {
@@ -381,7 +423,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
                 else {
                     conn->buf_pos = pos;
                     flb_plg_trace(ctx->ins, "[fd=%i] Need more data",
-                                  conn->event.fd);
+                                  conn->connection->fd);
                     return MQTT_MORE;
                 }
             } while (1);
@@ -403,7 +445,7 @@ int mqtt_prot_parser(struct mqtt_conn *conn)
             }
             else if (conn->packet_type == MQTT_DISCONNECT) {
                 flb_plg_trace(ctx->ins, "[fd=%i] CMD DISCONNECT",
-                          conn->event.fd);
+                          conn->connection->fd);
                 return MQTT_HANGUP;
             }
             else {

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -56,6 +56,7 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
     }
     ctx->ins = ins;
 
+    /* only used if the config has been set from the command line */
     if (uri) {
         if (uri->count >= 2) {
             f_index = flb_uri_get(uri, 0);
@@ -104,7 +105,21 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
 
     /* Set manual Index and Type */
     if (f_index) {
-        ctx->index = flb_strdup(f_index->value); /* FIXME */
+        ctx->index = flb_strdup(f_index->value);
+    }
+    else {
+        /* Check if the index has been set in the configuration */
+        if (ctx->index) {
+            /* do we have a record accessor pattern ? */
+            if (strchr(ctx->index, '$')) {
+                ctx->ra_index = flb_ra_create(ctx->index, FLB_TRUE);
+                if (!ctx->ra_index) {
+                    flb_plg_error(ctx->ins, "invalid record accessor pattern set for 'index' property");
+                    flb_os_conf_destroy(ctx);
+                    return NULL;
+                }
+            }
+        }
     }
 
     if (f_type) {
@@ -199,7 +214,32 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
         }
     }
 
+    if (ctx->compression_str) {
+        if (strcasecmp(ctx->compression_str, "gzip") == 0) {
+            ctx->compression = FLB_OS_COMPRESSION_GZIP;
+        }
+        else {
+            ctx->compression = FLB_OS_COMPRESSION_NONE;
+        }
+    }
+    else {
+        ctx->compression = FLB_OS_COMPRESSION_NONE;
+    }
+
 #ifdef FLB_HAVE_AWS
+    /* AWS Auth Unsigned Headers */
+    ctx->aws_unsigned_headers = flb_malloc(sizeof(struct mk_list));
+    if (!ctx->aws_unsigned_headers) {
+        flb_os_conf_destroy(ctx);
+        return NULL;
+    }
+    flb_slist_create(ctx->aws_unsigned_headers);
+    ret = flb_slist_add(ctx->aws_unsigned_headers, "Content-Length");
+    if (ret != 0) {
+        flb_os_conf_destroy(ctx);
+        return NULL;
+    }
+
     /* AWS Auth */
     ctx->has_aws_auth = FLB_FALSE;
     tmp = flb_output_get_property("aws_auth", ins);
@@ -209,7 +249,8 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
             flb_debug("[out_es] Enabled AWS Auth");
 
             /* AWS provider needs a separate TLS instance */
-            ctx->aws_tls = flb_tls_create(FLB_TRUE,
+            ctx->aws_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                          FLB_TRUE,
                                           ins->tls_debug,
                                           ins->tls_vhost,
                                           ins->tls_ca_path,
@@ -241,7 +282,8 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
                                                                    ctx->aws_region,
                                                                    ctx->aws_sts_endpoint,
                                                                    NULL,
-                                                                   flb_aws_client_generator());
+                                                                   flb_aws_client_generator(),
+                                                                   ctx->aws_profile);
             if (!ctx->aws_provider) {
                 flb_error("[out_es] Failed to create AWS Credential Provider");
                 flb_os_conf_destroy(ctx);
@@ -268,7 +310,8 @@ struct flb_opensearch *flb_os_conf_create(struct flb_output_instance *ins,
                 }
 
                 /* STS provider needs yet another separate TLS instance */
-                ctx->aws_sts_tls = flb_tls_create(FLB_TRUE,
+                ctx->aws_sts_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                                  FLB_TRUE,
                                                   ins->tls_debug,
                                                   ins->tls_vhost,
                                                   ins->tls_ca_path,
@@ -347,10 +390,19 @@ int flb_os_conf_destroy(struct flb_opensearch *ctx)
     if (ctx->aws_sts_tls) {
         flb_tls_destroy(ctx->aws_sts_tls);
     }
+
+    if (ctx->aws_unsigned_headers) {
+        flb_slist_destroy(ctx->aws_unsigned_headers);
+        flb_free(ctx->aws_unsigned_headers);
+    }
 #endif
 
     if (ctx->ra_prefix_key) {
         flb_ra_destroy(ctx->ra_prefix_key);
+    }
+
+    if (ctx->ra_index) {
+        flb_ra_destroy(ctx->ra_index);
     }
 
     flb_free(ctx);

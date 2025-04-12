@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,9 +31,14 @@ enum {
 #define FLB_FMT_STR_MSGPACK "msgpack"
 #define FLB_FMT_STR_JSON    "json"
 
+#define FLB_DATA_MODE_SINGLE_RECORD  0 /* "single_record" */
+#define FLB_DATA_MODE_CHUNK          1 /* "chunk" */
+
 struct flb_out_lib_config {
     int format;
     int max_records;
+    int data_mode;
+    flb_sds_t data_mode_str;
     int (*cb_func)(void *record, size_t size, void *data);
     void *cb_data;
     struct flb_output_instance *ins;

@@ -110,8 +110,8 @@ struct record_check container_mix_input[] = {
 struct record_check container_mix_output[] = {
   {"a1\n"},
   {"a2\n"},
-  {"bbcc"},
   {"ddee\n"},
+  {"bbcc"},
   {"single full"},
   {"1a. some multiline log"},
   {"1b. some multiline log"},
@@ -144,6 +144,28 @@ struct record_check java_output[] = {
   {
     "single line\n"
   }
+};
+
+struct record_check ruby_input[] = {
+    {"/app/config/routes.rb:6:in `/': divided by 0 (ZeroDivisionError)"},
+    {"	from /app/config/routes.rb:6:in `block in <main>'"},
+    {"	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:428:in `instance_exec'"},
+    {"	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:428:in `eval_block'"},
+    {"	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:410:in `draw'"},
+    {"	from /app/config/routes.rb:1:in `<main>'"},
+    {"hello world, not multiline\n"}
+};
+
+struct record_check ruby_output[] = {
+    {
+        "/app/config/routes.rb:6:in `/': divided by 0 (ZeroDivisionError)\n"
+        "	from /app/config/routes.rb:6:in `block in <main>'\n"
+        "	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:428:in `instance_exec'\n"
+        "	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:428:in `eval_block'\n"
+        "	from /var/lib/gems/3.0.0/gems/actionpack-7.0.4/lib/action_dispatch/routing/route_set.rb:410:in `draw'\n"
+        "	from /app/config/routes.rb:1:in `<main>'\n"
+    },
+    {"hello world, not multiline\n"}
 };
 
 /* Python stacktrace detection */
@@ -460,7 +482,7 @@ static void test_parser_docker()
         flb_time_get(&tm);
 
         /* Package as msgpack */
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -514,7 +536,7 @@ static void test_parser_cri()
         flb_time_get(&tm);
 
         /* Package as msgpack */
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -568,7 +590,7 @@ static void test_container_mix()
         flb_time_get(&tm);
 
         /* Package as msgpack */
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -656,7 +678,7 @@ static void test_parser_java()
         map = &root.via.array.ptr[1];
 
         /* Package as msgpack */
-        ret = flb_ml_append_object(ml, stream_id, &tm, map);
+        ret = flb_ml_append_object(ml, stream_id, &tm, NULL, map);
 
         msgpack_unpacked_destroy(&result);
         msgpack_sbuffer_destroy(&mp_sbuf);
@@ -718,7 +740,66 @@ static void test_parser_python()
 
         /* Package as msgpack */
         flb_time_get(&tm);
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
+    }
+
+    if (ml) {
+        flb_ml_destroy(ml);
+    }
+
+    flb_config_exit(config);
+}
+
+static void test_parser_ruby()
+{
+    int i;
+    int len;
+    int ret;
+    int entries;
+    uint64_t stream_id;
+    msgpack_packer mp_pck;
+    msgpack_sbuffer mp_sbuf;
+    struct record_check *r;
+    struct flb_config *config;
+    struct flb_time tm;
+    struct flb_ml *ml;
+    struct flb_ml_parser_ins *mlp_i;
+    struct expected_result res = {0};
+
+    /* Expected results context */
+    res.key = "log";
+    res.out_records = ruby_output;
+
+    /* initialize buffers */
+    msgpack_sbuffer_init(&mp_sbuf);
+    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+
+    /* Initialize environment */
+    config = flb_config_init();
+
+    /* Create docker multiline mode */
+    ml = flb_ml_create(config, "ruby-test");
+    TEST_CHECK(ml != NULL);
+
+    /* Generate an instance of multiline ruby parser */
+    mlp_i = flb_ml_parser_instance_create(ml, "ruby");
+    TEST_CHECK(mlp_i != NULL);
+
+    ret = flb_ml_stream_create(ml, "ruby", -1, flush_callback, (void *) &res,
+                               &stream_id);
+    TEST_CHECK(ret == 0);
+
+    flb_time_get(&tm);
+
+    printf("\n");
+    entries = sizeof(ruby_input) / sizeof(struct record_check);
+    for (i = 0; i < entries; i++) {
+        r = &ruby_input[i];
+        len = strlen(r->buf);
+
+        /* Package as msgpack */
+        flb_time_get(&tm);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -785,7 +866,7 @@ static void test_issue_4949()
 
         /* Package as msgpack */
         flb_time_get(&tm);
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -895,7 +976,7 @@ static void test_parser_elastic()
         map = &root.via.array.ptr[1];
 
         /* Package as msgpack */
-        ret = flb_ml_append_object(ml, stream_id, &tm, map);
+        ret = flb_ml_append_object(ml, stream_id, &tm, NULL, map);
 
         msgpack_unpacked_destroy(&result);
         msgpack_sbuffer_destroy(&mp_sbuf);
@@ -961,7 +1042,7 @@ static void test_endswith()
 
         /* Package as msgpack */
         flb_time_get(&tm);
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -1010,7 +1091,7 @@ static void test_parser_go()
 
         /* Package as msgpack */
         flb_time_get(&tm);
-        flb_ml_append(ml, stream_id, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream_id, &tm, r->buf, len);
     }
 
     if (ml) {
@@ -1088,7 +1169,7 @@ static void run_test(struct flb_config *config, char *test_name,
         flb_time_get(&tm);
 
         /* Package as msgpack */
-        flb_ml_append(ml, stream1, FLB_ML_TYPE_TEXT, &tm, r->buf, len);
+        flb_ml_append_text(ml, stream1, &tm, r->buf, len);
     }
 
     flb_ml_destroy(ml);
@@ -1118,7 +1199,7 @@ static void run_test(struct flb_config *config, char *test_name,
         flb_time_pop_from_msgpack(&tm, &result, &map);
 
         /* Package as msgpack */
-        ret = flb_ml_append_object(ml, stream2, &tm, map);
+        ret = flb_ml_append_object(ml, stream2, &tm, NULL, map);
     }
     flb_ml_flush_pending_now(ml);
 
@@ -1273,7 +1354,7 @@ static void test_issue_4034()
         map = &root.via.array.ptr[1];
 
         /* Package as msgpack */
-        ret = flb_ml_append_object(ml, stream_id, &tm, map);
+        ret = flb_ml_append_object(ml, stream_id, &tm, NULL, map);
 
         msgpack_unpacked_destroy(&result);
         msgpack_sbuffer_destroy(&mp_sbuf);
@@ -1287,12 +1368,102 @@ static void test_issue_4034()
     flb_config_exit(config);
 }
 
+static void test_issue_5504()
+{
+    uint64_t last_flush;
+    struct flb_config *config;
+    struct flb_ml *ml;
+    struct flb_ml_parser_ins *mlp_i;
+    struct mk_event_loop *evl;
+    struct flb_sched *sched;
+    struct mk_list *tmp;
+    struct mk_list *head;
+    struct flb_sched_timer *timer;
+    void (*cb)(struct flb_config *, void *);
+    int timeout = 500;
+
+#ifdef _WIN32
+    WSADATA wsa_data;
+    WSAStartup(0x0201, &wsa_data);
+#endif
+
+    /* Initialize environment */
+    config = flb_config_init();
+
+    /* Create the event loop */
+    evl = config->evl;
+    config->evl = mk_event_loop_create(32);
+    TEST_CHECK(config->evl != NULL);
+
+    /* Initialize the scheduler */
+    sched = config->sched;
+    config->sched = flb_sched_create(config, config->evl);
+    TEST_CHECK(config->sched != NULL);
+
+    /* Set the thread local scheduler */
+    flb_sched_ctx_init();
+    flb_sched_ctx_set(config->sched);
+
+    ml = flb_ml_create(config, "5504-test");
+    TEST_CHECK(ml != NULL);
+
+    /* Generate an instance of any multiline parser */
+    mlp_i = flb_ml_parser_instance_create(ml, "cri");
+    TEST_CHECK(mlp_i != NULL);
+
+    flb_ml_parser_instance_set(mlp_i, "key_content", "log");
+
+    /* Set the flush timeout */
+    ml->flush_ms = timeout;
+
+    /* Initialize the auto flush */
+    flb_ml_auto_flush_init(ml);
+
+    /* Store the initial last_flush time */
+    last_flush = ml->last_flush;
+
+    /* Find the cb_ml_flush_timer callback from the timers */
+    mk_list_foreach_safe(head, tmp, &((struct flb_sched *)config->sched)->timers) {
+        timer = mk_list_entry(head, struct flb_sched_timer, _head);
+        if (timer->type == FLB_SCHED_TIMER_CB_PERM) {
+            cb = timer->cb;
+        }
+    }
+    TEST_CHECK(cb != NULL);
+
+    /* Trigger the callback without delay */
+    cb(config, ml);
+    /* This should not update the last_flush since it is before the timeout */
+    TEST_CHECK(ml->last_flush == last_flush);
+
+    /* Sleep just enough time to pass the timeout */
+    flb_time_msleep(timeout + 1);
+
+    /* Retrigger the callback */
+    cb(config, ml);
+    /* Ensure this time the last_flush has been updated */
+    TEST_CHECK(ml->last_flush > last_flush);
+
+    /* Cleanup */
+    flb_sched_destroy(config->sched);
+    config->sched = sched;
+    mk_event_loop_destroy(config->evl);
+    config->evl = evl;
+    flb_ml_destroy(ml);
+    flb_config_exit(config);
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+}
+
 TEST_LIST = {
     /* Normal features tests */
     { "parser_docker",  test_parser_docker},
     { "parser_cri",     test_parser_cri},
     { "parser_java",    test_parser_java},
     { "parser_python",  test_parser_python},
+    { "parser_ruby",    test_parser_ruby},
     { "parser_elastic", test_parser_elastic},
     { "parser_go",      test_parser_go},
     { "container_mix",  test_container_mix},
@@ -1302,5 +1473,6 @@ TEST_LIST = {
     { "issue_3817_1"  , test_issue_3817_1},
     { "issue_4034"    , test_issue_4034},
     { "issue_4949"    , test_issue_4949},
+    { "issue_5504"    , test_issue_5504},
     { 0 }
 };

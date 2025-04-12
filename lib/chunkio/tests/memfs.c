@@ -49,7 +49,7 @@ static int read_file(const char *file, char *buf, size_t size)
 {
     char *p = buf;
     size_t total = 0;
-    size_t nb;
+    ssize_t nb;
 
     int fd = open(file, O_RDONLY);
     if (fd == -1)
@@ -93,11 +93,10 @@ static void test_memfs_write()
 
     flags = CIO_CHECKSUM;
 
-    memset(&cio_opts, 0, sizeof(cio_opts));
+    cio_options_init(&cio_opts);
+    cio_opts.flags = flags;
 
-    cio_opts.root_path = NULL;
     cio_opts.log_cb = log_cb;
-    cio_opts.log_level = CIO_LOG_INFO;
     cio_opts.flags = flags;
 
     /* Create main context */

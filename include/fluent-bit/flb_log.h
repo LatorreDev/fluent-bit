@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,8 +27,10 @@
 #include <fluent-bit/flb_thread_storage.h>
 #include <fluent-bit/flb_worker.h>
 #include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_sds.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <stdarg.h>
 
 /* FIXME: this extern should be auto-populated from flb_thread_storage.h */
 extern FLB_TLS_DEFINE(struct flb_log, flb_log_ctx)
@@ -52,6 +54,14 @@ extern FLB_TLS_DEFINE(struct flb_log, flb_log_ctx)
 #define FLB_LOG_EVENT    MK_EVENT_NOTIFICATION
 #define FLB_LOG_MNG      1024
 
+
+#define FLB_LOG_MNG_TERMINATION_SIGNAL 1
+#define FLB_LOG_MNG_REFRESH_SIGNAL     2
+
+
+#define FLB_LOG_CACHE_ENTRIES        10
+#define FLB_LOG_CACHE_TEXT_BUF_SIZE  1024
+
 /* Logging main context */
 struct flb_log {
     struct mk_event event;     /* worker event for manager */
@@ -67,6 +77,19 @@ struct flb_log {
     int pth_init;
     pthread_cond_t  pth_cond;
     pthread_mutex_t pth_mutex;
+};
+
+struct flb_log_cache_entry {
+    flb_sds_t buf;
+    uint64_t timestamp;
+    struct mk_list _head;
+};
+
+/* Structure to keep a reference of the last N number of entries */
+struct flb_log_cache {
+    int size;                       /* cache size       */
+    int timeout;                    /* cache timeout    */
+    struct mk_list entries;         /* list for entries */
 };
 
 /*
@@ -103,7 +126,45 @@ int flb_log_get_level_str(char *str);
 int flb_log_set_file(struct flb_config *config, char *out);
 
 int flb_log_destroy(struct flb_log *log, struct flb_config *config);
-void flb_log_print(int type, const char *file, int line, const char *fmt, ...);
+void flb_log_print(int type, const char *file, int line, const char *fmt, ...) FLB_FORMAT_PRINTF(4, 5);
+int flb_log_is_truncated(int type, const char *file, int line, const char *fmt, ...) FLB_FORMAT_PRINTF(4, 5);
+
+struct flb_log_cache *flb_log_cache_create(int timeout_seconds, int size);
+void flb_log_cache_destroy(struct flb_log_cache *cache);
+struct flb_log_cache_entry *flb_log_cache_exists(struct flb_log_cache *cache, char *msg_buf, size_t msg_size);
+struct flb_log_cache_entry *flb_log_cache_get_target(struct flb_log_cache *cache, uint64_t ts);
+
+int flb_log_cache_check_suppress(struct flb_log_cache *cache, char *msg_buf, size_t msg_size);
+
+
+static inline int flb_log_suppress_check(int log_suppress_interval, const char *fmt, ...)
+{
+    int ret;
+    size_t size;
+    va_list args;
+    char buf[4096];
+    struct flb_worker *w;
+
+    if (log_suppress_interval <= 0) {
+        return FLB_FALSE;
+    }
+
+    va_start(args, fmt);
+    size = vsnprintf(buf, sizeof(buf) - 1, fmt, args);
+    va_end(args);
+
+    if (size == -1) {
+        return FLB_FALSE;
+    }
+
+    w = flb_worker_get();
+    if (!w) {
+        return FLB_FALSE;
+    }
+
+    ret = flb_log_cache_check_suppress(w->log_cache, buf, size);
+    return ret;
+}
 
 
 /* Logging macros */
@@ -114,37 +175,77 @@ void flb_log_print(int type, const char *file, int line, const char *fmt, ...);
     if (flb_log_check(FLB_LOG_ERROR))                                \
         flb_log_print(FLB_LOG_ERROR, NULL, 0, fmt, ##__VA_ARGS__)
 
+#define flb_error_is_truncated(fmt, ...)                                   \
+    flb_log_check(FLB_LOG_ERROR)                                           \
+        ? flb_log_is_truncated(FLB_LOG_ERROR, NULL, 0, fmt, ##__VA_ARGS__) \
+        : 0
+
 #define flb_warn(fmt, ...)                                           \
     if (flb_log_check(FLB_LOG_WARN))                                 \
         flb_log_print(FLB_LOG_WARN, NULL, 0, fmt, ##__VA_ARGS__)
+
+#define flb_warn_is_truncated(fmt, ...     )                              \
+    flb_log_check(FLB_LOG_WARN)                                           \
+        ? flb_log_is_truncated(FLB_LOG_WARN, NULL, 0, fmt, ##__VA_ARGS__) \
+        : 0
 
 #define flb_info(fmt, ...)                                           \
     if (flb_log_check(FLB_LOG_INFO))                                 \
         flb_log_print(FLB_LOG_INFO, NULL, 0, fmt, ##__VA_ARGS__)
 
+#define flb_info_is_truncated(fmt, ...)                                   \
+    flb_log_check(FLB_LOG_INFO)                                           \
+        ? flb_log_is_truncated(FLB_LOG_INFO, NULL, 0, fmt, ##__VA_ARGS__) \
+        : 0
+
 #define flb_debug(fmt, ...)                                         \
     if (flb_log_check(FLB_LOG_DEBUG))                               \
         flb_log_print(FLB_LOG_DEBUG, NULL, 0, fmt, ##__VA_ARGS__)
 
+#define flb_debug_is_truncated(fmt, ...       )                            \
+    flb_log_check(FLB_LOG_DEBUG)                                           \
+        ? flb_log_is_truncated(FLB_LOG_DEBUG, NULL, 0, fmt, ##__VA_ARGS__) \
+        : 0
+
 #define flb_idebug(fmt, ...)                                        \
     flb_log_print(FLB_LOG_IDEBUG, NULL, 0, fmt, ##__VA_ARGS__)
+
+#define flb_idebug_is_truncated(fmt, ...)                           \
+    flb_log_is_truncated(FLB_LOG_IDEBUG, NULL, 0, fmt, ##__VA_ARGS__)
 
 #ifdef FLB_HAVE_TRACE
 #define flb_trace(fmt, ...)                                             \
     if (flb_log_check(FLB_LOG_TRACE))                                   \
         flb_log_print(FLB_LOG_TRACE, __FILE__, __LINE__,                \
                       fmt, ##__VA_ARGS__)
+
+#define flb_trace_is_truncated(fmt, ...)                           \
+    flb_log_check(FLB_LOG_TRACE)                                   \
+        ? flb_log_is_truncated(FLB_LOG_TRACE, __FILE__, __LINE__,  \
+                      fmt, ##__VA_ARGS__)                          \
+        : 0
 #else
 #define flb_trace(fmt, ...)  do {} while(0)
+#define flb_trace_is_truncated(fmt, ...)  do {} while(0)
 #endif
 
 int flb_log_worker_init(struct flb_worker *worker);
+int flb_log_worker_destroy(struct flb_worker *worker);
 int flb_errno_print(int errnum, const char *file, int line);
+#ifdef WIN32
+int flb_wsa_get_last_error_print(int errnum, const char *file, int line);
+#endif
 
-#ifdef __FILENAME__
-#define flb_errno() flb_errno_print(errno, __FILENAME__, __LINE__)
+#ifdef __FLB_FILENAME__
+#define flb_errno() flb_errno_print(errno, __FLB_FILENAME__, __LINE__)
+#ifdef WIN32
+#define flb_wsa_get_last_error() flb_wsa_get_last_error_print(WSAGetLastError(), __FLB_FILENAME__, __LINE__)
+#endif
 #else
 #define flb_errno() flb_errno_print(errno, __FILE__, __LINE__)
+#ifdef WIN32
+#define flb_wsa_get_last_error() flb_wsa_get_last_error_print(WSAGetLastError(), __FILE__, __LINE__)
+#endif
 #endif
 
 #endif

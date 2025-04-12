@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ static int vmstat_configure(struct flb_ne *ctx)
     struct mk_list split_list;
     struct flb_slist_entry *line;
     struct flb_slist_entry *key;
-    struct cmt_untyped *u;
+    struct cmt_counter *c;
 
     /* Initialize regex for skipped devices */
     ctx->vml_regex_fields = flb_regex_create(VMSTAT_ENTRIES);
@@ -96,16 +96,16 @@ static int vmstat_configure(struct flb_ne *ctx)
 
         snprintf(tmp, sizeof(tmp) - 1,
                  "/proc/vmstat information field %s.", key->str);
-        u = cmt_untyped_create(ctx->cmt, "node", "vmstat", key->str,
+        c = cmt_counter_create(ctx->cmt, "node", "vmstat", key->str,
                                tmp, 0, NULL);
-        if (!u) {
+        if (!c) {
             flb_slist_destroy(&split_list);
             flb_slist_destroy(&list);
             return -1;
         }
 
         ret = flb_hash_table_add(ctx->vml_ht,
-                                 key->str, flb_sds_len(key->str), u, 0);
+                                 key->str, flb_sds_len(key->str), c, 0);
         if (ret == -1) {
             flb_plg_error(ctx->ins,
                           "could not add hash for vmstat metric: %s", key->str);
@@ -144,7 +144,7 @@ static int vmstat_update(struct flb_ne *ctx)
         return -1;
     }
 
-    ts = cmt_time_now();
+    ts = cfl_time_now();
     mk_list_foreach(head, &list) {
         line = mk_list_entry(head, struct flb_slist_entry, _head);
 
@@ -191,19 +191,21 @@ static int vmstat_update(struct flb_ne *ctx)
     return 0;
 }
 
-int ne_vmstat_init(struct flb_ne *ctx)
+static int ne_vmstat_init(struct flb_ne *ctx)
 {
     vmstat_configure(ctx);
     return 0;
 }
 
-int ne_vmstat_update(struct flb_ne *ctx)
+static int ne_vmstat_update(struct flb_input_instance *ins, struct flb_config *config, void *in_context)
 {
+    struct flb_ne *ctx = (struct flb_ne *)in_context;
+
     vmstat_update(ctx);
     return 0;
 }
 
-int ne_vmstat_exit(struct flb_ne *ctx)
+static int ne_vmstat_exit(struct flb_ne *ctx)
 {
     if (ctx->vml_regex_fields) {
         flb_regex_destroy(ctx->vml_regex_fields);
@@ -214,3 +216,10 @@ int ne_vmstat_exit(struct flb_ne *ctx)
     }
     return 0;
 }
+
+struct flb_ne_collector vmstat_collector = {
+    .name = "vmstat",
+    .cb_init = ne_vmstat_init,
+    .cb_update = ne_vmstat_update,
+    .cb_exit = ne_vmstat_exit
+};

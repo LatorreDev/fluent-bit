@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,9 +22,29 @@
 
 #include <msgpack.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+#include <fluent-bit/flb_log_event_encoder.h>
+
+enum {
+    FW_HANDSHAKE_HELO        = 1,
+    FW_HANDSHAKE_PINGPONG    = 2,
+    FW_HANDSHAKE_ESTABLISHED = 3,
+};
+
+struct flb_in_fw_helo {
+    flb_sds_t nonce;
+    int nonce_len;
+    flb_sds_t salt;
+    int salt_len;
+};
+
+struct flb_in_fw_user {
+    flb_sds_t name;
+    flb_sds_t password;
+    struct mk_list _head;
+};
 
 struct flb_in_fw_config {
-    int server_fd;                  /* TCP server file descriptor  */
     size_t buffer_max_size;         /* Max Buffer size             */
     size_t buffer_chunk_size;       /* Chunk allocation size       */
 
@@ -34,15 +54,29 @@ struct flb_in_fw_config {
 
     flb_sds_t tag_prefix;           /* tag prefix                  */
 
-    /* Unix Socket (TCP only) */
+    /* Unix Socket */
     char *unix_path;                /* Unix path for socket        */
     unsigned int unix_perm;         /* Permission for socket       */
     flb_sds_t unix_perm_str;        /* Permission (config map)     */
 
+    /* secure forward */
+    flb_sds_t shared_key;        /* shared key                   */
+    flb_sds_t self_hostname;     /* hostname used in certificate  */
+    struct mk_list users;        /* username and password pairs  */
+    int empty_shared_key;        /* use an empty string as shared key */
+
     int coll_fd;
+    struct flb_downstream *downstream; /* Client manager          */
     struct mk_list connections;     /* List of active connections */
-    struct mk_event_loop *evl;      /* Event loop file descriptor */
     struct flb_input_instance *ins; /* Input plugin instace       */
+
+    struct flb_log_event_decoder *log_decoder;
+    struct flb_log_event_encoder *log_encoder;
+
+    pthread_mutex_t conn_mutex;
+
+    /* Plugin is paused */
+    int is_paused;
 };
 
 #endif

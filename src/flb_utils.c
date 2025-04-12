@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,6 +35,9 @@
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_utf8.h>
+#include <fluent-bit/flb_simd.h>
+
+#include <fluent-bit/calyptia/calyptia_constants.h>
 
 #ifdef FLB_HAVE_AWS_ERROR_REPORTER
 #include <fluent-bit/aws/flb_aws_error_reporter.h>
@@ -44,6 +47,15 @@ extern struct flb_aws_error_reporter *error_reporter;
 
 #ifdef FLB_HAVE_OPENSSL
 #include <openssl/rand.h>
+#endif
+
+#ifdef FLB_SYSTEM_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#include <AvailabilityMacros.h>
+#if MAC_OS_X_VERSION_MIN_REQUIRED < 120000
+#define kIOMainPortDefault kIOMasterPortDefault
+#endif
 #endif
 
 /*
@@ -110,6 +122,14 @@ void flb_utils_error(int err)
     case FLB_ERR_CORO_STACK_SIZE:
         msg = "invalid coroutine stack size";
         break;
+    case FLB_ERR_CFG_PLUGIN_FILE:
+        msg = "plugins_file not found";
+        break;
+    case FLB_ERR_RELOADING_IN_PROGRESS:
+        msg = "reloading in progress";
+        break;
+    default:
+        flb_error("(error message is not defined. err=%d)", err);
     }
 
     if (!msg) {
@@ -160,9 +180,9 @@ int flb_utils_set_daemon(struct flb_config *config)
     pid_t pid;
 
     if ((pid = fork()) < 0){
-		flb_error("Failed creating to switch to daemon mode (fork failed)");
+        flb_error("Failed creating to switch to daemon mode (fork failed)");
         exit(EXIT_FAILURE);
-	}
+    }
 
     if (pid > 0) { /* parent */
         exit(EXIT_SUCCESS);
@@ -177,7 +197,7 @@ int flb_utils_set_daemon(struct flb_config *config)
     if (chdir("/") < 0) { /* make sure we can unmount the inherited filesystem */
         flb_error("Unable to unmount the inherited filesystem");
         exit(EXIT_FAILURE);
-	}
+    }
 
     /* Our last STDOUT messages */
     flb_info("switching to background mode (PID=%ld)", (long) getpid());
@@ -252,7 +272,118 @@ void flb_utils_print_setup(struct flb_config *config)
     }
 }
 
-struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
+/*
+ * quoted_string_len returns the length of a quoted string, not including the quotes.
+ */
+static int quoted_string_len(const char *str)
+{
+    int len = 0;
+    char quote = *str++; /* Consume the quote character. */
+
+    while (quote != 0) {
+        char c = *str++;
+        switch (c) {
+            case '\0':
+                /* Error: string ends before end-quote was seen. */
+                return -1;
+            case '\\':
+                /* Skip escaped quote or \\. */
+                if (*str == quote || *str == '\\') {
+                    str++;
+                }
+                break;
+            case '\'':
+            case '"':
+                /* End-quote seen: stop iterating. */
+                if (c == quote) {
+                    quote = 0;
+                }
+                break;
+            default:
+                break;
+        }
+        len++;
+    }
+
+    /* Go back one character to ignore end-quote */
+    len--;
+
+    return len;
+}
+
+/*
+ * next_token returns the next token in the string 'str' delimited by 'separator'.
+ * 'out' is set to the beginning of the token.
+ * 'out_len' is set to the length of the token.
+ * 'parse_quotes' is set to FLB_TRUE when quotes shall be considered when tokenizing the 'str'.
+ * The function returns offset to next token in the string.
+ */
+static int next_token(const char *str, int separator, char **out, int *out_len, int parse_quotes) {
+    const char *token_in = str;
+    char *token_out;
+    int next_separator = 0;
+    int quote = 0; /* Parser state: 0 not inside quoted string, or '"' or '\'' when inside quoted string. */
+    int len = 0;
+    int i;
+
+    /* Skip leading separators. */
+    while (*token_in == separator) {
+        token_in++;
+    }
+
+    /* Should quotes be parsed? Or is token quoted? If not, copy until separator or the end of string. */
+    if (parse_quotes == FLB_FALSE || (*token_in != '"' && *token_in != '\'')) {
+        len = (int)strlen(token_in);
+        next_separator = mk_string_char_search(token_in, separator, len);
+        if (next_separator > 0) {
+            len = next_separator;
+        }
+        *out_len = len;
+        *out = mk_string_copy_substr(token_in, 0, len);
+        if (*out == NULL) {
+            return -1;
+        }
+
+        return (int)(token_in - str) + len;
+    }
+
+    /* Token is quoted. */
+
+    len = quoted_string_len(token_in);
+    if (len < 0) {
+        return -1;
+    }
+
+    /* Consume the quote character. */
+    quote = *token_in++;
+
+    token_out = flb_malloc(len + 1);
+    if (!token_out) {
+        return -1;
+    }
+
+    /* Copy the token */
+    for (i = 0; i < len; i++) {
+        /* Handle escapes when inside quoted token:
+         *   \" -> "
+         *   \' -> '
+         *   \\ -> \
+         */
+        if (*token_in == '\\' && (token_in[1] == quote || token_in[1] == '\\')) {
+            token_in++;
+        }
+        token_out[i] = *token_in++;
+    }
+    token_out[i] = '\0';
+
+    *out = token_out;
+    *out_len = len;
+
+    return (int)(token_in - str);
+}
+
+
+static struct mk_list *split(const char *line, int separator, int max_split, int quoted)
 {
     int i = 0;
     int count = 0;
@@ -276,26 +407,15 @@ struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
 
     len = strlen(line);
     while (i < len) {
-        end = mk_string_char_search(line + i, separator, len - i);
-        if (end >= 0 && end + i < len) {
-            end += i;
-
-            if (i == (unsigned int) end) {
-                i++;
-                continue;
-            }
-
-            val = mk_string_copy_substr(line, i, end);
-            val_len = end - i;
-        }
-        else {
-            val = mk_string_copy_substr(line, i, len);
-            val_len = len - i;
-            end = len;
+        end = next_token(line + i, separator, &val, &val_len, quoted);
+        if (end == -1) {
+            flb_error("Parsing failed: %s", line);
+            flb_utils_split_free(list);
+            return NULL;
         }
 
         /* Update last position */
-        i = end;
+        i += end;
 
         /* Create new entry */
         new = flb_malloc(sizeof(struct flb_split_entry));
@@ -336,6 +456,17 @@ struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
     return list;
 }
 
+struct mk_list *flb_utils_split_quoted(const char *line, int separator, int max_split)
+{
+    return split(line, separator, max_split, FLB_TRUE);
+}
+
+struct mk_list *flb_utils_split(const char *line, int separator, int max_split)
+{
+    return split(line, separator, max_split, FLB_FALSE);
+}
+
+
 void flb_utils_split_free_entry(struct flb_split_entry *entry)
 {
     mk_list_del(&entry->_head);
@@ -365,7 +496,7 @@ int flb_utils_timer_consume(flb_pipefd_t fd)
 
     ret = flb_pipe_r(fd, &val, sizeof(val));
     if (ret == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -386,7 +517,7 @@ int flb_utils_pipe_byte_consume(flb_pipefd_t fd)
 
     ret = flb_pipe_r(fd, &val, sizeof(val));
     if (ret == -1) {
-        flb_errno();
+        flb_pipe_error();
         return -1;
     }
 
@@ -398,7 +529,7 @@ int64_t flb_utils_size_to_bytes(const char *size)
     int i;
     int len;
     int plen = 0;
-    int64_t val;
+    double val;
     char c;
     char tmp[3] = {0};
     int64_t KB = 1000;
@@ -414,7 +545,7 @@ int64_t flb_utils_size_to_bytes(const char *size)
     }
 
     len = strlen(size);
-    val = atoll(size);
+    val = atof(size);
 
     if (len == 0) {
         return -1;
@@ -430,7 +561,7 @@ int64_t flb_utils_size_to_bytes(const char *size)
     }
 
     if (plen == 0) {
-        return val;
+        return (int64_t)val;
     }
     else if (plen > 2) {
         return -1;
@@ -449,31 +580,31 @@ int64_t flb_utils_size_to_bytes(const char *size)
 
     if (tmp[0] == 'K') {
         /* set upper bound (2**64/KB)/2 to avoid overflows */
-        if (val >= 9223372036854775 || val <= -9223372036854774)
+        if (val >= 9223372036854775.0 || val <= -9223372036854774.0)
         {
             return -1;
         }
-        return (val * KB);
+        return (int64_t)(val * KB);
     }
     else if (tmp[0] == 'M') {
         /* set upper bound (2**64/MB)/2 to avoid overflows */
         if (val >= 9223372036854 || val <= -9223372036853) {
             return -1;
         }
-        return (val * MB);
+        return (int64_t)(val * MB);
     }
     else if (tmp[0] == 'G') {
         /* set upper bound (2**64/GB)/2 to avoid overflows */
         if (val >= 9223372036 || val <= -9223372035) {
             return -1;
         }
-        return (val * GB);
+        return (int64_t)(val * GB);
     }
     else {
         return -1;
     }
 
-    return val;
+    return (int64_t)val;
 }
 
 int64_t flb_utils_hex2int(char *hex, int len)
@@ -628,228 +759,340 @@ static inline void encoded_to_buf(char *out, const char *in, int len)
     }
 }
 
+/* Structure to hold escape sequence */
+struct escape_seq {
+    const char *seq;
+};
+
+/* Lookup table for escape sequences */
+static const struct escape_seq json_escape_table[128] = {
+    ['\"'] = {"\\\""},
+    ['\\'] = {"\\\\"},
+    ['\n'] = {"\\n"},
+    ['\r'] = {"\\r"},
+    ['\t'] = {"\\t"},
+    ['\b'] = {"\\b"},
+    ['\f'] = {"\\f"},
+    [0x00] = {"\\u0000"}, [0x01] = {"\\u0001"}, [0x02] = {"\\u0002"}, [0x03] = {"\\u0003"},
+    [0x04] = {"\\u0004"}, [0x05] = {"\\u0005"}, [0x06] = {"\\u0006"}, [0x07] = {"\\u0007"},
+    [0x0B] = {"\\u000b"}, [0x0E] = {"\\u000e"}, [0x0F] = {"\\u000f"},
+    [0x10] = {"\\u0010"}, [0x11] = {"\\u0011"}, [0x12] = {"\\u0012"}, [0x13] = {"\\u0013"},
+    [0x14] = {"\\u0014"}, [0x15] = {"\\u0015"}, [0x16] = {"\\u0016"}, [0x17] = {"\\u0017"},
+    [0x18] = {"\\u0018"}, [0x19] = {"\\u0019"}, [0x1A] = {"\\u001a"}, [0x1B] = {"\\u001b"},
+    [0x1C] = {"\\u001c"}, [0x1D] = {"\\u001d"}, [0x1E] = {"\\u001e"}, [0x1F] = {"\\u001f"},
+    [0x7F] = {"\\u007f"}
+};
+
 /*
  * Write string pointed by 'str' to the destination buffer 'buf'. It's make sure
- * to escape sepecial characters and convert utf-8 byte characters to string
+ * to escape special characters and convert utf-8 byte characters to string
  * representation.
  */
-int flb_utils_write_str(char *buf, int *off, size_t size,
-                        const char *str, size_t str_len)
+int flb_utils_write_str(char *buf, int *off, size_t size, const char *str, size_t str_len)
 {
-    int i;
-    int b;
-    int ret;
-    int written = 0;
-    int required;
-    int len;
-    int hex_bytes;
-    int is_valid;
-    int utf_sequence_number;
-    int utf_sequence_length;
-    uint32_t codepoint;
-    uint32_t state = 0;
-    char tmp[16];
-    size_t available;
+    int i, b, ret, len, hex_bytes, utf_sequence_length, utf_sequence_number;
+    int processed_bytes = 0;
+    int is_valid, copypos = 0, vlen;
     uint32_t c;
-    char *p;
+    uint32_t codepoint = 0;
+    uint32_t state = 0;
+    size_t available;
     uint8_t *s;
+    off_t offset = 0;
+    char tmp[16];
+    char *p;
+    const size_t inst_len = FLB_SIMD_VEC8_INST_LEN;
 
-    available = (size - *off);
-    required = str_len;
-    if (available <= required) {
+    /* to encode codepoints > 0xFFFF */
+    uint16_t high;
+    uint16_t low;
+
+    available = size - *off;
+
+    /* Ensure we have some minimum space in the buffer */
+    if (available < str_len) {
         return FLB_FALSE;
     }
 
     p = buf + *off;
-    for (i = 0; i < str_len; i++) {
-        if ((available - written) < 2) {
-            return FLB_FALSE;
+
+    /* align length to the nearest multiple of the vector size for safe SIMD processing */
+    vlen = str_len & ~(inst_len - 1);
+    for (i = 0;;) {
+        /* SIMD optimization: Process chunk of input string */
+        for (; i < vlen; i += inst_len) {
+            flb_vector8 chunk;
+            flb_vector8_load(&chunk, (const uint8_t *)&str[i]);
+
+            /*
+             * Look for the special characters we are interested in,
+             * if they are found we break the loop and escape them
+             * in a char-by-char basis. Otherwise the do a bulk copy
+             */
+            if (flb_vector8_has_le(chunk, (unsigned char) 0x1F) ||
+                flb_vector8_has(chunk, (unsigned char)    '"') ||
+                flb_vector8_has(chunk, (unsigned char)    '\\')) {
+                break;
+            }
         }
 
-        c = (uint32_t) str[i];
-        if (c == '\"') {
-            *p++ = '\\';
-            *p++ = '\"';
-        }
-        else if (c == '\\') {
-            *p++ = '\\';
-            *p++ = '\\';
-        }
-        else if (c == '\n') {
-            *p++ = '\\';
-            *p++ = 'n';
-        }
-        else if (c == '\r') {
-            *p++ = '\\';
-            *p++ = 'r';
-        }
-        else if (c == '\t') {
-            *p++ = '\\';
-            *p++ = 't';
-        }
-        else if (c == '\b') {
-            *p++ = '\\';
-            *p++ = 'b';
-        }
-        else if (c == '\f') {
-            *p++ = '\\';
-            *p++ = 'f';
-        }
-        else if (c < 32 || c == 0x7f) {
-            if ((available - written) < 6) {
-                return FLB_FALSE;
-            }
-            len = snprintf(tmp, sizeof(tmp) - 1, "\\u%.4hhx", (unsigned char) c);
-            if ((available - written) < len) {
-                return FLB_FALSE;
-            }
-            encoded_to_buf(p, tmp, len);
-            p += len;
-        }
-        else if (c >= 0x80 && c <= 0xFFFF) {
-            hex_bytes = flb_utf8_len(str + i);
-            if (available - written < 6) {
+        /* Copy the chunk processed so far */
+        if (copypos < i) {
+            /* check if we have enough space */
+            if (available < i - copypos) {
                 return FLB_FALSE;
             }
 
-            if (i + hex_bytes > str_len) {
-                break; /* skip truncated UTF-8 */
-            }
-
-            state = FLB_UTF8_ACCEPT;
-            codepoint = 0;
-
-            for (b = 0; b < hex_bytes; b++) {
-                s = (unsigned char *) str + i + b;
-                ret = flb_utf8_decode(&state, &codepoint, *s);
-                if (ret == 0) {
-                    break;
-                }
-            }
-
-            if (state != FLB_UTF8_ACCEPT) {
-                /* Invalid UTF-8 hex, just skip utf-8 bytes */
-                flb_warn("[pack] invalid UTF-8 bytes found, skipping bytes");
-            }
-            else {
-                len = snprintf(tmp, sizeof(tmp) - 1, "\\u%.4x", codepoint);
-                if ((available - written) < len) {
-                    return FLB_FALSE;
-                }
-                encoded_to_buf(p, tmp, len);
-                p += len;
-            }
-            i += (hex_bytes - 1);
+            /* copy and adjust pointers */
+            memcpy(p, &str[copypos], i - copypos);
+            p += i - copypos;
+            offset += i - copypos;
+            available -= (i - copypos);
+            copypos = i;
         }
-        else if (c > 0xFFFF) {
-            utf_sequence_length = flb_utf8_len(str + i);
 
-            if (i + utf_sequence_length > str_len) {
-                break; /* skip truncated UTF-8 */
+        /* Process remaining characters one by one */
+        for (b = 0; b < inst_len; b++) {
+            if (i >= str_len) {
+                /* all characters has been processed */
+                goto done;
             }
 
-            is_valid = FLB_TRUE;
-            for (utf_sequence_number = 0; utf_sequence_number < utf_sequence_length;
-                utf_sequence_number++) {
-                /* Leading characters must start with bits 11 */
-                if (utf_sequence_number == 0 && ((str[i] & 0xC0) != 0xC0)) {
-                    /* Invalid unicode character. replace */
-                    flb_debug("[pack] unexpected UTF-8 leading byte, "
-                             "substituting character with replacement character");
-                    tmp[utf_sequence_number] = str[i];
-                    ++i; /* Consume invalid leading byte */
-                    utf_sequence_length = utf_sequence_number + 1;
-                    is_valid = FLB_FALSE;
-                    break;
-                }
-                /* Trailing characters must start with bits 10 */
-                else if (utf_sequence_number > 0 && ((str[i] & 0xC0) != 0x80)) {
-                    /* Invalid unicode character. replace */
-                    flb_debug("[pack] unexpected UTF-8 continuation byte, "
-                             "substituting character with replacement character");
-                    /* This byte, i, is the start of the next unicode character */
-                    utf_sequence_length = utf_sequence_number;
-                    is_valid = FLB_FALSE;
-                    break;
-                }
+            c = (uint32_t) str[i];
 
-                tmp[utf_sequence_number] = str[i];
-                ++i;
-            }
-            --i;
-
-            if (is_valid) {
-                if (available - written < utf_sequence_length) {
-                    return FLB_FALSE;
-                }
-
-                encoded_to_buf(p, tmp, utf_sequence_length);
-                p += utf_sequence_length;
-            }
-            else {
-                if (available - written < utf_sequence_length * 3) {
-                    return FLB_FALSE;
-                }
-
+            /* Use lookup table for escaping known sequences */
+            if (c < 128 && json_escape_table[c].seq) {
                 /*
-                 * Utf-8 sequence is invalid. Map fragments to private use area
-                 * codepoints in range:
-                 * 0x<FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR>00 to
-                 * 0x<FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR>FF
+                 * All characters in the table have a lenght of 2 or 6 bytes,
+                 * just check if the second byte starts with 'u' so we know
+                 * it's unicode and needs 6 bytes of space.
                  */
-                for (b = 0; b < utf_sequence_length; ++b) {
-                    /*
-                     * Utf-8 private block invalid hex mapping. Format unicode charpoint
-                     * in the following format:
-                     *
-                     *      +--------+--------+--------+
-                     *      |1110PPPP|10PPPPHH|10HHHHHH|
-                     *      +--------+--------+--------+
-                     *
-                     * Where:
-                     *   P is FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR bits (1 byte)
-                     *   H is Utf-8 fragment hex bits (1 byte)
-                     *   1 is bit 1
-                     *   0 is bit 0
-                     */
-
-                    /* unicode codepoint start */
-                    *p = 0xE0;
-
-                    /* print unicode private block header first 4 bits */
-                    *p |= FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR >> 4;
-                    ++p;
-
-                    /* unicode codepoint middle */
-                    *p = 0x80;
-
-                    /* print end of unicode private block header last 4 bits */
-                    *p |= ((FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR << 2) & 0x3f);
-
-                    /* print hex fragment first 2 bits */
-                    *p |= (tmp[b] >> 6) & 0x03;
-                    ++p;
-
-                    /* unicode codepoint middle */
-                    *p = 0x80;
-
-                    /* print hex fragment last 6 bits */
-                    *p |= tmp[b] & 0x3f;
-                    ++p;
+                if (json_escape_table[c].seq[1] == 'u') {
+                    len = 6;
                 }
+                else {
+                    len = 2;
+                }
+
+                /* check if we have anough space */
+                if (available < len) {
+                    return FLB_FALSE;
+                }
+
+                /* copy the escape sequence */
+                memcpy(p, json_escape_table[c].seq, len);
+                p += len;
+                offset += len;
+                available -= len;
             }
+            /* Handle UTF-8 sequences from 0x80 to 0xFFFF */
+            else if (c >= 0x80 && c <= 0xFFFF) {
+                hex_bytes = flb_utf8_len(&str[i]);
+
+                /* Handle invalid or truncated sequence */
+                if (hex_bytes == 0 || i + hex_bytes > str_len) {
+                    /* check for the minimum space required */
+                    if (available < 3) {
+                        return FLB_FALSE;
+                    }
+
+                    /* insert replacement character (U+FFFD) */
+                    p[0] = 0xEF;
+                    p[1] = 0xBF;
+                    p[2] = 0xBD;
+                    p += 3;
+                    offset += 3;
+                    available -= 3;
+
+                    /* skip the original byte */
+                    i++;
+                    continue;
+                }
+
+                /* decode UTF-8 sequence */
+                state = FLB_UTF8_ACCEPT;
+                codepoint = 0;
+                processed_bytes = 0;
+
+                for (b = 0; b < hex_bytes; b++) {
+                    s = (unsigned char *) &str[i + b];
+                    ret = flb_utf8_decode(&state, &codepoint, *s);
+                    processed_bytes++;
+
+                    if (ret == FLB_UTF8_ACCEPT) {
+                        /* check if all required bytes for the sequence are processed */
+                        if (processed_bytes == hex_bytes) {
+                            break;
+                        }
+                    }
+                    else if (ret == FLB_UTF8_REJECT) {
+                        flb_warn("[pack] Invalid UTF-8 bytes found, skipping.");
+                        break;
+                    }
+                }
+
+                if (state == FLB_UTF8_ACCEPT) {
+                    len = snprintf(tmp, sizeof(tmp), "\\u%.4x", codepoint);
+                    if (available < len) {
+                        return FLB_FALSE;
+                    }
+                    memcpy(p, tmp, len);
+                    p += len;
+                    offset += len;
+                    available -= len;
+                }
+                else {
+                    flb_warn("[pack] Invalid UTF-8 bytes found, skipping.");
+                }
+
+                i += processed_bytes;
+            }
+            /* Handle sequences beyond 0xFFFF */
+            else if (c > 0xFFFF) {
+                utf_sequence_length = flb_utf8_len(str + i);
+
+                /* skip truncated UTF-8 ? */
+                if (i + utf_sequence_length > str_len) {
+                    i++;
+                    break;
+                }
+
+                state = FLB_UTF8_ACCEPT;
+                codepoint = 0;
+                is_valid = FLB_TRUE;
+
+                /* Decode the sequence */
+                for (utf_sequence_number = 0; utf_sequence_number < utf_sequence_length; utf_sequence_number++) {
+                    ret = flb_utf8_decode(&state, &codepoint, (uint8_t) str[i]);
+
+                    if (ret == FLB_UTF8_REJECT) {
+                        /* Handle invalid leading byte */
+                        if (utf_sequence_number == 0) {
+                            flb_debug("[pack] unexpected UTF-8 leading byte, substituting character");
+                            tmp[utf_sequence_number] = str[i];
+                            utf_sequence_length = utf_sequence_number + 1; /* Process only this invalid byte */
+                            i++; /* Consume invalid byte */
+                        }
+                        /* Handle invalid continuation byte */
+                        else {
+                            flb_debug("[pack] unexpected UTF-8 continuation byte, substituting character");
+                            utf_sequence_length = utf_sequence_number; /* Adjust length */
+                        }
+                        is_valid = FLB_FALSE;
+                        break;
+                    }
+
+                    tmp[utf_sequence_number] = str[i];
+                    ++i;
+                }
+
+                --i;
+
+                if (is_valid) {
+                    if (available < utf_sequence_length) {
+                        /* not enough space */
+                        return FLB_FALSE;
+                    }
+
+                    /* Handle codepoints beyond BMP (requires surrogate pairs in UTF-16) */
+                    if (codepoint > 0xFFFF) {
+                        high = 0xD800 + ((codepoint - 0x10000) >> 10);
+                        low = 0xDC00 + ((codepoint - 0x10000) & 0x3FF);
+
+                        len = snprintf(tmp, sizeof(tmp), "\\u%.4x\\u%.4x", high, low);
+                    }
+                    else {
+                        len = snprintf(tmp, sizeof(tmp), "\\u%.4x", codepoint);
+                    }
+
+                    if (available < len) {
+                        /* not enough space */
+                        return FLB_FALSE;
+                    }
+                    memcpy(p, tmp, len);
+                    p += len;
+                    offset += len;
+                    available -= len;
+                }
+                else {
+                    if (available < utf_sequence_length * 3) {
+                        return FLB_FALSE;
+                    }
+
+                    /*
+                    * Utf-8 sequence is invalid. Map fragments to private use area
+                    * codepoints in range:
+                    * 0x<FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR>00 to
+                    * 0x<FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR>FF
+                    */
+                    for (b = 0; b < utf_sequence_length; ++b) {
+                        /*
+                        * Utf-8 private block invalid hex mapping. Format unicode charpoint
+                        * in the following format:
+                        *
+                        *      +--------+--------+--------+
+                        *      |1110PPPP|10PPPPHH|10HHHHHH|
+                        *      +--------+--------+--------+
+                        *
+                        * Where:
+                        *   P is FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR bits (1 byte)
+                        *   H is Utf-8 fragment hex bits (1 byte)
+                        *   1 is bit 1
+                        *   0 is bit 0
+                        */
+
+                        /* unicode codepoint start */
+                        *p = 0xE0;
+
+                        /* print unicode private block header first 4 bits */
+                        *p |= FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR >> 4;
+                        ++p;
+
+                        /* unicode codepoint middle */
+                        *p = 0x80;
+
+                        /* print end of unicode private block header last 4 bits */
+                        *p |= ((FLB_UTILS_FRAGMENT_PRIVATE_BLOCK_DESCRIPTOR << 2) & 0x3f);
+
+                        /* print hex fragment first 2 bits */
+                        *p |= (tmp[b] >> 6) & 0x03;
+                        ++p;
+
+                        /* unicode codepoint middle */
+                        *p = 0x80;
+
+                        /* print hex fragment last 6 bits */
+                        *p |= tmp[b] & 0x3f;
+                        ++p;
+
+                        offset += 3;
+                        available -= 3;
+                    }
+                }
+
+            }
+             else {
+                if (available < 1) {
+                    /*  no space for a single byte */
+                    return FLB_FALSE;
+                }
+                *p++ = c;
+                offset++;
+                available--;
+            }
+
+            i++;
         }
-        else {
-            *p++ = c;
-        }
-        written = (p - (buf + *off));
+
+        copypos = i;
     }
 
-    *off += written;
+done:
+    /* update the buffer offset */
+    *off += offset;
 
     return FLB_TRUE;
 }
-
 
 int flb_utils_write_str_buf(const char *str, size_t str_len, char **out, size_t *out_size)
 {
@@ -893,13 +1136,27 @@ int flb_utils_write_str_buf(const char *str, size_t str_len, char **out, size_t 
 static char *flb_copy_host(const char *string, int pos_init, int pos_end)
 {
     if (string[pos_init] == '[') {            /* IPv6 */
-        if (string[pos_end-1] != ']')
+        if (string[pos_end-1] != ']') {
             return NULL;
-
+        }
         return mk_string_copy_substr(string, pos_init + 1, pos_end - 1);
     }
-    else
+    else {
         return mk_string_copy_substr(string, pos_init, pos_end);
+    }
+}
+
+static char *flb_utils_copy_host_sds(const char *string, int pos_init, int pos_end)
+{
+    if (string[pos_init] == '[') {            /* IPv6 */
+        if (string[pos_end-1] != ']') {
+            return NULL;
+        }
+        return flb_sds_create_len(string + pos_init + 1, pos_end - 1);
+    }
+    else {
+        return flb_sds_create_len(string + pos_init, pos_end);
+    }
 }
 
 int flb_utils_url_split(const char *in_url, char **out_protocol,
@@ -997,10 +1254,139 @@ int flb_utils_url_split(const char *in_url, char **out_protocol,
     return -1;
 }
 
+int flb_utils_url_split_sds(const flb_sds_t in_url, flb_sds_t *out_protocol,
+                            flb_sds_t *out_host, flb_sds_t *out_port, flb_sds_t *out_uri)
+{
+    int i;
+    flb_sds_t protocol = NULL;
+    flb_sds_t host = NULL;
+    flb_sds_t port = NULL;
+    flb_sds_t uri = NULL;
+    char *p = NULL;
+    char *tmp = NULL;
+    char *sep = NULL;
+
+    /* Protocol */
+    p = strstr(in_url, "://");
+    if (!p) {
+        return -1;
+    }
+    if (p == in_url) {
+        return -1;
+    }
+
+    protocol = flb_sds_create_len(in_url, p - in_url);
+    if (!protocol) {
+        flb_errno();
+        return -1;
+    }
+
+    /* Advance position after protocol */
+    p += 3;
+
+    /* Check for first '/' */
+    sep = strchr(p, '/');
+    tmp = strchr(p, ':');
+
+    /* Validate port separator is found before the first slash */
+    if (sep && tmp) {
+        if (tmp > sep) {
+            tmp = NULL;
+        }
+    }
+
+    if (tmp) {
+        host = flb_utils_copy_host_sds(p, 0, tmp - p);
+        if (!host) {
+            flb_errno();
+            goto error;
+        }
+        p = tmp + 1;
+
+        /* Look for an optional URI */
+        tmp = strchr(p, '/');
+        if (tmp) {
+            port = flb_sds_create_len(p, tmp - p);
+            uri = flb_sds_create(tmp);
+        }
+        else {
+            port = flb_sds_create_len(p, strlen(p));
+            uri = flb_sds_create("/");
+        }
+    }
+    else {
+        tmp = strchr(p, '/');
+        if (tmp) {
+            host = flb_utils_copy_host_sds(p, 0, tmp - p);
+            uri = flb_sds_create(tmp);
+        }
+        else {
+            host = flb_utils_copy_host_sds(p, 0, strlen(p));
+            uri = flb_sds_create("/");
+        }
+    }
+
+    if (!port) {
+        if (strcmp(protocol, "http") == 0) {
+            port = flb_sds_create("80");
+        }
+        else if (strcmp(protocol, "https") == 0) {
+            port = flb_sds_create("443");
+        }
+    }
+
+    if (!host) {
+        flb_errno();
+        goto error;
+    }
+
+    if (!port) {
+        flb_errno();
+        goto error;
+    }
+    else {
+        /* check that port is a number */
+        for (i = 0; i < flb_sds_len(port); i++) {
+            if (!isdigit(port[i])) {
+                goto error;
+            }
+        }
+
+    }
+
+    if (!uri) {
+        flb_errno();
+        goto error;
+    }
+
+    *out_protocol = protocol;
+    *out_host = host;
+    *out_port = port;
+    *out_uri = uri;
+
+    return 0;
+
+ error:
+    if (protocol) {
+        flb_sds_destroy(protocol);
+    }
+    if (host) {
+        flb_sds_destroy(host);
+    }
+    if (port) {
+        flb_sds_destroy(port);
+    }
+    if (uri) {
+        flb_sds_destroy(uri);
+    }
+
+    return -1;
+}
+
 
 /*
  * flb_utils_proxy_url_split parses a proxy's information from a http_proxy URL.
- * The URL is in the form like `http://username:password@myproxy.com:8080`.
+ * The URL is in the form like `http://[username:password@]myproxy.com:8080`.
  * Note: currently only HTTP is supported.
  */
 int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
@@ -1019,9 +1405,11 @@ int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
     /*  Parse protocol */
     proto_sep = strstr(in_url, "://");
     if (!proto_sep) {
+        flb_error("HTTP_PROXY variable must be set in the form of 'http://[username:password@]host:port'");
         return -1;
     }
     if (proto_sep == in_url) {
+        flb_error("HTTP_PROXY variable must be set in the form of 'http://[username:password@]host:port'");
         return -1;
     }
 
@@ -1032,6 +1420,7 @@ int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
     }
     /* Only HTTP proxy is supported for now. */
     if (strcmp(protocol, "http") != 0) {
+        flb_error("only HTTP proxy is supported.");
         flb_free(protocol);
         return -1;
     }
@@ -1039,10 +1428,10 @@ int flb_utils_proxy_url_split(const char *in_url, char **out_protocol,
     /* Advance position after protocol */
     proto_sep += 3;
 
-    /* Seperate `username:password` and `host:port` */
+    /* Separate `username:password` and `host:port` */
     at_sep = strrchr(proto_sep, '@');
     if (at_sep) {
-        /* Parse username:passwrod part. */
+        /* Parse username:password part. */
         tmp = strchr(proto_sep, ':');
         if (!tmp) {
             flb_free(protocol);
@@ -1155,9 +1544,16 @@ int flb_utils_uuid_v4_gen(char *buf)
 
 int flb_utils_read_file(char *path, char **out_buf, size_t *out_size)
 {
+    return flb_utils_read_file_offset(path, 0, 0, out_buf, out_size);
+}
+
+int flb_utils_read_file_offset(char *path, off_t offset_start, off_t offset_end, char **out_buf, size_t *out_size)
+{
     int fd;
     int ret;
     size_t bytes;
+    size_t bytes_to_read;
+    size_t total_bytes_read = 0;
     struct stat st;
     flb_sds_t buf;
     FILE *fp;
@@ -1175,24 +1571,54 @@ int flb_utils_read_file(char *path, char **out_buf, size_t *out_size)
         return -1;
     }
 
-    buf = flb_calloc(1, st.st_size + 1);
+    if (offset_start > st.st_size || offset_end > st.st_size) {
+        flb_error("offsets exceed file size (%jd bytes)", (intmax_t) st.st_size);
+        fclose(fp);
+        return -1;
+    }
+
+    if (offset_start > 0) {
+        ret = fseek(fp, offset_start, SEEK_SET);
+        if (ret != 0) {
+            flb_errno();
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    if (offset_end == 0) {
+        offset_end = st.st_size;
+    }
+
+    bytes_to_read = offset_end - offset_start;
+
+    buf = flb_calloc(1, bytes_to_read + 1);
     if (!buf) {
         flb_errno();
         fclose(fp);
         return -1;
     }
 
-    bytes = fread(buf, st.st_size, 1, fp);
-    if (bytes < 1) {
-        flb_errno();
-        flb_free(buf);
-        fclose(fp);
-        return -1;
+    while (total_bytes_read < bytes_to_read) {
+        bytes = fread(buf + total_bytes_read, 1, bytes_to_read - total_bytes_read, fp);
+        if (bytes < 1) {
+            if (feof(fp)) {
+                break;
+            }
+            if (ferror(fp)) {
+                flb_errno();
+                free(buf);
+                fclose(fp);
+                return -1;
+            }
+        }
+        total_bytes_read += bytes;
     }
     fclose(fp);
 
     *out_buf = buf;
-    *out_size = st.st_size;
+    *out_size = total_bytes_read;
+
     return 0;
 }
 
@@ -1231,25 +1657,40 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
     char *id;
     size_t bytes;
     char *uuid;
+    int fallback = FLB_FALSE;
 
 #ifdef __linux__
     char *dbus_var = "/var/lib/dbus/machine-id";
     char *dbus_etc = "/etc/machine-id";
 
     /* dbus */
-    ret = machine_id_read_and_sanitize(dbus_var, &id, &bytes);
-    if (ret == 0) {
-        *out_id = id;
-        *out_size = bytes;
-        return 0;
+    if (access(dbus_var, F_OK) == 0) { /* check if the file exists first */
+        ret = machine_id_read_and_sanitize(dbus_var, &id, &bytes);
+        if (ret == 0) {
+            if (bytes == 0) {
+                /* guid is somewhat corrupted */
+                fallback = FLB_TRUE;
+                goto fallback;
+            }
+            *out_id = id;
+            *out_size = bytes;
+            return 0;
+        }
     }
 
     /* etc */
-    ret = machine_id_read_and_sanitize(dbus_etc, &id, &bytes);
-    if (ret == 0) {
-        *out_id = id;
-        *out_size = bytes;
-        return 0;
+    if (access(dbus_etc, F_OK) == 0) { /* check if the file exists first */
+        ret = machine_id_read_and_sanitize(dbus_etc, &id, &bytes);
+        if (ret == 0) {
+            if (bytes == 0) {
+                /* guid is somewhat corrupted */
+                fallback = FLB_TRUE;
+                goto fallback;
+            }
+            *out_id = id;
+            *out_size = bytes;
+            return 0;
+        }
     }
 #elif defined(__FreeBSD__) || defined(__NetBSD__) || \
       defined(__OpenBSD__) || defined(__DragonFly__)
@@ -1263,7 +1704,87 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
         *out_size = bytes;
         return 0;
     }
+#elif defined(FLB_SYSTEM_WINDOWS)
+    LSTATUS status;
+    HKEY hKey = 0;
+    DWORD dwType = REG_SZ;
+    char buf[255] = {0};
+    DWORD dwBufSize = sizeof(buf)-1;
+
+    status = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                          TEXT("SOFTWARE\\Microsoft\\Cryptography"),
+                          0,
+                          KEY_QUERY_VALUE|KEY_WOW64_64KEY,
+                          &hKey);
+
+    if (status != ERROR_SUCCESS) {
+        return -1;
+    }
+
+    status = RegQueryValueEx(hKey, TEXT("MachineGuid"), 0, &dwType, (LPBYTE)buf, &dwBufSize );
+    RegCloseKey(hKey);
+
+    if (status == ERROR_SUCCESS) {
+        *out_id = flb_calloc(1, dwBufSize+1);
+
+        if (*out_id == NULL) {
+            return -1;
+        }
+
+        memcpy(*out_id, buf, dwBufSize);
+
+        /* RegQueryValueEx sets dwBufSize to strlen()+1 for the NULL
+         * terminator, but we only need strlen(). */
+        *out_size = dwBufSize-1;
+        return 0;
+    }
+    else {
+        flb_error("unable to retrieve MachineGUID, error code: %d", status);
+    }
+#elif defined (FLB_SYSTEM_MACOS)
+    bool bret;
+    CFStringRef serialNumber;
+    io_service_t platformExpert = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("IOPlatformExpertDevice"));
+
+    if (platformExpert) {
+        CFTypeRef serialNumberAsCFString =
+            IORegistryEntryCreateCFProperty(platformExpert,
+                                        CFSTR(kIOPlatformSerialNumberKey),
+                                        kCFAllocatorDefault, 0);
+        if (serialNumberAsCFString) {
+            serialNumber = (CFStringRef)serialNumberAsCFString;
+        }
+        else {
+            IOObjectRelease(platformExpert);
+            return -1;
+        }
+        IOObjectRelease(platformExpert);
+
+        *out_size = CFStringGetLength(serialNumber);
+        *out_id = flb_malloc(CFStringGetLength(serialNumber)+1);
+
+        if (*out_id == NULL) {
+            return -1;
+        }
+
+        bret = CFStringGetCString(serialNumber, *out_id,
+                                  CFStringGetLength(serialNumber)+1,
+                                  kCFStringEncodingUTF8);
+        CFRelease(serialNumber);
+
+        if (bret == false) {
+            *out_size = 0;
+            return -1;
+        }
+
+        return 0;
+    }
 #endif
+
+fallback:
+
+    flb_warn("falling back on random machine UUID");
 
     /* generate a random uuid */
     uuid = flb_malloc(38);
@@ -1275,8 +1796,87 @@ int flb_utils_get_machine_id(char **out_id, size_t *out_size)
     if (ret == 0) {
         *out_id = uuid;
         *out_size = strlen(uuid);
+        if (fallback == FLB_TRUE) {
+            return 2;
+        }
         return 0;
     }
 
     return -1;
+}
+
+void flb_utils_set_plugin_string_property(const char *name,
+                                          flb_sds_t *field_storage,
+                                          flb_sds_t  new_value)
+{
+    if (field_storage == NULL) {
+        flb_error("[utils] invalid field storage pointer for property '%s'",
+                  name);
+
+        return;
+    }
+
+    if (*field_storage != NULL) {
+        flb_warn("[utils] property '%s' is already specified with value '%s'."
+                 " Overwriting with '%s'",
+                 name,
+                 *field_storage,
+                 new_value);
+
+        flb_sds_destroy(*field_storage);
+
+        *field_storage = NULL;
+    }
+
+    *field_storage = new_value;
+}
+
+#ifdef FLB_SYSTEM_WINDOWS
+#define _mkdir(a, b) mkdir(a)
+#else
+#define _mkdir(a, b) mkdir(a, b)
+#endif
+
+/* recursively create directories, based on:
+ *   https://stackoverflow.com/a/2336245
+ * who found it at:
+ *   http://nion.modprobe.de/blog/archives/357-Recursive-directory-creation.html
+ */
+int flb_utils_mkdir(const char *dir, int perms) {
+    char tmp[CALYPTIA_MAX_DIR_SIZE];
+    char *ptr = NULL;
+    size_t len;
+    int ret;
+
+    ret = snprintf(tmp, sizeof(tmp),"%s",dir);
+    if (ret < 0 || ret >= sizeof(tmp)) {
+        flb_error("directory too long for flb_utils_mkdir: %s", dir);
+        return -1;
+    }
+
+    len = strlen(tmp);
+    /* len == ret but verifying index is valid */
+    if ( len > 0 && tmp[len - 1] == PATH_SEPARATOR[0]) {
+        tmp[len - 1] = 0;
+    }
+
+#ifndef FLB_SYSTEM_WINDOWS
+    for (ptr = tmp + 1; *ptr; ptr++) {
+#else
+    for (ptr = tmp + 3; *ptr; ptr++) {
+#endif
+
+        if (*ptr == PATH_SEPARATOR[0]) {
+            *ptr = 0;
+            if (access(tmp, F_OK) != 0) {
+                ret = _mkdir(tmp, perms);
+                if (ret != 0) {
+                    return ret;
+                }
+            }
+            *ptr = PATH_SEPARATOR[0];
+        }
+    }
+
+    return _mkdir(tmp, perms);
 }

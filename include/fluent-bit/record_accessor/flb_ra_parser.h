@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -64,6 +64,7 @@ struct flb_ra_key *flb_ra_parser_key_add(struct flb_ra_parser *ra, char *key);
 int flb_ra_parser_subentry_add_string(struct flb_ra_parser *rp, char *key);
 int flb_ra_parser_subentry_add_array_id(struct flb_ra_parser *rp, int id);
 
+int flb_ra_parser_subkey_count(struct flb_ra_parser *rp);
 void flb_ra_parser_dump(struct flb_ra_parser *rp);
 struct flb_ra_parser *flb_ra_parser_string_create(char *str, int len);
 struct flb_ra_parser *flb_ra_parser_regex_id_create(int id);

@@ -56,6 +56,9 @@ typedef uint32_t gid_t;
 #define MK_CAP_SOCK_PLAIN  4
 #define MK_CAP_SOCK_TLS    8
 
+struct plugin_api;
+struct mk_clock_context;
+
 struct mk_config_listener
 {
     char *address;                /* address to bind */
@@ -151,10 +154,14 @@ struct mk_server
     int  server_signature_header_len;
 
     /* Library  mode */
-    int lib_mode;                   /* is running in Library mode ? */
-    int lib_ch_manager[2];          /* lib channel manager */
-    struct mk_event_loop *lib_evl;  /* lib event loop */
-    struct mk_event  lib_ch_event;  /* lib channel manager event ? */
+    int lib_mode;                        /* is running in Library mode ? */
+
+    int lib_ch_manager[2];               /* lib channel manager */
+    struct mk_event_loop *lib_evl;       /* lib event loop */
+    struct mk_event  lib_ch_event;       /* lib channel manager event ? */
+    int lib_ch_start[2];                 /* lib start signal channel */
+    struct mk_event_loop *lib_evl_start; /* lib start event loop */
+    struct mk_event lib_ch_start_event;  /* lib start event */
 
     /* Scheduler context (struct mk_sched_ctx) */
     void *sched_ctx;
@@ -185,6 +192,9 @@ struct mk_server
      */
     int             worker_id;
 
+    struct plugin_api *api;
+    struct mk_clock_context *clock_context;
+
     /* Direct map to Stage plugins */
     struct mk_list stage10_handler;
     struct mk_list stage20_handler;
@@ -206,8 +216,8 @@ void mk_config_error(const char *path, int line, const char *msg);
 struct mk_config_listener *mk_config_listener_add(char *address,
                                                   char *port, int flags,
                                                   struct mk_server *server);
-int mk_config_listen_check_busy();
-void mk_config_listeners_free();
+int mk_config_listen_check_busy(struct mk_server *server);
+void mk_config_listeners_free(struct mk_server *server);
 
 int mk_config_get_bool(char *value);
 void mk_config_read_hosts(char *path);

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@
 #define FLB_ERR_OUTPUT_INVALID       101
 #define FLB_ERR_OUTPUT_UNIQ          102
 #define FLB_ERR_FILTER_INVALID       201
+#define FLB_ERR_PROCESSOR_INVALID    202
 
 /* Parser */
 #define FLB_ERR_CFG_PARSER_FILE      300
@@ -47,5 +48,8 @@
 
 /* Coroutine errors */
 #define FLB_ERR_CORO_STACK_SIZE      -600
+
+/* Reloading */
+#define FLB_ERR_RELOADING_IN_PROGRESS 700
 
 #endif

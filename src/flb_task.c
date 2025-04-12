@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@
 
 /*
  * Every task created must have an unique ID, this function lookup the
- * lowest number available in the tasks_map.
+ * lowest number available in the task_map.
  *
  * This 'id' is used by the task interface to communicate with the engine event
  * loop about some action.
@@ -41,13 +41,19 @@
 
 static inline int map_get_task_id(struct flb_config *config)
 {
+    int result;
     int i;
-    int map_size = (sizeof(config->tasks_map) / sizeof(struct flb_task_map));
 
-    for (i = 0; i < map_size; i++) {
-        if (config->tasks_map[i].task == NULL) {
+    for (i = 0; i < config->task_map_size ; i++) {
+        if (config->task_map[i].task == NULL) {
             return i;
         }
+    }
+
+    result = flb_config_task_map_grow(config);
+
+    if (result == 0) {
+        return i;
     }
 
     return -1;
@@ -56,13 +62,13 @@ static inline int map_get_task_id(struct flb_config *config)
 static inline void map_set_task_id(int id, struct flb_task *task,
                                    struct flb_config *config)
 {
-    config->tasks_map[id].task = task;
+    config->task_map[id].task = task;
 
 }
 
 static inline void map_free_task_id(int id, struct flb_config *config)
 {
-    config->tasks_map[id].task = NULL;
+    config->task_map[id].task = NULL;
 }
 
 void flb_task_retry_destroy(struct flb_task_retry *retry)
@@ -160,8 +166,14 @@ struct flb_task_retry *flb_task_retry_create(struct flb_task *task,
      * we need to determinate if the source input plugin have some memory
      * restrictions and if the Storage type is 'filesystem' we need to put
      * the file content down.
+     *
+     * Note that we can only put the chunk down if there are no more active users
+     * otherwise it can lead to a corruption (https://github.com/fluent/fluent-bit/issues/8691)
      */
-    flb_input_chunk_set_up_down(task->ic);
+
+    if (task->users <= 1) {
+        flb_input_chunk_set_up_down(task->ic);
+    }
 
     /*
      * Besides limits adjusted above, a retry that's going to only one place
@@ -226,7 +238,7 @@ int flb_task_retry_clean(struct flb_task *task, struct flb_output_instance *ins)
 }
 
 /* Allocate an initialize a basic Task structure */
-static struct flb_task *task_alloc(struct flb_config *config)
+struct flb_task *task_alloc(struct flb_config *config)
 {
     int task_id;
     struct flb_task *task;
@@ -244,6 +256,7 @@ static struct flb_task *task_alloc(struct flb_config *config)
         flb_free(task);
         return NULL;
     }
+
     map_set_task_id(task_id, task, config);
 
     flb_trace("[task %p] created (id=%i)", task, task_id);
@@ -256,10 +269,12 @@ static struct flb_task *task_alloc(struct flb_config *config)
     mk_list_init(&task->routes);
     mk_list_init(&task->retries);
 
+    pthread_mutex_init(&task->lock, NULL);
+
     return task;
 }
 
-/* Return the number of tasks with 'running status' */
+/* Return the number of tasks with 'running status' or tasks with retries */
 int flb_task_running_count(struct flb_config *config)
 {
     int count = 0;
@@ -272,7 +287,7 @@ int flb_task_running_count(struct flb_config *config)
         ins = mk_list_entry(head, struct flb_input_instance, _head);
         mk_list_foreach(t_head, &ins->tasks) {
             task = mk_list_entry(t_head, struct flb_task, _head);
-            if (task->users > 0) {
+            if (task->users > 0 || mk_list_size(&task->retries) > 0) {
                 count++;
             }
         }
@@ -329,6 +344,10 @@ int flb_task_running_print(struct flb_config *config)
     return 0;
 }
 
+int flb_task_map_get_task_id(struct flb_config *config) {
+    return map_get_task_id(config);
+}
+
 /* Create an engine task to handle the output plugin flushing work */
 struct flb_task *flb_task_create(uint64_t ref_id,
                                  const char *buf,
@@ -360,9 +379,7 @@ struct flb_task *flb_task_create(uint64_t ref_id,
         return NULL;
     }
 
-#ifdef FLB_HAVE_METRICS
     total_events = ((struct flb_input_chunk *) ic)->total_records;
-#endif
 
     /* event chunk */
     evc = flb_event_chunk_create(ic->event_type,
@@ -374,6 +391,14 @@ struct flb_task *flb_task_create(uint64_t ref_id,
         *err = FLB_TRUE;
         return NULL;
     }
+
+#ifdef FLB_HAVE_CHUNK_TRACE
+    if (ic->trace) {
+        flb_debug("add trace to task");
+        evc->trace = ic->trace;
+    }
+#endif
+
     task->event_chunk = evc;
     task_ic = (struct flb_input_chunk *) ic;
     task_ic->task = task;
@@ -419,13 +444,16 @@ struct flb_task *flb_task_create(uint64_t ref_id,
             continue;
         }
 
-        if (flb_routes_mask_get_bit(task_ic->routes_mask, o_ins->id) != 0) {
-            route = flb_malloc(sizeof(struct flb_task_route));
+        if (flb_routes_mask_get_bit(task_ic->routes_mask, 
+                                    o_ins->id,
+                                    o_ins->config) != 0) {
+            route = flb_calloc(1, sizeof(struct flb_task_route));
             if (!route) {
                 flb_errno();
                 continue;
             }
 
+            route->status = FLB_TASK_ROUTE_INACTIVE;
             route->out = o_ins;
             mk_list_add(&route->_head, &task->routes);
             count++;
@@ -465,21 +493,61 @@ void flb_task_destroy(struct flb_task *task, int del)
     }
 
     /* Unlink and release task */
-    mk_list_del(&task->_head);
+    if (!mk_list_entry_is_orphan(&task->_head)) {
+        mk_list_del(&task->_head);
+    }
 
     /* destroy chunk */
-    flb_input_chunk_destroy(task->ic, del);
+    if (task->ic != NULL) {
+        flb_input_chunk_destroy(task->ic, del);
+    }
 
     /* Remove 'retries' */
     mk_list_foreach_safe(head, tmp, &task->retries) {
         retry = mk_list_entry(head, struct flb_task_retry, _head);
+
         flb_task_retry_destroy(retry);
     }
 
-    flb_input_chunk_set_limits(task->i_ins);
+    if (task->i_ins != NULL) {
+        flb_input_chunk_set_limits(task->i_ins);
+    }
 
-    if (task->event_chunk) {
+    if (task->event_chunk != NULL) {
         flb_event_chunk_destroy(task->event_chunk);
     }
+
     flb_free(task);
+}
+
+struct flb_task_queue* flb_task_queue_create() {
+    struct flb_task_queue *tq;
+    tq = flb_malloc(sizeof(struct flb_task_queue));
+    if (!tq) {
+        flb_errno();
+        return NULL;
+    }
+    mk_list_init(&tq->pending);
+    mk_list_init(&tq->in_progress);
+    return tq;
+}
+
+void flb_task_queue_destroy(struct flb_task_queue *queue) {
+    struct flb_task_enqueued *queued_task;
+    struct mk_list *tmp;
+    struct mk_list *head;
+
+    mk_list_foreach_safe(head, tmp, &queue->pending) {
+        queued_task = mk_list_entry(head, struct flb_task_enqueued, _head);
+        mk_list_del(&queued_task->_head);
+        flb_free(queued_task);
+    }
+
+    mk_list_foreach_safe(head, tmp, &queue->in_progress) {
+        queued_task = mk_list_entry(head, struct flb_task_enqueued, _head);
+        mk_list_del(&queued_task->_head);
+        flb_free(queued_task);
+    }
+
+    flb_free(queue);
 }

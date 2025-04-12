@@ -38,6 +38,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         return 0;
     }
 
+    /* Set fuzzer-malloc chance of failure */
+    flb_malloc_mod = 25000;
     flb_malloc_p = 0;
 
     uint64_t ran_hash = *(uint64_t *)data;
@@ -67,6 +69,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     struct mk_list *list = flb_utils_split(null_terminated, 'A', 3);
     if (list != NULL) {
         flb_utils_split_free(list);
+    }
+    struct mk_list *list2 = flb_utils_split_quoted(null_terminated, 'A', 3);
+    if (list2 != NULL) {
+        flb_utils_split_free(list2);
     }
 
     if (flb_utils_url_split(null_terminated, &prot, &host, &port, &uri) == 0) {

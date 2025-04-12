@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -154,6 +154,10 @@ static flb_sds_t token_retrieve(char **str)
  exit:
     if (*p) {
         out = flb_sds_create_len(start, p - start);
+        if (!out) {
+            *str = NULL;
+            return NULL;
+        }
         if (quoted == FLB_TRUE) {
             len = token_unescape(out);
             flb_sds_len_set(out, len);

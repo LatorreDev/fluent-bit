@@ -58,14 +58,15 @@ struct flb_input_thread {
     size_t bufpos;                /* current offset in the msgpack buffer */
 };
 
-/* ============== New input thread interface =================== */
-
 struct flb_input_thread_instance {
     struct mk_event event;               /* event context to associate events */
     struct mk_event event_local;         /* local events inside the thread/event loop */
     struct mk_event_loop *evl;           /* thread event loop context */
     flb_pipefd_t ch_parent_events[2];    /* communication between parent and thread */
     flb_pipefd_t ch_thread_events[2];    /* local messages in the thread event loop */
+    int notification_channels_initialized;
+    flb_pipefd_t notification_channels[2];
+    struct mk_event notification_event;
     struct flb_input_instance *ins;      /* output plugin instance */
     struct flb_tp *tp;
     struct flb_tp_thread *th;
@@ -95,6 +96,7 @@ int flb_input_thread_instance_init(struct flb_config *config,
 int flb_input_thread_instance_pre_run(struct flb_config *config, struct flb_input_instance *ins);
 
 int flb_input_thread_instance_pause(struct flb_input_instance *ins);
+int flb_input_thread_instance_resume(struct flb_input_instance *ins);
 int flb_input_thread_instance_exit(struct flb_input_instance *ins);
 
 int flb_input_thread_collectors_signal_start(struct flb_input_instance *ins);
@@ -104,19 +106,5 @@ int flb_input_thread_collectors_start(struct flb_input_instance *ins);
 int flb_input_thread_init_fail(struct flb_input_instance *ins);
 int flb_input_thread_is_ready(struct flb_input_instance *ins);
 int flb_input_thread_wait_until_is_ready(struct flb_input_instance *ins);
-
-/* ============= END ==================== */
-
-int flb_input_thread_init(struct flb_input_thread *it,
-                          flb_input_thread_cb callback,
-                          void *data);
-int flb_input_thread_destroy(struct flb_input_thread *it,
-                             struct flb_input_instance *ins);
-int flb_input_thread_collect(struct flb_input_instance *ins,
-                             struct flb_config *config,
-                             void *in_context);
-void flb_input_thread_exit(void *in_context, struct flb_input_instance *ins);
-bool flb_input_thread_exited(struct flb_input_thread *it);
-
 
 #endif

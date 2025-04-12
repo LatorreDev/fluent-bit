@@ -181,7 +181,7 @@ void test_parser_time_lookup()
     struct flb_parser *p;
     struct flb_config *config;
     struct time_check *t;
-    struct tm tm;
+    struct flb_tm tm;
 
     config = flb_config_init();
 
@@ -231,7 +231,7 @@ void test_parser_time_lookup()
             continue;
         }
 
-        epoch = flb_parser_tm2time(&tm);
+        epoch = flb_parser_tm2time(&tm, FLB_FALSE);
         epoch -= year_diff;
         TEST_CHECK(t->epoch == epoch);
         TEST_CHECK(t->frac_seconds == ns);

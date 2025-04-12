@@ -12,18 +12,24 @@ set(src
   flb_env.c
   flb_file.c
   flb_uri.c
+  flb_utf8.c
   flb_hash_table.c
   flb_help.c
   flb_pack.c
   flb_pack_gelf.c
   flb_sds.c
+  flb_sds_list.c
   flb_pipe.c
   flb_meta.c
   flb_kernel.c
   flb_custom.c
   flb_input.c
   flb_input_chunk.c
+  flb_input_log.c
   flb_input_metric.c
+  flb_input_trace.c
+  flb_input_profiles.c
+  flb_input_blob.c
   flb_input_thread.c
   flb_filter.c
   flb_output.c
@@ -41,6 +47,8 @@ set(src
   flb_scheduler.c
   flb_io.c
   flb_storage.c
+  flb_connection.c
+  flb_downstream.c
   flb_upstream.c
   flb_upstream_ha.c
   flb_upstream_node.c
@@ -56,6 +64,11 @@ set(src
   flb_plugin.c
   flb_gzip.c
   flb_snappy.c
+  flb_zstd.c
+  flb_compression.c
+  flb_http_common.c
+  flb_http_client_http1.c
+  flb_http_client_http2.c
   flb_http_client.c
   flb_callback.c
   flb_strptime.c
@@ -66,6 +79,18 @@ set(src
   flb_event.c
   flb_base64.c
   flb_ring_buffer.c
+  flb_log_event_decoder.c
+  flb_log_event_encoder.c
+  flb_log_event_encoder_primitives.c
+  flb_log_event_encoder_dynamic_field.c
+  flb_processor.c
+  flb_reload.c
+  flb_msgpack_append_message.c
+  flb_notification.c
+  flb_lock.c
+  flb_cfl_ra_key.c
+  flb_cfl_record_accessor.c
+  flb_conditionals.c
   )
 
 # Config format
@@ -149,6 +174,7 @@ if(FLB_SIGNV4 AND FLB_TLS)
   set(src
     ${src}
     "flb_signv4.c"
+    "flb_signv4_ng.c"
     )
 endif()
 
@@ -193,13 +219,13 @@ set(extra_libs
 if(FLB_JEMALLOC)
   set(extra_libs
     ${extra_libs}
-    "libjemalloc")
+    ${JEMALLOC_LIBRARIES})
 endif()
 
 if(FLB_REGEX)
-  set(extra_libs
-    ${extra_libs}
-    "libonigmo")
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    onigmo-static)
   set(src
     ${src}
     "flb_regex.c"
@@ -209,7 +235,7 @@ endif()
 if(FLB_LUAJIT)
   set(extra_libs
     ${extra_libs}
-    "libluajit")
+    ${LUAJIT_LIBRARIES})
 endif()
 
 if(FLB_SQLDB)
@@ -226,6 +252,13 @@ if(FLB_STATIC_CONF)
   set(src
     ${src}
     "flb_config_static.c"
+    )
+endif()
+
+if(FLB_CHUNK_TRACE)
+  set(src
+    ${src}
+    "flb_chunk_trace.c"
     )
 endif()
 
@@ -256,6 +289,14 @@ if(CMAKE_SYSTEM_NAME MATCHES "Linux")
     )
 endif()
 
+if(FLB_SYSTEM_MACOS)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    "-framework Foundation"
+    "-framework IOKit"
+    "-framework Security"
+    )
+endif()
 
 # Record Accessor
 # ---------------
@@ -299,6 +340,24 @@ if(FLB_PROXY_GO)
   set(FLB_PROXY_PLUGINS ${FLB_PROXY_PLUGINS} flb-plugin-proxy-go)
 endif()
 
+# WASM runtime
+if(FLB_WASM)
+  add_subdirectory(wasm)
+endif()
+
+if(FLB_UNICODE_ENCODER)
+  add_subdirectory(simdutf)
+  set(src
+    ${src}
+    "flb_unicode.c"
+    )
+endif()
+
+# WAMRC compiler
+if(FLB_WAMRC)
+  add_subdirectory(wamrc)
+endif()
+
 # HTTP Server
 if(FLB_HTTP_SERVER)
   set(FLB_DEPS
@@ -315,23 +374,37 @@ set(FLB_DEPS
   )
 endif()
 
+# WASM runtime
+if(FLB_WASM)
+  set(FLB_DEPS
+    ${FLB_DEPS}
+    vmlib-static
+    flb-wasm-static)
+endif()
+
 # Set static dependencies
 set(FLB_DEPS
   ${FLB_DEPS}
+  cfl-static
+  fluent-otel-proto
+  cprofiles-static
+  cmetrics-static
+  ctraces-static
   mk_core
   jsmn
   msgpack-c-static
   mpack-static
   chunkio-static
   miniz
-  xxhash
-  cmetrics-static
+  libzstd_static
+
   ${FLB_PLUGINS}
   ${FLB_PROXY_PLUGINS}
   ${extra_libs}
-  c-ares
+  ${LIBCARES_LIBRARIES}
   snappy-c
   lwrb
+  ${NGHTTP2_LIBRARIES}
   )
 
 if(OPENSSL_FOUND)
@@ -354,6 +427,15 @@ if(FLB_UTF8_ENCODER)
 set(FLB_DEPS
   ${FLB_DEPS}
   tutf8e
+  )
+endif()
+
+# Unicode Encoding (UTF-16LE, UTF-16BE)
+if(FLB_UNICODE_ENCODER)
+set(FLB_DEPS
+  ${FLB_DEPS}
+  simdutf-static
+  flb-simdutf-connector-static
   )
 endif()
 
@@ -428,7 +510,7 @@ else()
 endif(MSVC)
 
 if(FLB_JEMALLOC)
-  target_link_libraries(fluent-bit-static libjemalloc)
+  target_link_libraries(fluent-bit-static ${JEMALLOC_LIBRARIES})
 endif()
 
 # Binary / Executable
@@ -446,17 +528,22 @@ if(FLB_BINARY)
     add_dependencies(fluent-bit-bin flb-static-conf)
   endif()
 
+  # in_ebpf
+  if(FLB_IN_EBPF)
+    add_dependencies(fluent-bit-bin flb-ebpf-generate_skeletons)
+  endif()
+
   if(FLB_REGEX)
-    target_link_libraries(fluent-bit-bin libonigmo)
+    target_link_libraries(fluent-bit-bin onigmo-static)
   endif()
 
   if(FLB_JEMALLOC)
-    target_link_libraries(fluent-bit-bin libjemalloc)
+    target_link_libraries(fluent-bit-bin ${JEMALLOC_LIBRARIES})
   endif()
 
   if(FLB_BACKTRACE)
     add_definitions(-DFLB_DUMP_STACKTRACE=1)
-    target_link_libraries(fluent-bit-bin libbacktrace)
+    target_link_libraries(fluent-bit-bin ${LIBBACKTRACE_LIBRARIES})
   endif()
 
   target_link_libraries(fluent-bit-bin fluent-bit-static ${CMAKE_THREAD_LIBS_INIT})
@@ -476,14 +563,37 @@ if(FLB_BINARY)
   endif()
 
   # Detect init system, install upstart, systemd or init.d script
-  if(IS_DIRECTORY /lib/systemd/system)
-    set(FLB_SYSTEMD_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.service")
-    configure_file(
-      "${PROJECT_SOURCE_DIR}/init/systemd.in"
-      ${FLB_SYSTEMD_SCRIPT}
-      )
-    install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION /lib/systemd/system)
-    install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
+
+  # Handle issues with detection on some systems during build
+  if(NOT SYSTEMD_UNITDIR AND IS_DIRECTORY /lib/systemd/system)
+    set(SYSTEMD_UNITDIR  /lib/systemd/system)
+  endif()
+
+  if(SYSTEMD_UNITDIR)
+    if (FLB_AMAZON_LINUX2)
+      set(FLB_SYSTEMD_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.service")
+      configure_file(
+        "${PROJECT_SOURCE_DIR}/init/az2-systemd.in"
+        ${FLB_SYSTEMD_SCRIPT}
+        )
+      install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION ${SYSTEMD_UNITDIR})
+      install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
+      set(FLB_HOSTNAME_SYSTEMD_SCRIPT "${PROJECT_SOURCE_DIR}/init/sethostname.service")
+      configure_file(
+        "${PROJECT_SOURCE_DIR}/init/az2-sethostname.in"
+        ${FLB_HOSTNAME_SYSTEMD_SCRIPT}
+        )
+      install(FILES ${FLB_HOSTNAME_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION ${SYSTEMD_UNITDIR})
+      install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
+    else()
+      set(FLB_SYSTEMD_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.service")
+      configure_file(
+        "${PROJECT_SOURCE_DIR}/init/systemd.in"
+        ${FLB_SYSTEMD_SCRIPT}
+        )
+      install(FILES ${FLB_SYSTEMD_SCRIPT} COMPONENT binary DESTINATION ${SYSTEMD_UNITDIR})
+      install(DIRECTORY DESTINATION ${FLB_INSTALL_CONFDIR} COMPONENT binary)
+    endif()
   elseif(IS_DIRECTORY /usr/share/upstart)
     set(FLB_UPSTART_SCRIPT "${PROJECT_SOURCE_DIR}/init/${FLB_OUT_NAME}.conf")
     configure_file(

@@ -7,6 +7,9 @@ changes to Fluent Bit.
 
 - [Beginners Guide to Contributing to Fluent Bit](#beginners-guide-to-contributing-to-fluent-bit)
   - [Table of Contents](#table-of-contents)
+  - [Development Environment](#development-environment)
+    - [Devcontainer](#devcontainer)
+    - [Vagrant](#vagrant)
   - [Libraries](#libraries)
     - [Memory Management](#memory-management)
     - [Strings](#strings)
@@ -24,8 +27,65 @@ changes to Fluent Bit.
     - [Output](#output)
     - [Config Maps](#config-maps)
   - [Testing](#testing)
+    - [Building and Testing on Windows](#building-and-testing-on-windows)
     - [Valgrind](#valgrind)
   - [Need more help?](#need-more-help)
+
+## Development Environment
+
+Development environments allow to work without any dependency locally.
+
+### Devcontainer
+
+A Development Container (or Dev Container for short) allows you to use a container as a full-featured development environment.
+
+Thanks to [Visual Studio Code integration](https://code.visualstudio.com/docs/devcontainers/containers), devcontainers are managed easily.
+
+#### Prerequirements
+
+Please refer to the [devcontainer documentation](https://code.visualstudio.com/docs/devcontainers/containers#_system-requirements) for full details on pre-requisites and installation.
+
+#### Using without optional tools
+
+```shell
+docker run \
+    --name devcontainer-fluent-bit \
+    --volume $PWD/:/workspaces/fluent-bit \
+    --user $UID:$GID \
+    --tty \
+    --detach \
+    fluent/fluent-bit:latest-debug
+
+docker exec --user root devcontainer-fluent-bit addgroup --system --gid $GID fluent-bit
+docker exec --user root devcontainer-fluent-bit useradd --create-home --system --uid $UID --gid $GID fluent-bit
+docker exec --user root devcontainer-fluent-bit sh -c 'mkdir -p /etc/sudoers.d; echo "fluent-bit   ALL=(ALL:ALL) NOPASSWD:ALL" > /etc/sudoers.d/fluent-bit'
+docker exec -it devcontainer-fluent-bit bash
+
+cd /workspaces/fluent-bit
+```
+
+If local applications need to access fluent-bit server or tcp/udp inputs, the ports must be publish with --publish flag. ex:
+
+```text
+docker run \
+--publish 2020:2020 \
+--publish 80:80 \
+...
+```
+
+### Vagrant
+Vagrant enables the creation and configuration of lightweight, reproducible, and portable development environments.
+
+#### Prerequirements
+- [vagrant](https://www.vagrantup.com)
+- [vagrant providers](https://developer.hashicorp.com/vagrant/docs/providers)
+
+#### Using
+
+```shell
+vagrant up
+vagrant ssh
+```
 
 ## Libraries
 
@@ -534,6 +594,26 @@ Note that Fluent Bit uses Cmake 3 and on some systems you may need to invoke it 
 
 To set up and build your environment, please refer to the packaging containers for a dependency list: <https://github.com/fluent/fluent-bit/tree/master/packaging/distros>.
 
+See [Building and Testing on Windows](#building-and-testing-on-windows) for Windows instructions.
+
+A simple container-based script [`run_code_analysis.sh`](./run_code_analysis.sh) is provided to run unit tests using <https://github.com/marketplace/actions/cmake-swiss-army-knife>.
+
+```shell
+$ ./run_code_analysis.sh
+...
++ ctest --output-on-failure .
+Test project /tmp/source
+        Start   1: flb-rt-core-timeout
+  1/109 Test   #1: flb-rt-core-timeout ........................   Passed   10.31 sec
+        Start   2: flb-rt-in_event_test
+  2/109 Test   #2: flb-rt-in_event_test .......................   Passed    9.01 sec
+        Start   3: flb-rt-in_cpu
+...
+
+```
+
+Refer to <https://github.com/marketplace/actions/cmake-swiss-army-knife> for full details but this can run with sanitizers, valgrind and other tooling too by setting the `TEST_PRESENT` environment variable.
+
 A [`Vagrantfile`](./Vagrantfile) is provided to simplify building on a VM, this will set up a VM using Vagrant you can then build in.
 
 ```shell
@@ -569,9 +649,227 @@ Test sds_printf...                              [   OK   ]
 SUCCESS: All unit tests have passed.
 ```
 
+### Building and testing on Windows
+
+Fluent Bit is built with MSVC and CMake on Windows.
+
+Windows builds of Fluent Bit override the set of enabled plugins. See
+[`cmake/windows-setup.cmake`](./cmake/windows-setup.cmake) for the override
+list and other Windows-specific build rules.
+
+#### Using a Github Action
+
+For developers without convenient access to a Windows build machine the easiest
+way to build a branch of Fluent Bit on Windows is to fork the `fluent-bit`
+repository and enable workflow runs. The
+[`.github/workflows/pr-windows-build.yaml`](.github/workflows/pr-windows-build.yaml)
+workflow can then be invoked in your branch via the Actions tab on your forked
+repository to build your patch.
+
+This workflow will not run automatically on pull requests opened against the
+`fluent/fluent-bit` repository so it's best you run it yourself in your fork. 
+
+The resulting binaries are uploaded as a Github workflow artifact which can be
+found on the workflow run page.
+
+At time of writing this workflow *does not run any of the Fluent Bit test suite*
+- so it only checks that the target branch can be compiled. To run tests, a local
+build will be required.
+
+#### Using Docker for Windows
+
+For Windows users with Hyper-V capable machines the simplest way to build a
+branch of Fluent Bit is to use
+[Docker Desktop for Windows](https://docs.docker.com/desktop/install/windows-install/)
+to build
+[`./dockerfiles/Dockerfile.windows`](./dockerfiles/Dockerfile.windows).
+
+This method does not require manual installation of any build dependencies.
+
+The Dockerfile build does *not* run any Fluent Bit test suites. To run tests you
+will need to use a different method.
+
+Most OS virtualisation tools and virtual machine hosting services do not enable
+nested virtualisation, so it is generally not possible to use this method on
+virtualized windows machines.
+
+#### Locally on a Windows machine
+
+Local compilation on a Windows machine takes the longest to set up, but is the
+most convenient for iterating development work.
+
+At time of writing this is the only way to run the Fluent Bit tests on Windows.
+
+In lieu of full Windows dev environment setup instructions, see these CI automation
+resources for how to set up a Windows build of fluent-bit:
+
+* [`dockerfiles/Dockerfile.windows`](./dockerfiles/Dockerfile.windows) - only build-able using Docker for Windows
+* [`appveyor.yml`](./appveyor.yml)
+* [`.github/workflows/call-build-windows.yaml`](.github/workflows/call-build-windows.yaml) - github automation that runs the build on a Windows worker.
+
+The dependencies must be present:
+
+* Microsoft Visual Studio C/C++ toolchain. The CI automation uses MSVC 2019 at time of writing. MSVC Community Edition works fine.
+* [CMake](https://cmake.org/) 3.x on the `PATH`
+* A build of [OpenSSL](https://www.openssl.org/) as static libraries, pointed to by the `-DOPENSSL_ROOT_DIR` CMake variable.
+* The CI automation uses vcpkg to install dependencies [](https://github.com/fluent/fluent-bit/blob/master/.github/workflows/call-build-windows.yaml#L148)
+* `flex.exe` and `bison.exe` must be present on the `PATH`. The CI automation uses https://github.com/lexxmark/winflexbison.
+
+Assuming that `cmake` is on the `PATH`, Visual Studio is installed,
+WinFlexBison is present at `%SYSTEMDRIVE%\WinFlexBison` and OpenSSL is present
+at `%PROGRAMFILES%\OpenSSL-Win64`, the following Powershell commands should
+produce a basic Fluent Bit build:
+
+```powershell
+$env:PATH += "$env:SystemDrive\WinFlexBison"
+mkdir build
+cd build
+cmake -DOPENSSL_ROOT_DIR="$env:ProgramFiles\OpenSSL-Win64" -S .. -B .
+cmake --build .
+```
+
+The build output will be `bin\Debug\fluent-bit.exe`.
+
+If in doubt, check the CI and build automation files referenced above for specifics.
+
+### Building on a Windows Server 2022
+
+The following steps have been tested on a Windows Server 2022 Datacenter edition on top of GCP.
+
+1. **Download and Install Visual Studio 2022** (Community Edition)
+    - **Download**: Go to [Visual Studio Download Page](https://visualstudio.microsoft.com/downloads/).
+    - **Install**:
+        - Select **Community Edition** and check the following components during installation:
+            - **Desktop development with C++**
+            - **Linux development with C++**
+
+2. **Install Flex and Bison**
+    1. Create a new file called `setup-flex-bison.ps1` and paste the following script:
+
+    ```powershell
+    # Define variables for Flex and Bison
+    $flexBisonUrl = "https://sourceforge.net/projects/winflexbison/files/win_flex_bison3-latest.zip/download"
+    $downloadPath = "$env:TEMP\win_flex_bison.zip"
+    $extractPath = "C:\win_flex_bison"
+    $flexExe = "flex.exe"
+    $bisonExe = "bison.exe"
+
+    # Step 2: Download and Setup Flex and Bison
+    Write-Output "Downloading win_flex_bison..."
+    Invoke-WebRequest -Uri $flexBisonUrl -OutFile $downloadPath
+
+    # Create the extract directory if it does not exist
+    If (!(Test-Path -Path $extractPath)) {
+        New-Item -ItemType Directory -Path $extractPath
+    }
+
+    # Extract the zip file
+    Write-Output "Extracting win_flex_bison..."
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($downloadPath, $extractPath)
+
+    # Rename the executables
+    Write-Output "Renaming executables..."
+    Rename-Item "$extractPath\win_flex.exe" "$extractPath\$flexExe" -Force
+    Rename-Item "$extractPath\win_bison.exe" "$extractPath\$bisonExe" -Force
+
+    # Add Flex and Bison path to system environment variables
+    Write-Output "Adding Flex and Bison path to environment variables..."
+    $envPath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    If ($envPath -notlike "*$extractPath*") {
+        [System.Environment]::SetEnvironmentVariable("Path", "$envPath;$extractPath", "Machine")
+        Write-Output "Path updated. Please restart your command prompt to apply changes."
+    } else {
+        Write-Output "Path already contains the Flex and Bison directory."
+    }
+
+    # Cleanup
+    Remove-Item $downloadPath
+
+    Write-Output "Flex and Bison setup complete."
+    ```
+
+    2. Run the Script: Open PowerShell as administrator.
+
+    ```powershell
+    .\setup-flex-bison.ps1
+    ```
+
+    3. Restart the command prompt: After the script completes, restart your command prompt or Visual Studio for the changes to take effect.
+
+3. **Create `vcpkg.json` file for the dependencies**
+
+    In the root of your project, create a `vcpkg.json` file with the following content:
+
+    ```json
+    {
+        "name": "fluent-bit",
+        "version": "3.2.0",
+        "dependencies": [
+            {
+                "name": "openssl",
+                "default-features": false
+            },
+            {
+                "name": "libyaml",
+                "default-features": false
+            }
+        ],
+        "builtin-baseline": "9f5925e81bbcd9c8c34cc7a8bd25e3c557b582b2"
+    }
+    ```
+
+4. **Install dependencies using `vcpkg`**
+
+    ```bash
+    vcpkg install --triplet x64-windows-static
+    ```
+
+    You should see output like:
+
+    ```bash
+    libyaml:x64-windows-static      0.2.5#5      A C library for parsing and emitting YAML.
+    openssl:x64-windows-static      3.3.2#1      OpenSSL is an open source project that provides SSL and TLS.
+    ```
+
+5. **Link `vcpkg` with Visual Studio**
+
+    ```bash
+    vcpkg integrate install
+    ```
+
+6. **Generate the Visual Studio solution of Fluent Bit using CMake**
+
+    ```bash
+    cd build
+    cmake -G "Visual Studio 17 2022" -DFLB_TESTS_INTERNAL=Off -DFLB_TESTS_RUNTIME=Off -DCMAKE_TOOLCHAIN_FILE="C:/Program Files/Microsoft Visual Studio/2022/Community/VC/vcpkg/scripts/buildsystems/vcpkg.cmake" -DOPENSSL_ROOT_DIR=C:/path/to/your/vcpkg_installed/x64-windows-static -DFLB_LIBYAML_DIR=C:/path/to/your/vcpkg_installed/x64-windows-static ..
+    ```
+
+    **Notes**:
+    - Replace `C:/path/to/your/vcpkg_installed/x64-windows-static` with the actual path where `vcpkg` installed OpenSSL and LibYAML.
+    - When installing with `vcpkg`, you can also specify a different install root using `--x-install-root`.
+    - This will generate a Visual Studio solution file, which you can open and compile.
+
+7. **Run the binary build**
+
+    ```bash
+    cmake --build . --parallel 4 --clean-first
+    ```
+
+    **Notes**:
+    - You can choose to omit the `--parallel` option.
+    - The `--clean-first` option will clear cache and start a fresh clean build.
+
 ### Valgrind
 
 [Valgrind](https://valgrind.org/) is a tool that will help you detect and diagnose memory issues in your code. It will check for memory leaks and invalid memory accesses.
+
+When you use Valgrind, you should compile Fluent Bit with the following options:
+
+```
+$ cmake -DFLB_DEV=On -DFLB_VALGRIND=On ../
+$ make
+```
 
 To use it while developing, invoke it before Fluent Bit:
 
@@ -586,6 +884,14 @@ valgrind ./bin/flb-rt-your-test
 ```
 
 This will allow you to check for memory issues in code paths (ex error cases) which are hard to trigger through manual testing.
+
+See above for using the `run_code_analysis.sh` script as well to run Valgrind on unit tests with the simple tooling in a container:
+
+```shell
+$ export TEST_PRESET=valgrind
+$ ./run_code_analysis.sh
+...
+```
 
 ## Need more help?
 

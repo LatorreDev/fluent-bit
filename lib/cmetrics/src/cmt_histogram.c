@@ -2,7 +2,7 @@
 
 /*  CMetrics
  *  ========
- *  Copyright 2021 Eduardo Silva <eduardo@calyptia.com>
+ *  Copyright 2021-2022 The CMetrics Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -240,7 +240,7 @@ struct cmt_histogram *cmt_histogram_create(struct cmt *cmt,
         cmt_errno();
         return NULL;
     }
-    mk_list_add(&h->_head, &cmt->histograms);
+    cfl_list_add(&h->_head, &cmt->histograms);
 
     /* set buckets */
     if (buckets) {
@@ -284,7 +284,7 @@ struct cmt_histogram *cmt_histogram_create(struct cmt *cmt,
 
 int cmt_histogram_destroy(struct cmt_histogram *h)
 {
-    mk_list_del(&h->_head);
+    cfl_list_del(&h->_head);
     cmt_opts_exit(&h->opts);
 
     if (h->buckets) {
@@ -341,8 +341,8 @@ int cmt_histogram_observe(struct cmt_histogram *histogram, uint64_t timestamp,
     metric = histogram_get_metric(histogram, labels_count, label_vals);
     if (!metric) {
         cmt_log_error(histogram->cmt,
-                      "unable to retrieve metric: %s for histogram %s_%s_%s",
-                      histogram->map, histogram->opts.ns, histogram->opts.subsystem,
+                      "unable to retrieve metric for histogram %s_%s_%s",
+                      histogram->opts.ns, histogram->opts.subsystem,
                       histogram->opts.name);
         return -1;
     }
@@ -381,8 +381,8 @@ int cmt_histogram_set_default(struct cmt_histogram *histogram,
     metric = histogram_get_metric(histogram, labels_count, label_vals);
     if (!metric) {
         cmt_log_error(histogram->cmt,
-                      "unable to retrieve metric: %s for histogram %s_%s_%s",
-                      histogram->map, histogram->opts.ns, histogram->opts.subsystem,
+                      "unable to retrieve metric for histogram %s_%s_%s",
+                      histogram->opts.ns, histogram->opts.subsystem,
                       histogram->opts.name);
         return -1;
     }

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,11 +27,12 @@
 #define FLB_DATADOG_DEFAULT_PORT      443
 #define FLB_DATADOG_DEFAULT_TIME_KEY  "timestamp"
 #define FLB_DATADOG_DEFAULT_TAG_KEY   "tagkey"
+#define FLB_DATADOG_DEFAULT_LOG_KEY   "log"
+#define FLB_DATADOG_DD_HOSTNAME_KEY   "hostname"
 #define FLB_DATADOG_DD_SOURCE_KEY     "ddsource"
 #define FLB_DATADOG_DD_SERVICE_KEY    "service"
 #define FLB_DATADOG_DD_TAGS_KEY       "ddtags"
 #define FLB_DATADOG_DD_MESSAGE_KEY    "message"
-#define FLB_DATADOG_DD_LOG_KEY        "log"
 
 #define FLB_DATADOG_REMAP_PROVIDER    "ecs"
 #define FLB_DATADOG_TAG_SEPERATOR     ","
@@ -58,6 +59,7 @@ struct flb_out_datadog {
     flb_sds_t api_key;
     int include_tag_key;
     flb_sds_t tag_key;
+    struct mk_list *headers;
     bool remap;
 
     /* final result */
@@ -65,6 +67,7 @@ struct flb_out_datadog {
     int nb_additional_entries;
     flb_sds_t dd_source;
     flb_sds_t dd_service;
+    flb_sds_t dd_hostname;
     flb_sds_t dd_tags;
     flb_sds_t dd_message_key;
 

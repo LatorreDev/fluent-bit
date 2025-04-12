@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #define FLB_FILTER_RECORD_MODIFIER_H
 
 #include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_filter.h>
 
 struct modifier_record {
@@ -42,6 +43,9 @@ struct record_modifier_ctx {
     int records_num;
     int remove_keys_num;
     int allowlist_keys_num;
+
+    flb_sds_t uuid_key;
+
     /* config map */
     struct mk_list *records_map;
     struct mk_list *remove_keys_map;

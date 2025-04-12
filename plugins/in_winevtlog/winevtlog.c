@@ -31,15 +31,15 @@ static char* convert_wstr(wchar_t *wstr, UINT codePage);
 static wchar_t* convert_str(char *str);
 
 struct winevtlog_channel *winevtlog_subscribe(const char *channel, int read_existing_events,
-                                              EVT_HANDLE stored_bookmark)
+                                              EVT_HANDLE stored_bookmark, const char *query)
 {
     struct winevtlog_channel *ch;
     EVT_HANDLE bookmark = NULL;
     HANDLE signal_event = NULL;
     DWORD len;
     DWORD flags = 0L;
-    PWSTR wide_channel = L"Application";
-    PWSTR wide_query = L"*";
+    PWSTR wide_channel = NULL;
+    PWSTR wide_query = NULL;
     void *buf;
 
     ch = flb_calloc(1, sizeof(struct winevtlog_channel));
@@ -54,13 +54,21 @@ struct winevtlog_channel *winevtlog_subscribe(const char *channel, int read_exis
         flb_free(ch);
         return NULL;
     }
+    ch->query = NULL;
 
-    signal_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+    signal_event = CreateEvent(NULL, TRUE, TRUE, NULL);
 
     // channel : To wide char
     len = MultiByteToWideChar(CP_UTF8, 0, channel, -1, NULL, 0);
     wide_channel = flb_malloc(sizeof(PWSTR) * len);
     MultiByteToWideChar(CP_UTF8, 0, channel, -1, wide_channel, len);
+    if (query != NULL) {
+    // query : To wide char
+        len = MultiByteToWideChar(CP_UTF8, 0, query, -1, NULL, 0);
+        wide_query = flb_malloc(sizeof(PWSTR) * len);
+        MultiByteToWideChar(CP_UTF8, 0, query, -1, wide_query, len);
+        ch->query = flb_strdup(query);
+    }
 
     if (stored_bookmark) {
         flags |= EvtSubscribeStartAfterBookmark;
@@ -70,11 +78,17 @@ struct winevtlog_channel *winevtlog_subscribe(const char *channel, int read_exis
         flags |= EvtSubscribeToFutureEvents;
     }
 
+    /* The wide_query parameter can handle NULL as `*` for retrieving all events.
+     * ref. https://learn.microsoft.com/en-us/windows/win32/api/winevt/nf-winevt-evtsubscribe
+     */
     ch->subscription = EvtSubscribe(NULL, signal_event, wide_channel, wide_query,
                                     stored_bookmark, NULL, NULL, flags);
     if (!ch->subscription) {
         flb_error("[in_winevtlog] cannot subscribe '%s' (%i)", channel, GetLastError());
         flb_free(ch->name);
+        if (ch->query != NULL) {
+            flb_free(ch->query);
+        }
         flb_free(ch);
         return NULL;
     }
@@ -98,12 +112,18 @@ struct winevtlog_channel *winevtlog_subscribe(const char *channel, int read_exis
             flb_error("[in_winevtlog] cannot subscribe '%s' (%i)", channel, GetLastError());
             flb_free(wide_channel);
             flb_free(ch->name);
+            if (ch->query != NULL) {
+                flb_free(ch->query);
+            }
             flb_free(ch);
             return NULL;
         }
     }
 
     flb_free(wide_channel);
+    if (wide_query != NULL) {
+        flb_free(wide_query);
+    }
 
     return ch;
 }
@@ -142,6 +162,9 @@ static void close_handles(struct winevtlog_channel *ch)
 void winevtlog_close(struct winevtlog_channel *ch)
 {
     flb_free(ch->name);
+    if (ch->query != NULL) {
+        flb_free(ch->query);
+    }
     close_handles(ch);
 
     flb_free(ch);
@@ -266,12 +289,20 @@ cleanup:
 PWSTR get_message(EVT_HANDLE metadata, EVT_HANDLE handle, unsigned int *message_size)
 {
     WCHAR* buffer = NULL;
+    WCHAR* previous_buffer = NULL;
     DWORD status = ERROR_SUCCESS;
-    DWORD buffer_size = 0;
+    DWORD buffer_size = 512;
     DWORD buffer_used = 0;
     LPVOID format_message_buffer;
     WCHAR* message = NULL;
     char *error_message = NULL;
+
+    buffer = flb_malloc(sizeof(WCHAR) * buffer_size);
+    if (!buffer) {
+        flb_error("failed to premalloc message buffer");
+
+        goto buffer_error;
+    }
 
     // Get the size of the buffer
     if (!EvtFormatMessage(metadata, handle, 0, 0, NULL,
@@ -279,12 +310,15 @@ PWSTR get_message(EVT_HANDLE metadata, EVT_HANDLE handle, unsigned int *message_
         status = GetLastError();
         if (ERROR_INSUFFICIENT_BUFFER == status) {
             buffer_size = buffer_used;
-            buffer = flb_malloc(sizeof(WCHAR) * buffer_size);
+            previous_buffer = buffer;
+            buffer = flb_realloc(previous_buffer, sizeof(WCHAR) * buffer_size);
             if (!buffer) {
                 flb_error("failed to malloc message buffer");
+                flb_free(previous_buffer);
 
-                goto cleanup;
+                goto buffer_error;
             }
+
             if (!EvtFormatMessage(metadata,
                                   handle,
                                   0xffffffff,
@@ -352,33 +386,40 @@ cleanup:
         flb_free(buffer);
     }
 
+buffer_error:
+
     return message;
 }
 
 PWSTR get_description(EVT_HANDLE handle, LANGID langID, unsigned int *message_size)
 {
-    WCHAR *buffer[EVENT_PROVIDER_NAME_LENGTH];
     PEVT_VARIANT values = NULL;
-    DWORD buffer_used = 0;
+    DWORD buffer_size = 0;
+    DWORD buffer_size_used = 0;
     DWORD status = ERROR_SUCCESS;
     DWORD count = 0;
     WCHAR *message = NULL;
     EVT_HANDLE metadata = NULL;
 
-    PCWSTR properties[] = { L"Event/System/Provider/@Name" };
+    PCWSTR properties[] = { L"Event/System/Provider/@Name", L"Event/RenderingInfo/Message" };
     EVT_HANDLE context =
-            EvtCreateRenderContext(1, properties, EvtRenderContextValues);
+            EvtCreateRenderContext(_countof(properties), properties,
+                                   EvtRenderContextValues);
     if (context == NULL) {
         flb_error("Failed to create renderContext");
         goto cleanup;
     }
 
+    // Get the size of the buffer
+    EvtRender(context, handle, EvtRenderEventValues, 0, NULL, &buffer_size, &count);
+    values = (PEVT_VARIANT)flb_malloc(buffer_size);
+
     if (EvtRender(context,
                   handle,
                   EvtRenderEventValues,
-                  EVENT_PROVIDER_NAME_LENGTH,
-                  buffer,
-                  &buffer_used,
+                  buffer_size,
+                  values,
+                  &buffer_size_used,
                   &count) != FALSE){
         status = ERROR_SUCCESS;
     }
@@ -390,19 +431,25 @@ PWSTR get_description(EVT_HANDLE handle, LANGID langID, unsigned int *message_si
         flb_error("failed to query RenderContextValues");
         goto cleanup;
     }
-    values = (PEVT_VARIANT)buffer;
 
-    metadata = EvtOpenPublisherMetadata(
-            NULL, // TODO: Remote handle
-            values[0].StringVal,
-            NULL,
-            MAKELCID(langID, SORT_DEFAULT),
-            0);
-    if (metadata == NULL) {
-        goto cleanup;
+    /* For non forwarded events, we need to determine the
+     * corresponding metadata. */
+    if ((values[1].Type & EVT_VARIANT_TYPE_MASK) == EvtVarTypeNull) {
+        /* Metadata can be NULL because some of the events do not have an
+         * associated publisher metadata. */
+        metadata = EvtOpenPublisherMetadata(
+                NULL, // TODO: Remote handle
+                values[0].StringVal,
+                NULL,
+                MAKELCID(langID, SORT_DEFAULT),
+                0);
+
+        message = get_message(metadata, handle, message_size);
     }
-
-    message = get_message(metadata, handle, message_size);
+    else if ((values[1].Type & EVT_VARIANT_TYPE_MASK) == EvtVarTypeString) {
+        /* Forwarded events contain RenderingInfo element */
+        message = _wcsdup(values[1].StringVal);
+    }
 
 cleanup:
     if (context) {
@@ -411,6 +458,10 @@ cleanup:
 
     if (metadata) {
         EvtClose(metadata);
+    }
+
+    if (values) {
+        flb_free(values);
     }
 
     return message;
@@ -438,7 +489,7 @@ int get_string_inserts(EVT_HANDLE handle, PEVT_VARIANT *string_inserts_values,
 
     succeeded = EvtRender(context,
                           handle,
-                          EvtRenderContextValues,
+                          EvtRenderEventValues,
                           buffer_size,
                           values,
                           &buffer_size_used,
@@ -469,6 +520,7 @@ static int winevtlog_next(struct winevtlog_channel *ch, int hit_threshold)
     DWORD status = ERROR_SUCCESS;
     BOOL has_next = FALSE;
     int i;
+    DWORD wait = 0;
 
     /* If subscription handle is NULL, it should return false. */
     if (!ch->subscription) {
@@ -477,6 +529,15 @@ static int winevtlog_next(struct winevtlog_channel *ch, int hit_threshold)
     }
 
     if (hit_threshold) {
+        return FLB_FALSE;
+    }
+
+    wait = WaitForSingleObject(ch->signal_event, 0);
+    if (wait == WAIT_FAILED) {
+        flb_error("subscription is invalid. err code = %d", GetLastError());
+        return FLB_FALSE;
+    }
+    else if (wait != WAIT_OBJECT_0) {
         return FLB_FALSE;
     }
 
@@ -491,6 +552,8 @@ static int winevtlog_next(struct winevtlog_channel *ch, int hit_threshold)
         if (ERROR_NO_MORE_ITEMS != status) {
             return FLB_FALSE;
         }
+
+        ResetEvent(ch->signal_event);
     }
 
     if (status == ERROR_SUCCESS) {
@@ -509,7 +572,7 @@ static int winevtlog_next(struct winevtlog_channel *ch, int hit_threshold)
 /*
  * Read from an open Windows Event Log channel.
  */
-int winevtlog_read(struct winevtlog_channel *ch, msgpack_packer *mp_pck, struct winevtlog_config *ctx,
+int winevtlog_read(struct winevtlog_channel *ch, struct winevtlog_config *ctx,
                    unsigned int *read)
 {
     DWORD status = ERROR_SUCCESS;
@@ -534,7 +597,7 @@ int winevtlog_read(struct winevtlog_channel *ch, msgpack_packer *mp_pck, struct 
                 if (system_xml) {
                     /* Caluculate total allocated size: system + message + string_inserts */
                     read_size += (system_size + message_size + string_inserts_size);
-                    winevtlog_pack_xml_event(mp_pck, system_xml, message, string_inserts,
+                    winevtlog_pack_xml_event(system_xml, message, string_inserts,
                                              count_inserts, ch, ctx);
 
                     flb_free(string_inserts);
@@ -550,7 +613,7 @@ int winevtlog_read(struct winevtlog_channel *ch, msgpack_packer *mp_pck, struct 
                 if (rendered_system) {
                     /* Caluculate total allocated size: system + message + string_inserts */
                     read_size += (system_size + message_size + string_inserts_size);
-                    winevtlog_pack_event(mp_pck, rendered_system, message, string_inserts,
+                    winevtlog_pack_event(rendered_system, message, string_inserts,
                                          count_inserts, ch, ctx);
 
                     flb_free(string_inserts);
@@ -587,7 +650,7 @@ int winevtlog_read(struct winevtlog_channel *ch, msgpack_packer *mp_pck, struct 
  *
  * "channels" are comma-separated names like "Setup,Security".
  */
-struct mk_list *winevtlog_open_all(const char *channels, int read_existing_events)
+struct mk_list *winevtlog_open_all(const char *channels, struct winevtlog_config *ctx)
 {
     char *tmp;
     char *channel;
@@ -611,15 +674,29 @@ struct mk_list *winevtlog_open_all(const char *channels, int read_existing_event
 
     channel = strtok_s(tmp , ",", &state);
     while (channel) {
-        ch = winevtlog_subscribe(channel, read_existing_events, NULL);
-        if (!ch) {
-            flb_free(tmp);
-            winevtlog_close_all(list);
-            return NULL;
+        ch = winevtlog_subscribe(channel, ctx->read_existing_events, NULL, ctx->event_query);
+        if (ch) {
+            mk_list_add(&ch->_head, list);
         }
-        mk_list_add(&ch->_head, list);
+        else {
+            if (ctx->ignore_missing_channels) {
+                flb_debug("[in_winevtlog] channel '%s' does not exist", channel);
+            }
+            else {
+                flb_free(tmp);
+                winevtlog_close_all(list);
+                return NULL;
+            }
+        }
         channel = strtok_s(NULL, ",", &state);
     }
+
+    if (mk_list_size(list) == 0) {
+        flb_free(tmp);
+        winevtlog_close_all(list);
+        return NULL;
+    }
+
     flb_free(tmp);
     return list;
 }
@@ -732,7 +809,7 @@ int winevtlog_sqlite_load(struct winevtlog_channel *ch, struct flb_sqldb *db)
             bookmark = EvtCreateBookmark(bookmark_xml);
             if (bookmark) {
                 /* re-create subscription handles */
-                re_ch = winevtlog_subscribe(ch->name, FLB_FALSE, bookmark);
+                re_ch = winevtlog_subscribe(ch->name, FLB_FALSE, bookmark, ch->query);
                 if (re_ch != NULL) {
                     close_handles(ch);
 

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,24 +38,51 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
     struct flb_syslog *ctx;
 
     ctx = flb_calloc(1, sizeof(struct flb_syslog));
-    if (!ctx) {
+
+    if (ctx == NULL) {
         flb_errno();
+
         return NULL;
     }
-    ctx->evl = config->evl;
+
     ctx->ins = ins;
-    ctx->buffer_data = NULL;
+
+    ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ctx->log_encoder == NULL) {
+        flb_plg_error(ins, "could not initialize event encoder");
+        syslog_conf_destroy(ctx);
+
+        return NULL;
+    }
+
     mk_list_init(&ctx->connections);
 
     ret = flb_input_config_map_set(ins, (void *)ctx);
     if (ret == -1) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+
         flb_plg_error(ins, "unable to load configuration");
         flb_free(ctx);
+
         return NULL;
     }
 
     /* Syslog mode: unix_udp, unix_tcp, tcp or udp */
     if (ctx->mode_str) {
+#ifdef FLB_SYSTEM_WINDOWS
+        if (strcasestr(ctx->mode_str, "unix") != NULL) {
+            flb_log_event_encoder_destroy(ctx->log_encoder);
+
+            flb_plg_error(ins, "unix sockets are note available in windows");
+            flb_free(ctx);
+
+            return NULL;
+        }
+
+#undef FLB_SYSLOG_UNIX_UDP
+#define FLB_SYSLOG_UNIX_UDP FLB_SYSLOG_UDP
+#endif
         if (strcasecmp(ctx->mode_str, "unix_tcp") == 0) {
             ctx->mode = FLB_SYSLOG_UNIX_TCP;
         }
@@ -69,6 +96,8 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
             ctx->mode = FLB_SYSLOG_UDP;
         }
         else {
+            flb_log_event_encoder_destroy(ctx->log_encoder);
+
             flb_error("[in_syslog] Unknown syslog mode %s", ctx->mode_str);
             flb_free(ctx);
             return NULL;
@@ -98,6 +127,8 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
 
     /* Buffer Chunk Size */
     if (ctx->buffer_chunk_size == -1) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+
         flb_plg_error(ins, "invalid buffer_chunk_size");
         flb_free(ctx);
         return NULL; 
@@ -105,12 +136,23 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
 
     /* Buffer Max Size */
     if (ctx->buffer_max_size == -1) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+
         flb_plg_error(ins, "invalid buffer_max_size");
         flb_free(ctx);
         return NULL;
     }
     else if (ctx->buffer_max_size == 0) {
         ctx->buffer_max_size = ctx->buffer_chunk_size;
+    }
+
+    /* Socket rcv buffer size */
+    if (ctx->receive_buffer_size == -1 || ctx->receive_buffer_size>INT_MAX) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
+
+        flb_plg_error(ins, "invalid receive_buffer_size");
+        flb_free(ctx);
+        return NULL;
     }
 
     /* Parser */
@@ -137,11 +179,12 @@ struct flb_syslog *syslog_conf_create(struct flb_input_instance *ins,
 
 int syslog_conf_destroy(struct flb_syslog *ctx)
 {
-    if (ctx->buffer_data) {
-        flb_free(ctx->buffer_data);
-        ctx->buffer_data = NULL;
+    if (ctx->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
     }
+
     syslog_server_destroy(ctx);
+
     flb_free(ctx);
 
     return 0;

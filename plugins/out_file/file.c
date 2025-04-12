@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include <msgpack.h>
 
 #include <stdio.h>
@@ -340,7 +341,7 @@ static void print_metrics_text(struct flb_output_instance *ins,
 {
     int ret;
     size_t off = 0;
-    cmt_sds_t text;
+    cfl_sds_t text;
     struct cmt *cmt = NULL;
 
     /* get cmetrics context */
@@ -364,6 +365,10 @@ static int mkpath(struct flb_output_instance *ins, const char *dir)
 {
     struct stat st;
     char *dup_dir = NULL;
+#ifdef FLB_SYSTEM_MACOS
+    char *parent_dir = NULL;
+#endif
+
     int ret;
 
     if (!dir) {
@@ -396,6 +401,35 @@ static int mkpath(struct flb_output_instance *ins, const char *dir)
         return -1;
     }
     return 0;
+#elif FLB_SYSTEM_MACOS
+    dup_dir = strdup(dir);
+    if (!dup_dir) {
+        return -1;
+    }
+
+    /* macOS's dirname(3) should return current directory when slash
+     * charachter is not included in passed string.
+     * And note that macOS's dirname(3) does not modify passed string.
+     */
+    parent_dir = dirname(dup_dir);
+    if (stat(parent_dir, &st) == 0 && strncmp(parent_dir, ".", 1)) {
+        if (S_ISDIR (st.st_mode)) {
+            flb_plg_debug(ins, "creating directory %s", dup_dir);
+            ret = mkdir(dup_dir, 0755);
+            free(dup_dir);
+            return ret;
+        }
+    }
+
+    ret = mkpath(ins, dirname(dup_dir));
+    if (ret != 0) {
+        free(dup_dir);
+        return ret;
+    }
+    flb_plg_debug(ins, "creating directory %s", dup_dir);
+    ret = mkdir(dup_dir, 0755);
+    free(dup_dir);
+    return ret;
 #else
     dup_dir = strdup(dir);
     if (!dup_dir) {
@@ -420,7 +454,6 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
     int ret;
     int column_names;
     FILE * fp;
-    msgpack_unpacked result;
     size_t off = 0;
     size_t last_off = 0;
     size_t alloc_size = 0;
@@ -428,11 +461,12 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
     char out_file[PATH_MAX];
     char *buf;
     long file_pos;
-    msgpack_object *obj;
     struct flb_file_conf *ctx = out_context;
-    struct flb_time tm;
-    (void) config;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
     char* out_file_copy;
+
+    (void) config;
 
     /* Set the right output file */
     if (ctx->out_path) {
@@ -514,31 +548,40 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 
+    ret = flb_log_event_decoder_init(&log_decoder,
+                                     (char *) event_chunk->data,
+                                     event_chunk->size);
+
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins,
+                      "Log event decoder initialization error : %d", ret);
+
+        fclose(fp);
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+    }
+
     /*
      * Upon flush, for each array, lookup the time and the first field
      * of the map to use as a data point.
      */
-    msgpack_unpacked_init(&result);
-    while (msgpack_unpack_next(&result,
-                               event_chunk->data,
-                               event_chunk->size, &off) == MSGPACK_UNPACK_SUCCESS) {
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
         alloc_size = (off - last_off) + 128; /* JSON is larger than msgpack */
         last_off = off;
 
-        flb_time_pop_from_msgpack(&tm, &result, &obj);
-
         switch (ctx->format){
         case FLB_OUT_FILE_FMT_JSON:
-            buf = flb_msgpack_to_json_str(alloc_size, obj);
+            buf = flb_msgpack_to_json_str(alloc_size, log_event.body);
             if (buf) {
                 fprintf(fp, "%s: [%"PRIu64".%09lu, %s]" NEWLINE,
                         event_chunk->tag,
-                        tm.tm.tv_sec, tm.tm.tv_nsec,
+                        (uint64_t) log_event.timestamp.tm.tv_sec, log_event.timestamp.tm.tv_nsec,
                         buf);
                 flb_free(buf);
             }
             else {
-                msgpack_unpacked_destroy(&result);
+                flb_log_event_decoder_destroy(&log_decoder);
                 fclose(fp);
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
@@ -551,21 +594,30 @@ static void cb_file_flush(struct flb_event_chunk *event_chunk,
             else {
                 column_names = FLB_FALSE;
             }
-            csv_output(fp, column_names, &tm, obj, ctx);
+            csv_output(fp, column_names,
+                       &log_event.timestamp,
+                       log_event.body, ctx);
             break;
         case FLB_OUT_FILE_FMT_LTSV:
-            ltsv_output(fp, &tm, obj, ctx);
+            ltsv_output(fp,
+                        &log_event.timestamp,
+                        log_event.body, ctx);
             break;
         case FLB_OUT_FILE_FMT_PLAIN:
-            plain_output(fp, obj, alloc_size);
+            plain_output(fp, log_event.body, alloc_size);
+
             break;
         case FLB_OUT_FILE_FMT_TEMPLATE:
-            template_output(fp, &tm, obj, ctx);
+            template_output(fp,
+                            &log_event.timestamp,
+                            log_event.body, ctx);
+
             break;
         }
     }
 
-    msgpack_unpacked_destroy(&result);
+    flb_log_event_decoder_destroy(&log_decoder);
+
     fclose(fp);
 
     FLB_OUTPUT_RETURN(FLB_OK);

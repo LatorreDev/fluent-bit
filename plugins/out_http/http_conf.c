@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@
 #include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_record_accessor.h>
+
 #ifdef FLB_HAVE_SIGNV4
 #ifdef FLB_HAVE_AWS
 #include <fluent-bit/flb_aws_credentials.h>
@@ -208,13 +209,15 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
 
     /* Output format */
     ctx->out_format = FLB_PACK_JSON_FORMAT_NONE;
-    tmp = flb_output_get_property("format", ins);
-    if (tmp) {
-        if (strcasecmp(tmp, "gelf") == 0) {
+    if (ctx->format) {
+        if (strcasecmp(ctx->format, "gelf") == 0) {
             ctx->out_format = FLB_HTTP_OUT_GELF;
         }
+        else if (strcasecmp(ctx->format, "msgpack") == 0) {
+            ctx->out_format = FLB_HTTP_OUT_MSGPACK;
+        }
         else {
-            ret = flb_pack_to_json_format_type(tmp);
+            ret = flb_pack_to_json_format_type(ctx->format);
             if (ret == -1) {
                 flb_plg_error(ctx->ins, "unrecognized 'format' option. "
                               "Using 'msgpack'");
@@ -255,6 +258,17 @@ struct flb_out_http *flb_http_conf_create(struct flb_output_instance *ins,
     if (tmp) {
         if (strcasecmp(tmp, "gzip") == 0) {
             ctx->compress_gzip = FLB_TRUE;
+        }
+        else if (strcasecmp(tmp, "snappy") == 0) {
+            ctx->compress_snappy = FLB_TRUE;
+        }
+        else if (strcasecmp(tmp, "zstd") == 0) {
+            ctx->compress_zstd = FLB_TRUE;
+        }
+        else {
+            flb_plg_error(ctx->ins, "invalid compress option '%s'", tmp);
+            flb_free(ctx);
+            return NULL;
         }
     }
 

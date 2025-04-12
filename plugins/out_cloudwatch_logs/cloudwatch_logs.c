@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -50,14 +50,40 @@ static struct flb_aws_header content_type_header = {
     .val_len = 26,
 };
 
+static int validate_log_group_class(struct flb_cloudwatch *ctx)
+{
+    if (ctx->create_group == FLB_FALSE) {
+        return 0;
+    }
+
+    if (ctx->log_group_class == NULL || strlen(ctx->log_group_class) == 0) {
+        ctx->log_group_class_type = LOG_CLASS_DEFAULT_TYPE;
+        ctx->log_group_class = LOG_CLASS_STANDARD;
+        return 0;
+    } else if (strncmp(ctx->log_group_class, LOG_CLASS_STANDARD, LOG_CLASS_STANDARD_LEN) == 0) {
+        flb_plg_debug(ctx->ins, "Using explicitly configured `log_group_class %s`, which is the default log class.", ctx->log_group_class);
+        ctx->log_group_class_type = LOG_CLASS_STANDARD_TYPE;
+        return 0;
+    } else if (strncmp(ctx->log_group_class, LOG_CLASS_INFREQUENT_ACCESS, LOG_CLASS_INFREQUENT_ACCESS_LEN) == 0) {
+        flb_plg_warn(ctx->ins, "Configured `log_group_class %s` will only apply to log groups created by Fluent Bit. "
+                     "Look for the `Created log group` info level message emitted when a group does not already exist and is created.", ctx->log_group_class);
+        ctx->log_group_class_type = LOG_CLASS_INFREQUENT_ACCESS_TYPE;
+        return 0;
+    }
+
+    flb_plg_error(ctx->ins, "The valid values for log_group_class are {%s, %s}. Invalid input was %s", LOG_CLASS_STANDARD, LOG_CLASS_INFREQUENT_ACCESS, ctx->log_group_class);
+
+    return -1;
+}
+
 static int cb_cloudwatch_init(struct flb_output_instance *ins,
                               struct flb_config *config, void *data)
 {
     const char *tmp;
     char *session_name = NULL;
     struct flb_cloudwatch *ctx = NULL;
-    struct cw_flush *buf = NULL;
     int ret;
+    flb_sds_t tmp_sds = NULL;
     (void) config;
     (void) data;
 
@@ -184,9 +210,8 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
 
     ctx->create_group = FLB_FALSE;
     tmp = flb_output_get_property("auto_create_group", ins);
-    /* native plugins use On/Off as bool, the old Go plugin used true/false */
-    if (tmp && (strcasecmp(tmp, "On") == 0 || strcasecmp(tmp, "true") == 0)) {
-        ctx->create_group = FLB_TRUE;
+    if (tmp) {
+        ctx->create_group = flb_utils_bool(tmp);
     }
 
     ctx->retry_requests = FLB_TRUE;
@@ -212,18 +237,14 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
         ctx->sts_endpoint = (char *) tmp;
     }
 
-    /* init log streams */
-    if (ctx->log_stream_name) {
-        ctx->stream.name = flb_sds_create(ctx->log_stream_name);
-        if (!ctx->stream.name) {
-            flb_errno();
-            goto error;
-        }
-        ctx->stream_created = FLB_FALSE;
+    ret = validate_log_group_class(ctx);
+    if (ret < 0) {
+        goto error;
     }
 
     /* one tls instance for provider, one for cw client */
-    ctx->cred_tls = flb_tls_create(FLB_TRUE,
+    ctx->cred_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                   FLB_TRUE,
                                    ins->tls_debug,
                                    ins->tls_vhost,
                                    ins->tls_ca_path,
@@ -237,7 +258,8 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
         goto error;
     }
 
-    ctx->client_tls = flb_tls_create(FLB_TRUE,
+    ctx->client_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                     ins->tls_verify,
                                      ins->tls_debug,
                                      ins->tls_vhost,
                                      ins->tls_ca_path,
@@ -255,7 +277,8 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
                                                            (char *) ctx->region,
                                                            (char *) ctx->sts_endpoint,
                                                            NULL,
-                                                           flb_aws_client_generator());
+                                                           flb_aws_client_generator(),
+                                                           (char *) ctx->profile);
     if (!ctx->aws_provider) {
         flb_plg_error(ctx->ins, "Failed to create AWS Credential Provider");
         goto error;
@@ -271,7 +294,8 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
         }
 
         /* STS provider needs yet another separate TLS instance */
-        ctx->sts_tls = flb_tls_create(FLB_TRUE,
+        ctx->sts_tls = flb_tls_create(FLB_TLS_CLIENT_MODE,
+                                      FLB_TRUE,
                                       ins->tls_debug,
                                       ins->tls_vhost,
                                       ins->tls_ca_path,
@@ -328,66 +352,31 @@ static int cb_cloudwatch_init(struct flb_output_instance *ins,
     ctx->cw_client->provider = ctx->aws_provider;
     ctx->cw_client->region = (char *) ctx->region;
     ctx->cw_client->service = "logs";
-    ctx->cw_client->port = 443;
-    ctx->cw_client->flags = 0;
+    ctx->cw_client->port = (ins->host.port != 0) ? ins->host.port : 443;
+    ctx->cw_client->flags = (ins->use_tls) ? FLB_IO_TLS : FLB_IO_TCP;
     ctx->cw_client->proxy = NULL;
     ctx->cw_client->static_headers = &content_type_header;
     ctx->cw_client->static_headers_len = 1;
-    ctx->cw_client->extra_user_agent = (char *) ctx->extra_user_agent;
+    tmp_sds = flb_sds_create(ctx->extra_user_agent);
+    if (!tmp_sds) {
+        flb_errno();
+        goto error;
+    }
+    ctx->cw_client->extra_user_agent = tmp_sds;
     ctx->cw_client->retry_requests = ctx->retry_requests;
 
     struct flb_upstream *upstream = flb_upstream_create(config, ctx->endpoint,
-                                                        443, FLB_IO_TLS,
+                                                        ctx->cw_client->port,
+                                                        ctx->cw_client->flags,
                                                         ctx->client_tls);
     if (!upstream) {
         flb_plg_error(ctx->ins, "Connection initialization error");
         goto error;
     }
 
-    /*
-     * Remove async flag from upstream
-     * CW output runs in sync mode; because the CW API currently requires
-     * PutLogEvents requests to a log stream to be made serially
-     */
-    upstream->flags &= ~(FLB_IO_ASYNC);
-
     ctx->cw_client->upstream = upstream;
     flb_output_upstream_set(upstream, ctx->ins);
     ctx->cw_client->host = ctx->endpoint;
-
-    /* alloc the payload/processing buffer */
-    buf = flb_calloc(1, sizeof(struct cw_flush));
-    if (!buf) {
-        flb_errno();
-        goto error;
-    }
-
-    buf->out_buf = flb_malloc(PUT_LOG_EVENTS_PAYLOAD_SIZE);
-    if (!buf->out_buf) {
-        flb_errno();
-        cw_flush_destroy(buf);
-        goto error;
-    }
-    buf->out_buf_size = PUT_LOG_EVENTS_PAYLOAD_SIZE;
-
-    buf->tmp_buf = flb_malloc(sizeof(char) * PUT_LOG_EVENTS_PAYLOAD_SIZE);
-    if (!buf->tmp_buf) {
-        flb_errno();
-        cw_flush_destroy(buf);
-        goto error;
-    }
-    buf->tmp_buf_size = PUT_LOG_EVENTS_PAYLOAD_SIZE;
-
-    buf->events = flb_malloc(sizeof(struct cw_event) * MAX_EVENTS_PER_PUT);
-    if (!buf->events) {
-        flb_errno();
-        cw_flush_destroy(buf);
-        goto error;
-    }
-    buf->events_capacity = MAX_EVENTS_PER_PUT;
-
-    ctx->buf = buf;
-
 
     /* Export context */
     flb_output_set_context(ins, ctx);
@@ -401,6 +390,43 @@ error:
     return -1;
 }
 
+struct cw_flush *new_buffer()
+{
+    struct cw_flush *buf;
+
+    buf = flb_calloc(1, sizeof(struct cw_flush));
+    if (!buf) {
+        flb_errno();
+        return NULL;
+    }
+
+    buf->out_buf = flb_malloc(PUT_LOG_EVENTS_PAYLOAD_SIZE);
+    if (!buf->out_buf) {
+        flb_errno();
+        cw_flush_destroy(buf);
+        return NULL;
+    }
+    buf->out_buf_size = PUT_LOG_EVENTS_PAYLOAD_SIZE;
+
+    buf->tmp_buf = flb_malloc(sizeof(char) * PUT_LOG_EVENTS_PAYLOAD_SIZE);
+    if (!buf->tmp_buf) {
+        flb_errno();
+        cw_flush_destroy(buf);
+        return NULL;
+    }
+    buf->tmp_buf_size = PUT_LOG_EVENTS_PAYLOAD_SIZE;
+
+    buf->events = flb_malloc(sizeof(struct cw_event) * MAX_EVENTS_PER_PUT);
+    if (!buf->events) {
+        flb_errno();
+        cw_flush_destroy(buf);
+        return NULL;
+    }
+    buf->events_capacity = MAX_EVENTS_PER_PUT;
+
+    return buf;
+}
+
 static void cb_cloudwatch_flush(struct flb_event_chunk *event_chunk,
                                 struct flb_output_flush *out_flush,
                                 struct flb_input_instance *i_ins,
@@ -412,15 +438,22 @@ static void cb_cloudwatch_flush(struct flb_event_chunk *event_chunk,
     (void) i_ins;
     (void) config;
 
-    event_count = process_and_send(ctx, i_ins->p->name, ctx->buf, event_chunk->tag,
-                                   event_chunk->data, event_chunk->size);
-    if (event_count < 0) {
-        flb_plg_error(ctx->ins, "Failed to send events");
+    struct cw_flush *buf;
+
+    buf = new_buffer();
+    if (!buf) {
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
 
-    // TODO: this msg is innaccurate if events are skipped
-    flb_plg_debug(ctx->ins, "Sent %d events to CloudWatch", event_count);
+    event_count = process_and_send(ctx, i_ins->p->name, buf, event_chunk->tag, event_chunk->data, event_chunk->size,
+                                   event_chunk->type);
+    if (event_count < 0) {
+        flb_plg_error(ctx->ins, "Failed to send events");
+        cw_flush_destroy(buf);
+        FLB_OUTPUT_RETURN(FLB_RETRY);
+    }
+
+    cw_flush_destroy(buf);
 
     FLB_OUTPUT_RETURN(FLB_OK);
 }
@@ -434,10 +467,6 @@ void flb_cloudwatch_ctx_destroy(struct flb_cloudwatch *ctx)
     if (ctx != NULL) {
         if (ctx->base_aws_provider) {
             flb_aws_provider_destroy(ctx->base_aws_provider);
-        }
-
-        if (ctx->buf) {
-            cw_flush_destroy(ctx->buf);
         }
 
         if (ctx->aws_provider) {
@@ -480,19 +509,14 @@ void flb_cloudwatch_ctx_destroy(struct flb_cloudwatch *ctx)
             flb_sds_destroy(ctx->stream_name);
         }
 
-        if (ctx->log_stream_name) {
-            if (ctx->stream.name) {
-                flb_sds_destroy(ctx->stream.name);
-            }
-            if (ctx->stream.sequence_token) {
-                flb_sds_destroy(ctx->stream.sequence_token);
-            }
-        } else {
-            mk_list_foreach_safe(head, tmp, &ctx->streams) {
-                stream = mk_list_entry(head, struct log_stream, _head);
-                mk_list_del(&stream->_head);
-                log_stream_destroy(stream);
-            }
+        if (ctx->metric_namespace) {
+            flb_sds_destroy(ctx->metric_namespace);
+        }
+
+        mk_list_foreach_safe(head, tmp, &ctx->streams) {
+            stream = mk_list_entry(head, struct log_stream, _head);
+            mk_list_del(&stream->_head);
+            log_stream_destroy(stream);
         }
         flb_free(ctx);
     }
@@ -511,9 +535,6 @@ void log_stream_destroy(struct log_stream *stream)
     if (stream) {
         if (stream->name) {
             flb_sds_destroy(stream->name);
-        }
-        if (stream->sequence_token) {
-            flb_sds_destroy(stream->sequence_token);
         }
         if (stream->group) {
             flb_sds_destroy(stream->group);
@@ -655,6 +676,19 @@ static struct flb_config_map config_map[] = {
      "is 'd1,d2;d3', we will consider it as [[d1, d2],[d3]]."
     },
 
+    {
+     FLB_CONFIG_MAP_STR, "profile", NULL,
+     0, FLB_TRUE, offsetof(struct flb_cloudwatch, profile),
+     "AWS Profile name. AWS Profiles can be configured with AWS CLI and are usually stored in "
+     "$HOME/.aws/ directory."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "log_group_class", "",
+     0, FLB_TRUE, offsetof(struct flb_cloudwatch, log_group_class),
+     "Specify the log storage class. Valid values are STANDARD (default) and INFREQUENT_ACCESS."
+    },
+
     /* EOF */
     {0}
 };
@@ -668,6 +702,7 @@ struct flb_output_plugin out_cloudwatch_logs_plugin = {
     .cb_exit      = cb_cloudwatch_exit,
     .flags        = 0,
     .workers      = 1,
+    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS,
 
     /* Configuration */
     .config_map     = config_map,

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 #include "http.h"
 #include "http_conn.h"
+#include "http_prot.h"
 #include "http_config.h"
 
 /*
@@ -34,36 +35,50 @@
 static int in_http_collect(struct flb_input_instance *ins,
                            struct flb_config *config, void *in_context)
 {
-    int fd;
-    struct flb_http *ctx = in_context;
-    struct http_conn *conn;
+    struct flb_connection *connection;
+    struct http_conn      *conn;
+    struct flb_http       *ctx;
 
-    /* Accept the new connection */
-    fd = flb_net_accept(ctx->server_fd);
-    if (fd == -1) {
+    ctx = in_context;
+
+    connection = flb_downstream_conn_get(ctx->downstream);
+
+    if (connection == NULL) {
         flb_plg_error(ctx->ins, "could not accept new connection");
+
         return -1;
     }
 
-    flb_plg_trace(ctx->ins, "new TCP connection arrived FD=%i", fd);
-    conn = http_conn_add(fd, ctx);
-    if (!conn) {
+    flb_plg_trace(ctx->ins, "new TCP connection arrived FD=%i",
+                  connection->fd);
+
+    conn = http_conn_add(connection, ctx);
+
+    if (conn == NULL) {
+        flb_downstream_conn_release(connection);
+
         return -1;
     }
+
     return 0;
 }
 
 static int in_http_init(struct flb_input_instance *ins,
                         struct flb_config *config, void *data)
 {
-    int ret;
-    struct flb_http *ctx;
+    unsigned short int  port;
+    int                 ret;
+    struct flb_http    *ctx;
+
+    (void) data;
 
     /* Create context and basic conf */
     ctx = http_config_create(ins);
     if (!ctx) {
         return -1;
     }
+
+    ctx->collector_id = -1;
 
     /* Populate context with config map defaults and incoming properties */
     ret = flb_input_config_map_set(ins, (void *) ctx);
@@ -76,18 +91,68 @@ static int in_http_init(struct flb_input_instance *ins,
     /* Set the context */
     flb_input_set_context(ins, ctx);
 
-    ctx->evl = config->evl;
+    port = (unsigned short int) strtoul(ctx->tcp_port, NULL, 10);
 
-    /* Create HTTP listener */
-    ctx->server_fd = flb_net_server(ctx->tcp_port, ctx->listen);
-    if (ctx->server_fd > 0) {
-        flb_plg_info(ctx->ins, "listening on %s:%s", ctx->listen, ctx->tcp_port);
+    if (ctx->enable_http2) {
+        ret = flb_http_server_init(&ctx->http_server,
+                                    HTTP_PROTOCOL_VERSION_AUTODETECT,
+                                    (FLB_HTTP_SERVER_FLAG_KEEPALIVE | FLB_HTTP_SERVER_FLAG_AUTO_INFLATE),
+                                    NULL,
+                                    ins->host.listen,
+                                    ins->host.port,
+                                    ins->tls,
+                                    ins->flags,
+                                    &ins->net_setup,
+                                    flb_input_event_loop_get(ins),
+                                    ins->config,
+                                    (void *) ctx);
+
+        if (ret != 0) {
+            flb_plg_error(ctx->ins,
+                          "could not initialize http server on %s:%u. Aborting",
+                          ins->host.listen, ins->host.port);
+
+            http_config_destroy(ctx);
+
+            return -1;
+        }
+
+        ret = flb_http_server_start(&ctx->http_server);
+
+        if (ret != 0) {
+            flb_plg_error(ctx->ins,
+                          "could not start http server on %s:%u. Aborting",
+                          ins->host.listen, ins->host.port);
+
+            http_config_destroy(ctx);
+
+            return -1;
+        }
+
+        ctx->http_server.request_callback = http_prot_handle_ng;
+
+        flb_input_downstream_set(ctx->http_server.downstream, ctx->ins);
     }
     else {
-        flb_plg_error(ctx->ins, "could not bind address %s:%s. Aborting",
-                      ctx->listen, ctx->tcp_port);
-        http_config_destroy(ctx);
-        return -1;
+        ctx->downstream = flb_downstream_create(FLB_TRANSPORT_TCP,
+                                                ins->flags,
+                                                ctx->listen,
+                                                port,
+                                                ins->tls,
+                                                config,
+                                                &ins->net_setup);
+
+        if (ctx->downstream == NULL) {
+            flb_plg_error(ctx->ins,
+                        "could not initialize downstream on %s:%s. Aborting",
+                        ctx->listen, ctx->tcp_port);
+
+            http_config_destroy(ctx);
+
+            return -1;
+        }
+
+        flb_input_downstream_set(ctx->downstream, ctx->ins);
     }
 
     if (ctx->successful_response_code != 200 &&
@@ -98,18 +163,20 @@ static int in_http_init(struct flb_input_instance *ins,
         ctx->successful_response_code = 201;
     }
 
-    /* Set the socket non-blocking */
-    flb_net_socket_nonblocking(ctx->server_fd);
+    if (!ctx->enable_http2) {
+        /* Collect upon data available on the standard input */
+        ret = flb_input_set_collector_socket(ins,
+                                            in_http_collect,
+                                            ctx->downstream->server_fd,
+                                            config);
+        if (ret == -1) {
+            flb_plg_error(ctx->ins, "Could not set collector for IN_TCP input plugin");
+            http_config_destroy(ctx);
 
-    /* Collect upon data available on the standard input */
-    ret = flb_input_set_collector_socket(ins,
-                                         in_http_collect,
-                                         ctx->server_fd,
-                                         config);
-    if (ret == -1) {
-        flb_plg_error(ctx->ins, "Could not set collector for IN_TCP input plugin");
-        http_config_destroy(ctx);
-        return -1;
+            return -1;
+        }
+
+        ctx->collector_id = ret;
     }
 
     return 0;
@@ -117,24 +184,27 @@ static int in_http_init(struct flb_input_instance *ins,
 
 static int in_http_exit(void *data, struct flb_config *config)
 {
-    struct flb_http *ctx = data;
+    struct flb_http *ctx;
+
     (void) config;
 
-    if (!ctx) {
-        return 0;
+    ctx = data;
+
+    if (ctx != NULL) {
+        http_config_destroy(ctx);
     }
 
-    if (ctx->server_fd >= 0) {
-        flb_socket_close(ctx->server_fd);
-        ctx->server_fd = -1;
-    }
-
-    http_config_destroy(ctx);
     return 0;
 }
 
 /* Configuration properties map */
 static struct flb_config_map config_map[] = {
+    {
+     FLB_CONFIG_MAP_BOOL, "http2", "true",
+     0, FLB_TRUE, offsetof(struct flb_http, enable_http2),
+     NULL
+    },
+
     {
      FLB_CONFIG_MAP_SIZE, "buffer_max_size", HTTP_BUFFER_MAX_SIZE,
      0, FLB_TRUE, offsetof(struct flb_http, buffer_max_size),
@@ -145,6 +215,12 @@ static struct flb_config_map config_map[] = {
      FLB_CONFIG_MAP_SIZE, "buffer_chunk_size", HTTP_BUFFER_CHUNK_SIZE,
      0, FLB_TRUE, offsetof(struct flb_http, buffer_chunk_size),
      ""
+    },
+
+    {
+     FLB_CONFIG_MAP_SLIST_1, "success_header", NULL,
+     FLB_CONFIG_MAP_MULT, FLB_TRUE, offsetof(struct flb_http, success_headers),
+     "Add an HTTP header key/value pair on success. Multiple headers can be set"
     },
 
     {
@@ -175,5 +251,5 @@ struct flb_input_plugin in_http_plugin = {
     .cb_resume    = NULL,
     .cb_exit      = in_http_exit,
     .config_map   = config_map,
-    .flags        = FLB_INPUT_NET,
+    .flags        = FLB_INPUT_NET_SERVER | FLB_IO_OPT_TLS
 };

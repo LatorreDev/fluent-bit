@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_downstream.h>
 #include <fluent-bit/flb_input_plugin.h>
 
 #include "fw.h"
@@ -35,6 +36,25 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
     config = flb_calloc(1, sizeof(struct flb_in_fw_config));
     if (!config) {
         flb_errno();
+        return NULL;
+    }
+    config->coll_fd = -1;
+
+    config->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (config->log_encoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event encoder");
+        fw_config_destroy(config);
+
+        return NULL;
+    }
+
+    config->log_decoder = flb_log_event_decoder_create(NULL, 0);
+
+    if (config->log_decoder == NULL) {
+        flb_plg_error(i_ins, "could not initialize event decoder");
+        fw_config_destroy(config);
+
         return NULL;
     }
 
@@ -64,17 +84,56 @@ struct flb_in_fw_config *fw_config_init(struct flb_input_instance *i_ins)
         flb_debug("[in_fw] Listen='%s' TCP_Port=%s",
                   config->listen, config->tcp_port);
     }
+
+    /* Shared Key */
+    if (config->empty_shared_key) {
+        if (config->shared_key) {
+            flb_sds_destroy(config->shared_key);
+        }
+        config->shared_key = flb_sds_create("");
+    }
+
+    /* Self Hostname */
+    p = flb_input_get_property("self_hostname", i_ins);
+    if (p) {
+        config->self_hostname = flb_sds_create(p);
+    }
+    else {
+        config->self_hostname = flb_sds_create("localhost");
+    }
     return config;
 }
 
 int fw_config_destroy(struct flb_in_fw_config *config)
 {
+    if (config->log_encoder != NULL) {
+        flb_log_event_encoder_destroy(config->log_encoder);
+    }
+
+    if (config->log_decoder != NULL) {
+        flb_log_event_decoder_destroy(config->log_decoder);
+    }
+
+    if (config->coll_fd != -1) {
+        flb_input_collector_delete(config->coll_fd, config->ins);
+
+        config->coll_fd = -1;
+    }
+
+    if (config->downstream != NULL) {
+        flb_downstream_destroy(config->downstream);
+    }
+
     if (config->unix_path) {
         unlink(config->unix_path);
     }
     else {
         flb_free(config->tcp_port);
     }
+
+    flb_sds_destroy(config->shared_key);
+    flb_sds_destroy(config->self_hostname);
+
     flb_free(config);
 
     return 0;

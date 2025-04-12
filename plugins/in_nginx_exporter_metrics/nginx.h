@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -45,7 +45,7 @@ struct nginx_ctx
     struct cmt_gauge *connections_waiting;
     struct cmt_gauge *connection_up;
     bool is_up;
-    bool is_nginx_plus;
+    int is_nginx_plus;
     int nginx_plus_version;
 
     struct nginx_plus_connections *plus_connections;

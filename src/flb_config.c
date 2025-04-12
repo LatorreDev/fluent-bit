@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 #include <fluent-bit/flb_str.h>
 #include <fluent-bit/flb_kv.h>
 #include <fluent-bit/flb_env.h>
+#include <fluent-bit/flb_meta.h>
 #include <fluent-bit/flb_macros.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_parser.h>
@@ -124,6 +125,10 @@ struct flb_service_config service_configs[] = {
      FLB_CONF_TYPE_BOOL,
      offsetof(struct flb_config, dns_prefer_ipv4)},
 
+    {FLB_CONF_DNS_PREFER_IPV6,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, dns_prefer_ipv6)},
+
     /* Storage */
     {FLB_CONF_STORAGE_PATH,
      FLB_CONF_TYPE_STR,
@@ -143,6 +148,12 @@ struct flb_service_config service_configs[] = {
     {FLB_CONF_STORAGE_MAX_CHUNKS_UP,
      FLB_CONF_TYPE_INT,
      offsetof(struct flb_config, storage_max_chunks_up)},
+    {FLB_CONF_STORAGE_DELETE_IRRECOVERABLE_CHUNKS,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, storage_del_bad_chunks)},
+    {FLB_CONF_STORAGE_TRIM_FILES,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, storage_trim_files)},
 
     /* Coroutines */
     {FLB_CONF_STR_CORO_STACK_SIZE,
@@ -161,7 +172,24 @@ struct flb_service_config service_configs[] = {
     {FLB_CONF_STR_STREAMS_FILE,
      FLB_CONF_TYPE_STR,
      offsetof(struct flb_config, stream_processor_file)},
+    {FLB_CONF_STR_STREAMS_STR_CONV,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, stream_processor_str_conv)},
 #endif
+
+#ifdef FLB_HAVE_CHUNK_TRACE
+    {FLB_CONF_STR_ENABLE_CHUNK_TRACE,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, enable_chunk_trace)},
+#endif
+
+    {FLB_CONF_STR_HOT_RELOAD,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, enable_hot_reload)},
+
+    {FLB_CONF_STR_HOT_RELOAD_ENSURE_THREAD_SAFETY,
+     FLB_CONF_TYPE_BOOL,
+     offsetof(struct flb_config, ensure_thread_safety_on_hot_reloading)},
 
     {NULL, FLB_CONF_TYPE_OTHER, 0} /* end of array */
 };
@@ -193,6 +221,7 @@ struct flb_config *flb_config_init()
     /* Initialize config_format context */
     cf = flb_cf_create();
     if (!cf) {
+        flb_free(config);
         return NULL;
     }
     config->cf_main = cf;
@@ -200,6 +229,7 @@ struct flb_config *flb_config_init()
     section = flb_cf_section_create(cf, "service", 0);
     if (!section) {
         flb_cf_destroy(cf);
+        flb_free(config);
         return NULL;
     }
 
@@ -244,12 +274,22 @@ struct flb_config *flb_config_init()
         }
     }
 
+    /* Routing */
+    flb_routes_mask_set_size(1, config);
+
     config->cio          = NULL;
     config->storage_path = NULL;
     config->storage_input_plugin = NULL;
+    config->storage_metrics = FLB_TRUE;
 
     config->sched_cap  = FLB_SCHED_CAP;
     config->sched_base = FLB_SCHED_BASE;
+
+    /* reload */
+    config->ensure_thread_safety_on_hot_reloading = FLB_TRUE;
+    config->hot_reloaded_count = 0;
+    config->shutdown_by_hot_reloading = FLB_FALSE;
+    config->hot_reloading = FLB_FALSE;
 
 #ifdef FLB_HAVE_SQLDB
     mk_list_init(&config->sqldb_list);
@@ -261,7 +301,10 @@ struct flb_config *flb_config_init()
 
 #ifdef FLB_HAVE_STREAM_PROCESSOR
     flb_slist_create(&config->stream_processor_tasks);
+    config->stream_processor_str_conv = FLB_TRUE;
 #endif
+
+    flb_slist_create(&config->external_plugins);
 
     /* Set default coroutines stack size */
     config->coro_stack_size = FLB_CORO_STACK_SIZE_BYTE;
@@ -275,7 +318,7 @@ struct flb_config *flb_config_init()
     pthread_mutex_init(&config->collectors_mutex, NULL);
 
     /* Initialize linked lists */
-    mk_list_init(&config->custom_plugins);
+    mk_list_init(&config->processor_plugins);
     mk_list_init(&config->custom_plugins);
     mk_list_init(&config->in_plugins);
     mk_list_init(&config->parser_plugins);
@@ -289,17 +332,39 @@ struct flb_config *flb_config_init()
     mk_list_init(&config->proxies);
     mk_list_init(&config->workers);
     mk_list_init(&config->upstreams);
+    mk_list_init(&config->downstreams);
     mk_list_init(&config->cmetrics);
     mk_list_init(&config->cf_parsers_list);
 
-    memset(&config->tasks_map, '\0', sizeof(config->tasks_map));
+    /* Task map */
+    ret = flb_config_task_map_resize(config, FLB_CONFIG_DEFAULT_TASK_MAP_SIZE);
+
+    if (ret != 0) {
+        flb_error("[config] task map resize failed");
+        flb_config_exit(config);
+        return NULL;
+    }
+
+    /* Initialize multiline-parser list. We need this here, because from now
+     * on we use flb_config_exit to cleanup the config, which requires
+     * the config->multiline_parsers list to be initialized. */
+    mk_list_init(&config->multiline_parsers);
 
     /* Environment */
     config->env = flb_env_create();
+    if (config->env == NULL) {
+        flb_error("[config] environment creation failed");
+        flb_config_exit(config);
+        return NULL;
+    }
 
     /* Multiline core */
-    mk_list_init(&config->multiline_parsers);
-    flb_ml_init(config);
+    ret = flb_ml_init(config);
+    if (ret == -1) {
+        flb_error("[config] multiline core initialization failed");
+        flb_config_exit(config);
+        return NULL;
+    }
 
     /* Register static plugins */
     ret = flb_plugins_register(config);
@@ -335,12 +400,12 @@ void flb_config_exit(struct flb_config *config)
     struct mk_list *head;
     struct flb_cf *cf;
 
-    if (config->log_file) {
-        flb_free(config->log_file);
-    }
-
     if (config->log) {
         flb_log_destroy(config->log, config);
+    }
+
+    if (config->log_file) {
+        flb_free(config->log_file);
     }
 
     if (config->parsers_file) {
@@ -352,8 +417,7 @@ void flb_config_exit(struct flb_config *config)
     }
 
     if (config->kernel) {
-        flb_free(config->kernel->s_version.data);
-        flb_free(config->kernel);
+        flb_kernel_destroy(config->kernel);
     }
 
     /* release resources */
@@ -363,8 +427,7 @@ void flb_config_exit(struct flb_config *config)
 
     /* Pipe */
     if (config->ch_data[0]) {
-        mk_event_closesocket(config->ch_data[0]);
-        mk_event_closesocket(config->ch_data[1]);
+        flb_pipe_destroy(config->ch_data);
     }
 
     /* Channel manager */
@@ -383,7 +446,9 @@ void flb_config_exit(struct flb_config *config)
         }
     }
 
-    flb_env_destroy(config->env);
+    if (config->env) {
+        flb_env_destroy(config->env);
+    }
 
     /* Program name */
     if (config->program_name) {
@@ -395,24 +460,35 @@ void flb_config_exit(struct flb_config *config)
         flb_free(config->conf_path);
     }
 
+    /* conf path file (file system config path) */
+    if (config->conf_path_file) {
+        flb_sds_destroy(config->conf_path_file);
+    }
+
     /* Working directory */
     if (config->workdir) {
         flb_free(config->workdir);
     }
 
     /* Destroy any DSO context */
-    flb_plugin_destroy(config->dso_plugins);
+    if (config->dso_plugins) {
+        flb_plugin_destroy(config->dso_plugins);
+    }
 
     /* Workers */
     flb_worker_exit(config);
 
     /* Event flush */
     if (config->evl) {
-        mk_event_timeout_destroy(config->evl, &config->event_flush);
+        if (config->event_flush.status != MK_EVENT_NONE) {
+            mk_event_timeout_destroy(config->evl, &config->event_flush);
+        }
     }
 
     /* Release scheduler */
-    flb_sched_destroy(config->sched);
+    if (config->sched) {
+        flb_sched_destroy(config->sched);
+    }
 
 #ifdef FLB_HAVE_HTTP_SERVER
     if (config->http_listen) {
@@ -454,6 +530,8 @@ void flb_config_exit(struct flb_config *config)
     flb_slist_destroy(&config->stream_processor_tasks);
 #endif
 
+    flb_slist_destroy(&config->external_plugins);
+
     if (config->evl) {
         mk_event_loop_destroy(config->evl);
     }
@@ -467,12 +545,21 @@ void flb_config_exit(struct flb_config *config)
         flb_cf_destroy(config->cf_main);
     }
 
+    /* cf_opts' lifetime should differ from config's lifetime.
+     * This member should be storing just for the cf_opts reference.
+     * Don't destroy it here.
+     */
+
     /* remove parsers */
     mk_list_foreach_safe(head, tmp, &config->cf_parsers_list) {
         cf = mk_list_entry(head, struct flb_cf, _head);
         mk_list_del(&cf->_head);
         flb_cf_destroy(cf);
     }
+
+    /* release task map */
+    flb_config_task_map_resize(config, 0);
+    flb_routes_empty_mask_destroy(config);
 
     flb_free(config);
 }
@@ -635,4 +722,319 @@ int flb_config_set_program_name(struct flb_config *config, char *name)
     }
 
     return 0;
+}
+
+static int configure_plugins_type(struct flb_config *config, struct flb_cf *cf, enum section_type type)
+{
+    int ret;
+    char *tmp;
+    char *name;
+    char *s_type;
+    struct mk_list *list;
+    struct mk_list *head;
+    struct cfl_list *h_prop;
+    struct cfl_kvpair *kv;
+    struct cfl_variant *val;
+    struct flb_cf_section *s;
+    struct flb_cf_group *processors = NULL;
+    int i;
+    void *ins;
+
+    if (type == FLB_CF_CUSTOM) {
+        s_type = "custom";
+        list = &cf->customs;
+    }
+    else if (type == FLB_CF_INPUT) {
+        s_type = "input";
+        list = &cf->inputs;
+    }
+    else if (type == FLB_CF_FILTER) {
+        s_type = "filter";
+        list = &cf->filters;
+    }
+    else if (type == FLB_CF_OUTPUT) {
+        s_type = "output";
+        list = &cf->outputs;
+    }
+    else {
+        return -1;
+    }
+
+    mk_list_foreach(head, list) {
+        s = mk_list_entry(head, struct flb_cf_section, _head_section);
+        name = flb_cf_section_property_get_string(cf, s, "name");
+        if (!name) {
+            flb_error("[config] section '%s' is missing the 'name' property",
+                      s_type);
+            return -1;
+        }
+
+        /* translate the variable */
+        tmp = flb_env_var_translate(config->env, name);
+
+        /* create an instance of the plugin */
+        ins = NULL;
+        if (type == FLB_CF_CUSTOM) {
+            ins = flb_custom_new(config, tmp, NULL);
+        }
+        else if (type == FLB_CF_INPUT) {
+            ins = flb_input_new(config, tmp, NULL, FLB_TRUE);
+        }
+        else if (type == FLB_CF_FILTER) {
+            ins = flb_filter_new(config, tmp, NULL);
+        }
+        else if (type == FLB_CF_OUTPUT) {
+            ins = flb_output_new(config, tmp, NULL, FLB_TRUE);
+        }
+        flb_sds_destroy(tmp);
+
+        /* validate the instance creation */
+        if (!ins) {
+            flb_error("[config] section '%s' tried to instance a plugin name "
+                      "that doesn't exist", name);
+            flb_sds_destroy(name);
+            return -1;
+        }
+        flb_sds_destroy(name);
+
+        /*
+         * iterate section properties and populate instance by using specific
+         * api function.
+         */
+        cfl_list_foreach(h_prop, &s->properties->list) {
+            kv = cfl_list_entry(h_prop, struct cfl_kvpair, _head);
+            if (strcasecmp(kv->key, "name") == 0) {
+                continue;
+            }
+
+            /* set ret to -1 to ensure that we treat any unhandled plugin or
+             * value types as errors.
+             */
+            ret = -1;
+
+            if (type == FLB_CF_CUSTOM) {
+                if (kv->val->type == CFL_VARIANT_STRING) {
+                    ret = flb_custom_set_property(ins, kv->key, kv->val->data.as_string);
+                } else if (kv->val->type == CFL_VARIANT_ARRAY) {
+                    for (i = 0; i < kv->val->data.as_array->entry_count; i++) {
+                        val = kv->val->data.as_array->entries[i];
+                        ret = flb_custom_set_property(ins, kv->key, val->data.as_string);
+                    }
+                }
+            }
+            else if (type == FLB_CF_INPUT) {
+                 if (kv->val->type == CFL_VARIANT_STRING) {
+                    ret = flb_input_set_property(ins, kv->key, kv->val->data.as_string);
+                } else if (kv->val->type == CFL_VARIANT_ARRAY) {
+                    for (i = 0; i < kv->val->data.as_array->entry_count; i++) {
+                        val = kv->val->data.as_array->entries[i];
+                        ret = flb_input_set_property(ins, kv->key, val->data.as_string);
+                    }
+                }
+            }
+            else if (type == FLB_CF_FILTER) {
+                 if (kv->val->type == CFL_VARIANT_STRING) {
+                    ret = flb_filter_set_property(ins, kv->key, kv->val->data.as_string);
+                } else if (kv->val->type == CFL_VARIANT_ARRAY) {
+                    for (i = 0; i < kv->val->data.as_array->entry_count; i++) {
+                        val = kv->val->data.as_array->entries[i];
+                        ret = flb_filter_set_property(ins, kv->key, val->data.as_string);
+                    }
+                }
+            }
+            else if (type == FLB_CF_OUTPUT) {
+                 if (kv->val->type == CFL_VARIANT_STRING) {
+                    ret = flb_output_set_property(ins, kv->key, kv->val->data.as_string);
+                } else if (kv->val->type == CFL_VARIANT_ARRAY) {
+                    for (i = 0; i < kv->val->data.as_array->entry_count; i++) {
+                        val = kv->val->data.as_array->entries[i];
+                        ret = flb_output_set_property(ins, kv->key, val->data.as_string);
+                    }
+                }
+            }
+
+            if (ret == -1) {
+                flb_error("[config] could not configure property '%s' on "
+                          "%s plugin with section name '%s'",
+                          kv->key, s_type, name);
+            }
+        }
+
+        /* Processors */
+        processors = flb_cf_group_get(cf, s, "processors");
+        if (processors) {
+            if (type == FLB_CF_INPUT) {
+                flb_processors_load_from_config_format_group(((struct flb_input_instance *) ins)->processor, processors);
+            }
+            else if (type == FLB_CF_OUTPUT) {
+                flb_processors_load_from_config_format_group(((struct flb_output_instance *) ins)->processor, processors);
+            }
+            else {
+                flb_error("[config] section '%s' does not support processors", s_type);
+            }
+        }
+    }
+
+    return 0;
+}
+/* Load a struct flb_config_format context into a flb_config instance */
+int flb_config_load_config_format(struct flb_config *config, struct flb_cf *cf)
+{
+    int ret;
+    struct flb_kv *kv;
+    struct mk_list *head;
+    struct cfl_kvpair *ckv;
+    struct cfl_list *chead;
+    struct flb_cf_section *s;
+
+    /* Process config environment vars */
+    mk_list_foreach(head, &cf->env) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        ret = flb_env_set(config->env, kv->key, kv->val);
+        if (ret == -1) {
+            flb_error("could not set config environment variable '%s'", kv->key);
+            return -1;
+        }
+    }
+
+    /* Process all meta commands */
+    mk_list_foreach(head, &cf->metas) {
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        flb_meta_run(config, kv->key, kv->val);
+    }
+
+    /* Validate sections */
+    mk_list_foreach(head, &cf->sections) {
+        s = mk_list_entry(head, struct flb_cf_section, _head);
+
+        if (strcasecmp(s->name, "env") == 0 ||
+            strcasecmp(s->name, "service") == 0 ||
+            strcasecmp(s->name, "custom") == 0 ||
+            strcasecmp(s->name, "input") == 0 ||
+            strcasecmp(s->name, "filter") == 0 ||
+            strcasecmp(s->name, "output") == 0) {
+
+            /* continue on valid sections */
+            continue;
+        }
+
+        /* Extra sanity checks */
+        if (strcasecmp(s->name, "parser") == 0 ||
+            strcasecmp(s->name, "multiline_parser") == 0) {
+
+            /*
+             * Classic mode configuration don't allow parser or multiline_parser
+             * to be defined in the main configuration file.
+             */
+            if (cf->format == FLB_CF_CLASSIC) {
+                fprintf(stderr,
+                        "Sections 'multiline_parser' and 'parser' are not valid in "
+                        "the main configuration file. It belongs to \n"
+                        "the 'parsers_file' configuration files.\n");
+                return -1;
+            }
+            else {
+                /* Yaml allow parsers definitions in any Yaml file, all good */
+            }
+        }
+    }
+
+    /* Read main 'service' section */
+    s = cf->service;
+    if (s) {
+        /* Iterate properties */
+        cfl_list_foreach(chead, &s->properties->list) {
+            ckv = cfl_list_entry(chead, struct cfl_kvpair, _head);
+            flb_config_set_property(config, ckv->key, ckv->val->data.as_string);
+        }
+    }
+
+    ret = flb_parser_load_parser_definitions("", cf, config);
+    if (ret == -1) {
+        return -1;
+    }
+
+    ret = flb_parser_load_multiline_parser_definitions("", cf, config);
+    if (ret == -1) {
+        return -1;
+    }
+
+    ret = flb_plugin_load_config_format(cf, config);
+    if (ret == -1) {
+        return -1;
+    }
+
+    ret = configure_plugins_type(config, cf, FLB_CF_CUSTOM);
+    if (ret == -1) {
+        return -1;
+    }
+
+    ret = configure_plugins_type(config, cf, FLB_CF_INPUT);
+    if (ret == -1) {
+        return -1;
+    }
+    ret = configure_plugins_type(config, cf, FLB_CF_FILTER);
+    if (ret == -1) {
+        return -1;
+    }
+    ret = configure_plugins_type(config, cf, FLB_CF_OUTPUT);
+    if (ret == -1) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int flb_config_task_map_resize(struct flb_config *config, size_t new_size)
+{
+    struct flb_task_map *new_task_map;
+
+    if (new_size == config->task_map_size) {
+        return 0;
+    }
+
+    if (new_size == 0) {
+        if (config->task_map != NULL) {
+            flb_free(config->task_map);
+
+            config->task_map = NULL;
+            config->task_map_size = 0;
+        }
+
+        return 0;
+    }
+
+    if (config->task_map == NULL) {
+        new_task_map = flb_calloc(new_size, sizeof(struct flb_task_map));
+    }
+    else {
+        new_task_map = flb_realloc(config->task_map, new_size * sizeof(struct flb_task_map));
+    }
+
+    if (new_task_map == NULL) {
+        flb_errno();
+
+        return -1;
+    }
+
+    if (new_size > config->task_map_size) {
+        memset(&new_task_map[config->task_map_size],
+               0,
+               (new_size - config->task_map_size) * sizeof(struct flb_task_map));
+    }
+
+    config->task_map = new_task_map;
+    config->task_map_size = new_size;
+
+    return 0;
+}
+
+int flb_config_task_map_grow(struct flb_config *config)
+{
+    if (config->task_map_size >= FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_LIMIT) {
+        return -1;
+    }
+
+    return flb_config_task_map_resize(config,
+                                      config->task_map_size + FLB_CONFIG_DEFAULT_TASK_MAP_SIZE_GROWTH_SiZE);
 }

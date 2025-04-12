@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,14 @@
 #include <fluent-bit/flb_pack.h>
 #include <fluent-bit/flb_config_map.h>
 #include <fluent-bit/flb_metrics.h>
+#include <fluent-bit/flb_log_event_decoder.h>
+
+#include <ctraces/ctraces.h>
+#include <ctraces/ctr_decode_msgpack.h>
+
+#include <cprofiles/cprofiles.h>
+#include <cprofiles/cprof_encode_text.h>
+#include <cprofiles/cprof_decode_msgpack.h>
 
 #include <msgpack.h>
 #include "stdout.h"
@@ -101,28 +109,104 @@ static void print_metrics_text(struct flb_output_instance *ins,
 {
     int ret;
     size_t off = 0;
-    cmt_sds_t text;
+    cfl_sds_t text;
     struct cmt *cmt = NULL;
+    int ok = CMT_DECODE_MSGPACK_SUCCESS;
 
     /* get cmetrics context */
-    ret = cmt_decode_msgpack_create(&cmt, (char *) data, bytes, &off);
-    if (ret != 0) {
-        flb_plg_error(ins, "could not process metrics payload");
-        return;
+    while((ret = cmt_decode_msgpack_create(&cmt,
+                                           (char *) data,
+                                           bytes, &off)) == ok) {
+        if (ret != 0) {
+            flb_plg_error(ins, "could not process metrics payload");
+            return;
+        }
+
+        /* convert to text representation */
+        text = cmt_encode_text_create(cmt);
+
+        /* destroy cmt context */
+        cmt_destroy(cmt);
+
+        printf("%s", text);
+        fflush(stdout);
+
+        cmt_encode_text_destroy(text);
     }
 
-    /* convert to text representation */
-    text = cmt_encode_text_create(cmt);
-
-    /* destroy cmt context */
-    cmt_destroy(cmt);
-
-    printf("%s", text);
-    fflush(stdout);
-
-    cmt_encode_text_destroy(text);
+    if (ret != ok) {
+        flb_plg_debug(ins, "cmt decode msgpack returned : %d", ret);
+    }
 }
 #endif
+
+static void print_traces_text(struct flb_output_instance *ins,
+                              const void *data, size_t bytes)
+{
+    int ret;
+    size_t off = 0;
+    cfl_sds_t text;
+    struct ctrace *ctr = NULL;
+    int ok = CTR_DECODE_MSGPACK_SUCCESS;
+
+    /* Decode each ctrace context */
+    while ((ret = ctr_decode_msgpack_create(&ctr,
+                                            (char *) data,
+                                            bytes, &off)) == ok) {
+        /* convert to text representation */
+        text = ctr_encode_text_create(ctr);
+
+        /* destroy ctr context */
+        ctr_destroy(ctr);
+
+        printf("%s", text);
+        fflush(stdout);
+
+        ctr_encode_text_destroy(text);
+    }
+    if (ret != ok) {
+        flb_plg_debug(ins, "ctr decode msgpack returned : %d", ret);
+    }
+}
+
+static void print_profiles_text(struct flb_output_instance *ins,
+                                const void *data, size_t bytes)
+{
+    int ret;
+    size_t off;
+    cfl_sds_t text;
+    struct cprof *profiles_context;
+
+    profiles_context = NULL;
+    off = 0;
+
+    /* Decode each profiles context */
+    while ((ret = cprof_decode_msgpack_create(&profiles_context,
+                                              (unsigned char *) data,
+                                              bytes, &off)) ==
+                                                CPROF_DECODE_MSGPACK_SUCCESS) {
+        /* convert to text representation */
+        ret = cprof_encode_text_create(&text, profiles_context);
+
+        if (ret != CPROF_ENCODE_TEXT_SUCCESS) {
+            flb_plg_debug(ins, "cprofiles text encoder returned : %d", ret);
+
+            continue;
+        }
+
+        /* destroy ctr context */
+        cprof_decode_msgpack_destroy(profiles_context);
+
+        printf("%s", text);
+        fflush(stdout);
+
+        cprof_encode_text_destroy(text);
+    }
+
+    if (ret != CPROF_DECODE_MSGPACK_SUCCESS) {
+        flb_plg_debug(ins, "cprofiles msgpack decoder returned : %d", ret);
+    }
+}
 
 static void cb_stdout_flush(struct flb_event_chunk *event_chunk,
                             struct flb_output_flush *out_flush,
@@ -130,24 +214,42 @@ static void cb_stdout_flush(struct flb_event_chunk *event_chunk,
                             void *out_context,
                             struct flb_config *config)
 {
-    msgpack_unpacked result;
-    size_t off = 0, cnt = 0;
-    struct flb_stdout *ctx = out_context;
-    flb_sds_t json;
-    char *buf = NULL;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event         log_event;
+    int                          result;
+    flb_sds_t                    json;
+    struct flb_stdout           *ctx;
+    size_t                       cnt;
+
     (void) config;
-    struct flb_time tmp;
-    msgpack_object *p;
+
+    result = FLB_EVENT_DECODER_SUCCESS;
+    ctx = (struct flb_stdout *) out_context;
+    cnt = 0;
 
 #ifdef FLB_HAVE_METRICS
     /* Check if the event type is metrics, handle the payload differently */
-    if (event_chunk->type == FLB_EVENT_TYPE_METRIC) {
+    if (event_chunk->type == FLB_EVENT_TYPE_METRICS) {
         print_metrics_text(ctx->ins, (char *)
                            event_chunk->data,
                            event_chunk->size);
         FLB_OUTPUT_RETURN(FLB_OK);
     }
 #endif
+
+    if (event_chunk->type == FLB_EVENT_TYPE_TRACES) {
+        print_traces_text(ctx->ins, (char *)
+                          event_chunk->data,
+                          event_chunk->size);
+        FLB_OUTPUT_RETURN(FLB_OK);
+    }
+
+    if (event_chunk->type == FLB_EVENT_TYPE_PROFILES) {
+        print_profiles_text(ctx->ins, (char *)
+                            event_chunk->data,
+                            event_chunk->size);
+        FLB_OUTPUT_RETURN(FLB_OK);
+    }
 
     /* Assuming data is a log entry...*/
     if (ctx->out_format != FLB_PACK_JSON_FORMAT_NONE) {
@@ -169,21 +271,54 @@ static void cb_stdout_flush(struct flb_event_chunk *event_chunk,
         fflush(stdout);
     }
     else {
-        msgpack_unpacked_init(&result);
-        while (msgpack_unpack_next(&result,
-                                   event_chunk->data,
-                                   event_chunk->size, &off) == MSGPACK_UNPACK_SUCCESS) {
-            if (flb_time_pop_from_msgpack(&tmp, &result, &p) != -1 ) {
-                printf("[%zd] %s: [", cnt++, event_chunk->tag);
-                printf("%"PRIu32".%09lu, ", (uint32_t)tmp.tm.tv_sec, tmp.tm.tv_nsec);
-                msgpack_object_print(stdout, *p);
-                printf("]\n");
-            }
+        result = flb_log_event_decoder_init(&log_decoder,
+                                            (char *) event_chunk->data,
+                                            event_chunk->size);
+
+        if (result != FLB_EVENT_DECODER_SUCCESS) {
+            flb_plg_error(ctx->ins,
+                          "Log event decoder initialization error : %d", result);
+
+            FLB_OUTPUT_RETURN(FLB_RETRY);
         }
-        msgpack_unpacked_destroy(&result);
-        flb_free(buf);
+
+        while (flb_log_event_decoder_next(&log_decoder,
+                                           &log_event) == FLB_EVENT_DECODER_SUCCESS) {
+
+            if (log_event.group_attributes != NULL) {
+                printf("GROUP METADATA : \n\n");
+                msgpack_object_print(stdout, *log_event.group_metadata);
+                printf("\n\n");
+
+                printf("GROUP ATTRIBUTES : \n\n");
+                msgpack_object_print(stdout, *log_event.group_attributes);
+                printf("\n\n");
+            }
+
+            printf("[%zd] %s: [[", cnt++, event_chunk->tag);
+
+            printf("%"PRId32".%09lu, ", (int32_t) log_event.timestamp.tm.tv_sec,
+                    log_event.timestamp.tm.tv_nsec);
+
+            msgpack_object_print(stdout, *log_event.metadata);
+
+            printf("], ");
+
+            msgpack_object_print(stdout, *log_event.body);
+
+            printf("]\n");
+        }
+        result = flb_log_event_decoder_get_last_result(&log_decoder);
+
+        flb_log_event_decoder_destroy(&log_decoder);
     }
+
     fflush(stdout);
+
+    if (result != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_error(ctx->ins, "Log event decoder error : %d", result);
+        FLB_OUTPUT_RETURN(FLB_ERROR);
+    }
 
     FLB_OUTPUT_RETURN(FLB_OK);
 }
@@ -231,6 +366,7 @@ struct flb_output_plugin out_stdout_plugin = {
     .cb_exit      = cb_stdout_exit,
     .flags        = 0,
     .workers      = 1,
-    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS,
+    .event_type   = FLB_OUTPUT_LOGS | FLB_OUTPUT_METRICS | FLB_OUTPUT_TRACES |
+                    FLB_OUTPUT_PROFILES | FLB_OUTPUT_BLOBS,
     .config_map   = config_map
 };

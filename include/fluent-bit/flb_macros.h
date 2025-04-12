@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,13 @@
 #define FLB_ERROR   0
 #define FLB_OK      1
 #define FLB_RETRY   2
+
+/* ala-printf format check */
+#if defined(__GNUC__) || defined(__clang__)
+#define FLB_FORMAT_PRINTF(fmt, args) __attribute__ ((format (printf, fmt, args)))
+#else
+#define FLB_FORMAT_PRINTF(fmt, args)
+#endif
 
 #ifdef _WIN32
 #define FLB_INLINE inline

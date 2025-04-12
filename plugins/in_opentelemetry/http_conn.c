@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 
 #include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_engine.h>
+#include <fluent-bit/flb_downstream.h>
 
 #include "opentelemetry.h"
 #include "http_conn.h"
@@ -27,20 +28,53 @@
 static void opentelemetry_conn_request_init(struct mk_http_session *session,
                                    struct mk_http_request *request);
 
+static int opentelemetry_conn_buffer_realloc(struct flb_opentelemetry *ctx,
+                                             struct http_conn *conn, size_t size)
+{
+    char *tmp;
+
+    /* Perform realloc */
+    tmp = flb_realloc(conn->buf_data, size);
+    if (!tmp) {
+        flb_errno();
+        flb_plg_error(ctx->ins, "could not perform realloc for size %zu", size);
+        return -1;
+    }
+
+    /* Update buffer info */
+    conn->buf_data = tmp;
+    conn->buf_size = size;
+
+    /* Keep NULL termination */
+    conn->buf_data[conn->buf_len] = '\0';
+
+    /* Reset parser state */
+    mk_http_parser_init(&conn->session.parser);
+
+    return 0;
+}
+
 static int opentelemetry_conn_event(void *data)
 {
+    int ret;
     int status;
     size_t size;
     ssize_t available;
     ssize_t bytes;
-    char *tmp;
-    char *request_end;
     size_t request_len;
-    struct http_conn *conn = data;
+    struct http_conn *conn;
     struct mk_event *event;
-    struct flb_opentelemetry *ctx = conn->ctx;
+    struct flb_opentelemetry *ctx;
+    struct flb_connection *connection;
 
-    event = &conn->event;
+    connection = (struct flb_connection *) data;
+
+    conn = connection->user_data;
+
+    ctx = conn->ctx;
+
+    event = &connection->event;
+
     if (event->mask & MK_EVENT_READ) {
         available = (conn->buf_size - conn->buf_len) - 1;
         if (available < 1) {
@@ -53,28 +87,31 @@ static int opentelemetry_conn_event(void *data)
             }
 
             size = conn->buf_size + ctx->buffer_chunk_size;
-            tmp = flb_realloc(conn->buf_data, size);
-            if (!tmp) {
+            ret = opentelemetry_conn_buffer_realloc(ctx, conn, size);
+            if (ret == -1) {
                 flb_errno();
+                opentelemetry_conn_del(conn);
                 return -1;
             }
-            flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %i",
+
+            flb_plg_trace(ctx->ins, "fd=%i buffer realloc %i -> %zu",
                           event->fd, conn->buf_size, size);
 
-            conn->buf_data = tmp;
-            conn->buf_size = size;
             available = (conn->buf_size - conn->buf_len) - 1;
         }
 
         /* Read data */
-        bytes = recv(conn->fd, conn->buf_data + conn->buf_len, available, 0);
+        bytes = flb_io_net_read(connection,
+                                (void *) &conn->buf_data[conn->buf_len],
+                                available);
+
         if (bytes <= 0) {
             flb_plg_trace(ctx->ins, "fd=%i closed connection", event->fd);
             opentelemetry_conn_del(conn);
             return -1;
         }
 
-        flb_plg_trace(ctx->ins, "read()=%i pre_len=%i now_len=%i",
+        flb_plg_trace(ctx->ins, "read()=%zi pre_len=%i now_len=%zi",
                       bytes, conn->buf_len, conn->buf_len + bytes);
         conn->buf_len += bytes;
         conn->buf_data[conn->buf_len] = '\0';
@@ -86,47 +123,44 @@ static int opentelemetry_conn_event(void *data)
             /* Do more logic parsing and checks for this request */
             opentelemetry_prot_handle(ctx, conn, &conn->session, &conn->request);
 
-            /* Evict the processed request from the connection buffer and reinitialize
+            /*
+             * Evict the processed request from the connection buffer and reinitialize
              * the HTTP parser.
              */
 
-            request_end = NULL;
+            /* Use the last parser position as the request length */
+            request_len = mk_http_parser_request_size(&conn->session.parser,
+                                                      conn->buf_data,
+                                                      conn->buf_len);
 
-            if (NULL != conn->request.data.data) {
-                request_end = &conn->request.data.data[conn->request.data.len];
+            if (request_len == -1 || (request_len > conn->buf_len)) {
+                /* Unexpected but let's make sure things are safe */
+                conn->buf_len = 0;
+                flb_plg_debug(ctx->ins, "request length exceeds buffer length, closing connection");
+                opentelemetry_conn_del(conn);
+                return -1;
+            }
+
+            /* If we have extra bytes in our bytes, adjust the extra bytes */
+            if (0 < (conn->buf_len - request_len)) {
+                memmove(conn->buf_data, &conn->buf_data[request_len],
+                        conn->buf_len - request_len);
+
+                conn->buf_data[conn->buf_len - request_len] = '\0';
+                conn->buf_len -= request_len;
             }
             else {
-                request_end = strstr(conn->buf_data, "\r\n\r\n");
-
-                if(NULL != request_end) {
-                    request_end = &request_end[4];
-                }
+                memset(conn->buf_data, 0, request_len);
+                conn->buf_len = 0;
             }
 
-            if (NULL != request_end) {
-                request_len = (size_t)(request_end - conn->buf_data);
-
-                if (0 < (conn->buf_len - request_len)) {
-                    memmove(conn->buf_data, &conn->buf_data[request_len],
-                            conn->buf_len - request_len);
-
-                    conn->buf_data[conn->buf_len - request_len] = '\0';
-                    conn->buf_len -= request_len;
-                }
-                else {
-                    memset(conn->buf_data, 0, request_len);
-
-                    conn->buf_len = 0;
-                }
-
-                /* Reinitialize the parser so the next request is properly
-                 * handled, the additional memset intends to wipe any left over data
-                 * from the headers parsed in the previous request.
-                 */
-                memset(&conn->session.parser, 0, sizeof(struct mk_http_parser));
-                mk_http_parser_init(&conn->session.parser);
-                opentelemetry_conn_request_init(&conn->session, &conn->request);
-            }
+            /* Reinitialize the parser so the next request is properly
+                * handled, the additional memset intends to wipe any left over data
+                * from the headers parsed in the previous request.
+                */
+            memset(&conn->session.parser, 0, sizeof(struct mk_http_parser));
+            mk_http_parser_init(&conn->session.parser);
+            opentelemetry_conn_request_init(&conn->session, &conn->request);
         }
         else if (status == MK_HTTP_PARSER_ERROR) {
             opentelemetry_prot_handle_error(ctx, conn, &conn->session, &conn->request);
@@ -198,34 +232,33 @@ static void opentelemetry_conn_request_init(struct mk_http_session *session,
     request->session = session;
 }
 
-struct http_conn *opentelemetry_conn_add(int fd, struct flb_opentelemetry *ctx)
+struct http_conn *opentelemetry_conn_add(struct flb_connection *connection,
+                                         struct flb_opentelemetry *ctx)
 {
-    int ret;
     struct http_conn *conn;
-    struct mk_event *event;
+    int               ret;
 
     conn = flb_calloc(1, sizeof(struct http_conn));
     if (!conn) {
         flb_errno();
         return NULL;
     }
+    conn->connection = connection;
 
     /* Set data for the event-loop */
-    event = &conn->event;
-    MK_EVENT_NEW(event);
-    event->fd      = fd;
-    event->type    = FLB_ENGINE_EV_CUSTOM;
-    event->handler = opentelemetry_conn_event;
+    MK_EVENT_NEW(&connection->event);
+
+    connection->user_data     = conn;
+    connection->event.type    = FLB_ENGINE_EV_CUSTOM;
+    connection->event.handler = opentelemetry_conn_event;
 
     /* Connection info */
-    conn->fd      = fd;
     conn->ctx     = ctx;
     conn->buf_len = 0;
 
     conn->buf_data = flb_malloc(ctx->buffer_chunk_size);
     if (!conn->buf_data) {
         flb_errno();
-        flb_socket_close(fd);
         flb_plg_error(ctx->ins, "could not allocate new connection");
         flb_free(conn);
         return NULL;
@@ -233,17 +266,20 @@ struct http_conn *opentelemetry_conn_add(int fd, struct flb_opentelemetry *ctx)
     conn->buf_size = ctx->buffer_chunk_size;
 
     /* Register instance into the event loop */
-    ret = mk_event_add(ctx->evl, fd, FLB_ENGINE_EV_CUSTOM, MK_EVENT_READ, conn);
+    ret = mk_event_add(flb_engine_evl_get(),
+                       connection->fd,
+                       FLB_ENGINE_EV_CUSTOM,
+                       MK_EVENT_READ,
+                       &connection->event);
     if (ret == -1) {
         flb_plg_error(ctx->ins, "could not register new connection");
-        flb_socket_close(fd);
         flb_free(conn->buf_data);
         flb_free(conn);
         return NULL;
     }
 
     /* Initialize HTTP Session: this is a custom context for Monkey HTTP */
-    opentelemetry_conn_session_init(&conn->session, ctx->server, conn->fd);
+    opentelemetry_conn_session_init(&conn->session, ctx->server, connection->fd);
 
     /* Initialize HTTP Request: this is the initial request and it will be reinitialized
      * automatically after the request is handled so it can be used for the next one.
@@ -257,17 +293,17 @@ struct http_conn *opentelemetry_conn_add(int fd, struct flb_opentelemetry *ctx)
 
 int opentelemetry_conn_del(struct http_conn *conn)
 {
-    struct flb_opentelemetry *ctx;
-
-    ctx = conn->ctx;
-
     if (conn->session.channel != NULL) {
         mk_channel_release(conn->session.channel);
     }
 
-    mk_event_del(ctx->evl, &conn->event);
+    /* The downstream unregisters the file descriptor from the event-loop
+     * so there's nothing to be done by the plugin
+     */
+    flb_downstream_conn_release(conn->connection);
+
     mk_list_del(&conn->_head);
-    flb_socket_close(conn->fd);
+
     flb_free(conn->buf_data);
     flb_free(conn);
 

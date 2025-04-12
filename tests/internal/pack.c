@@ -56,7 +56,7 @@ void test_json_pack()
 
     len = strlen(data);
 
-    ret = flb_pack_json(data, len, &out_buf, &out_size, &root_type);
+    ret = flb_pack_json(data, len, &out_buf, &out_size, &root_type, NULL);
     TEST_CHECK(ret == 0);
 
     flb_free(data);
@@ -273,7 +273,7 @@ void test_json_dup_keys()
     TEST_CHECK(data_out != NULL);
 
     /* Pack raw JSON as msgpack */
-    ret = flb_pack_json(data_in, len_in, &out_buf, &out_size, &type);
+    ret = flb_pack_json(data_in, len_in, &out_buf, &out_size, &type, NULL);
     TEST_CHECK(ret == 0);
 
     d = flb_sds_create("date");
@@ -520,6 +520,146 @@ void test_utf8_to_json()
     utf8_tests_destroy(n_tests);
 }
 
+void test_json_pack_surrogate_pairs()
+{
+    int i;
+    int ret;
+    int len;
+    int type;
+    int items;
+    char *p_in;
+    char *p_unescaped;
+    size_t len_in;
+    char *out_buf;
+    size_t out_size;
+    char *data_in[] = {
+        "{\"text\":\"\\ud83e\\udd17\"}",
+        "{\"text\":\"thinking...\\ud83e\\uddd0\"}",
+        "{\"text\":\"\\ud83e\\udee1\"}",
+    };
+    char *data_unescaped[] = {
+        "🤗",
+        "thinking...🧐",
+        "🫡",
+    };
+    msgpack_unpacked result;
+    msgpack_object root;
+    msgpack_object val;
+    size_t off = 0;
+
+    items = sizeof(data_in) / sizeof(char *);
+    for (i = 0; i < items; i++) {
+        p_in = data_in[i];
+        len_in = strlen(p_in);
+        p_unescaped = data_unescaped[i];
+
+        /* Pack raw JSON as msgpack */
+        ret = flb_pack_json(p_in, len_in, &out_buf, &out_size, &type, NULL);
+        TEST_CHECK(ret == 0);
+
+        /* Unpack 'text' value and compare it to the original raw */
+        off = 0;
+        msgpack_unpacked_init(&result);
+        ret = msgpack_unpack_next(&result, out_buf, out_size, &off);
+        TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS);
+
+        /* Check parent type is a map */
+        root = result.data;
+        TEST_CHECK(root.type == MSGPACK_OBJECT_MAP);
+
+        /* Get map value */
+        val = root.via.map.ptr[0].val;
+        TEST_CHECK(val.type == MSGPACK_OBJECT_STR);
+
+        /* Compare bytes length */
+        len = strlen(p_unescaped);
+        TEST_CHECK(len == val.via.str.size);
+        if (len != val.via.str.size) {
+            printf("failed comparing string length\n");
+        }
+
+        /* Compare raw bytes */
+        ret = memcmp(val.via.str.ptr, p_unescaped, len);
+        TEST_CHECK(ret == 0);
+        if (ret != 0) {
+            printf("failed comparing to original value\n");
+        }
+
+        msgpack_unpacked_destroy(&result);
+        flb_free(out_buf);
+    }
+}
+
+void test_json_pack_surrogate_pairs_with_replacement()
+{
+    int i;
+    int ret;
+    int len;
+    int type;
+    int items;
+    char *p_in;
+    char *p_unescaped;
+    size_t len_in;
+    char *out_buf;
+    size_t out_size;
+    char *data_in[] = {
+        "{\"text\":\"\\fddd,\"}",
+        "{\"text\":\"\\udee1,\"}",
+        "{\"text\":\"\\ud83e,|,\"}",
+    };
+    char *data_unescaped[] = {
+        "\fddd,",
+        "�,",
+        "�,|,",
+    };
+    msgpack_unpacked result;
+    msgpack_object root;
+    msgpack_object val;
+    size_t off = 0;
+
+    items = sizeof(data_in) / sizeof(char *);
+    for (i = 0; i < items; i++) {
+        p_in = data_in[i];
+        len_in = strlen(p_in);
+        p_unescaped = data_unescaped[i];
+
+        /* Pack raw JSON as msgpack */
+        ret = flb_pack_json(p_in, len_in, &out_buf, &out_size, &type, NULL);
+        TEST_CHECK(ret == 0);
+
+        /* Unpack 'text' value and compare it to the original raw */
+        off = 0;
+        msgpack_unpacked_init(&result);
+        ret = msgpack_unpack_next(&result, out_buf, out_size, &off);
+        TEST_CHECK(ret == MSGPACK_UNPACK_SUCCESS);
+
+        /* Check parent type is a map */
+        root = result.data;
+        TEST_CHECK(root.type == MSGPACK_OBJECT_MAP);
+
+        /* Get map value */
+        val = root.via.map.ptr[0].val;
+        TEST_CHECK(val.type == MSGPACK_OBJECT_STR);
+
+        /* Compare bytes length */
+        len = strlen(p_unescaped);
+        TEST_CHECK(len == val.via.str.size);
+        if (len != val.via.str.size) {
+            printf("failed comparing string length\n");
+        }
+
+        /* Compare raw bytes */
+        ret = memcmp(val.via.str.ptr, p_unescaped, len);
+        TEST_CHECK(ret == 0);
+        if (ret != 0) {
+            printf("failed comparing to original value\n");
+        }
+
+        msgpack_unpacked_destroy(&result);
+        flb_free(out_buf);
+    }
+}
+
 void test_json_pack_bug1278()
 {
     int i;
@@ -592,7 +732,7 @@ void test_json_pack_bug1278()
         }
         /* Put JSON string in a map and convert it to msgpack */
         snprintf(tmp, sizeof(tmp) -1 , "{\"log\": %s}", json);
-        ret = flb_pack_json(tmp, strlen(tmp), &out_buf, &out_size, &type);
+        ret = flb_pack_json(tmp, strlen(tmp), &out_buf, &out_size, &type, NULL);
         TEST_CHECK(ret == 0);
         if (ret != 0) {
             printf("failed packaging to JSON\n");
@@ -830,6 +970,66 @@ void test_json_pack_bug5336()
     }
 }
 
+const char input_msgpack[] = {0x92,/* array 2 */
+                            0xd7, 0x00, /* event time*/
+                            0x07, 0x5b, 0xcd, 0x15, /* second = 123456789 = 1973/11/29 21:33:09 */
+                            0x07, 0x5b, 0xcd, 0x15, /* nanosecond = 123456789 */
+                            0x81, 0xa2, 0x61, 0x61, 0xa2, 0x62, 0x62 /* {"aa":"bb"} */
+};
+
+void test_json_date(char* expect, int date_format)
+{
+    flb_sds_t json_key;
+    flb_sds_t ret;
+
+    json_key = flb_sds_create("date");
+    if (!TEST_CHECK(json_key != NULL)) {
+        TEST_MSG("flb_sds_create failed");
+        exit(1);
+    }
+
+    ret = flb_pack_msgpack_to_json_format((const char*)&input_msgpack[0], sizeof(input_msgpack),
+                                          FLB_PACK_JSON_FORMAT_JSON, date_format,
+                                          json_key);
+    if (!TEST_CHECK(ret != NULL)) {
+        TEST_MSG("flb_pack_msgpack_to_json_format failed");
+        flb_sds_destroy(json_key);
+        exit(1);
+    }
+    flb_sds_destroy(json_key);
+
+    if (!TEST_CHECK(strstr(ret, expect) != NULL)) {
+        TEST_MSG("mismatch. Got=%s expect=%s", ret, expect);
+    }
+
+    flb_sds_destroy(ret);
+}
+
+void test_json_date_iso8601()
+{
+    test_json_date("1973-11-29T21:33:09.123456Z", FLB_PACK_JSON_DATE_ISO8601);
+}
+
+void test_json_date_double()
+{
+    test_json_date("123456789.123456", FLB_PACK_JSON_DATE_DOUBLE);
+}
+
+void test_json_date_java_sql()
+{
+    test_json_date("1973-11-29 21:33:09.123456", FLB_PACK_JSON_DATE_JAVA_SQL_TIMESTAMP);
+}
+
+void test_json_date_epoch()
+{
+    test_json_date("123456789", FLB_PACK_JSON_DATE_EPOCH);
+}
+
+void test_json_date_epoch_ms()
+{
+    test_json_date("123456789123", FLB_PACK_JSON_DATE_EPOCH_MS);
+}
+
 TEST_LIST = {
     /* JSON maps iteration */
     { "json_pack"          , test_json_pack },
@@ -842,8 +1042,16 @@ TEST_LIST = {
     { "json_pack_bug1278"  , test_json_pack_bug1278},
     { "json_pack_nan"      , test_json_pack_nan},
     { "json_pack_bug5336"  , test_json_pack_bug5336},
+    { "json_date_iso8601" , test_json_date_iso8601},
+    { "json_date_double" , test_json_date_double},
+    { "json_date_java_sql" , test_json_date_java_sql},
+    { "json_date_epoch" , test_json_date_epoch},
+    { "json_date_epoch_ms" , test_json_date_epoch_ms},
 
     /* Mixed bytes, check JSON encoding */
     { "utf8_to_json", test_utf8_to_json},
+    { "json_pack_surrogate_pairs", test_json_pack_surrogate_pairs},
+    { "json_pack_surrogate_pairs_with_replacement",
+      test_json_pack_surrogate_pairs_with_replacement},
     { 0 }
 };

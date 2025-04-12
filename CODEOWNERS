@@ -13,17 +13,17 @@
 
 # Build System & Portability
 # --------------------------
-/CMakeLists.txt          @fujimotos @niedbalski
-/cmake/                  @fujimotos @niedbalski
+/CMakeLists.txt          @fujimotos @niedbalski @patrick-stephens @celalettin1286
+/cmake/                  @fujimotos @niedbalski @patrick-stephens @celalettin1286
 
-# CI 
+# CI
 # -------------------------
-/.github/                @niedbalski @patrick-stephens
-/appveyor.yml            @niedbalski @patrick-stephens
-/dockerfiles/            @niedbalski @patrick-stephens
-/packaging/              @niedbalski @patrick-stephens
-/codebase-structure.svg  @niedbalski @patrick-stephens
-/install.sh              @niedbalski @patrick-stephens
+/.github/                @niedbalski @patrick-stephens @celalettin1286
+/appveyor.yml            @niedbalski @patrick-stephens @celalettin1286
+/dockerfiles/            @niedbalski @patrick-stephens @celalettin1286
+/packaging/              @niedbalski @patrick-stephens @celalettin1286
+/codebase-structure.svg  @niedbalski @patrick-stephens @celalettin1286
+/install.sh              @niedbalski @patrick-stephens @celalettin1286
 
 # Core: Signv4
 # ------------
@@ -32,7 +32,12 @@
 
 # Core: AWS Auth & Utils
 # ------------
-/src/aws                 @pettitwesley
+/src/aws                 @pettitwesley @sparrc @singholt @swapneils
+
+# AWS header files
+/include/aws                   @pettitwesley @sparrc @singholt @swapneils
+/include/flb_aws_credentials.h @pettitwesley @sparrc @singholt @swapneils
+/include/flb_aws_util.h        @pettitwesley @sparrc @singholt @swapneils
 
 # Core: Stream Processor
 # ----------------
@@ -50,15 +55,44 @@
 
 # Filter Plugins
 # --------------
-/plugins/filter_aws      @pettitwesley
+/plugins/filter_aws      @pettitwesley @sparrc @singholt @swapneils
+/plugins/filter_ecs      @pettitwesley @sparrc @singholt @swapneils
 
 # Output Plugins
 # --------------
 /plugins/out_datadog     @nokute78 @edsiper
 /plugins/out_es          @pettitwesley @edsiper
 /plugins/out_pgsql       @sxd
-# AWS Plugins 
-/plugins/out_s3               @pettitwesley
-/plugins/out_cloudwatch_logs  @pettitwesley
-/plugins/out_kinesis_firehose @pettitwesley
-/plugins/out_kinesis_streams  @pettitwesley
+/plugins/out_stackdriver @braydonk @jefferbrecht @jeffluoo
+
+# AWS Plugins
+/plugins/out_s3               @pettitwesley @sparrc @singholt @swapneils
+/plugins/out_cloudwatch_logs  @pettitwesley @sparrc @singholt @swapneils
+/plugins/out_kinesis_firehose @pettitwesley @sparrc @singholt @swapneils
+/plugins/out_kinesis_streams  @pettitwesley @sparrc @singholt @swapneils
+/plugins/out_opensearch       @pettitwesley @edsiper @sparrc @singholt @swapneils
+
+# AWS test code
+/tests/internal/aws             @pettitwesley @sparrc @singholt @swapneils
+/tests/internal/aws_*           @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/filter_ecs.c     @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/filter_aws.c     @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/out_cloudwatch.c @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/out_firehose.c   @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/out_kinesis.c    @pettitwesley @sparrc @singholt @swapneils
+/tests/runtime/out_opensearch.c @pettitwesley @edsiper @sparrc @singholt @swapneils
+/tests/runtime/out_s3.c         @pettitwesley @sparrc @singholt @swapneils
+
+# Google test code
+# --------------
+/tests/runtime/out_stackdriver.c @braydonk @jefferbrecht @jeffluoo
+/tests/runtime/data/stackdriver  @braydonk @jefferbrecht @jeffluoo
+
+# Devcontainer
+/.devcontainer                  @patrick-stephens @niedbalski @edsiper
+
+# Calyptia Fleet
+/include/fluent-bit/calyptia/       @pwhelan @patrick-stephens @niedbalski
+/plugins/custom_calyptia/       @pwhelan @patrick-stephens @niedbalski
+/plugins/custom_calyptia/       @pwhelan @patrick-stephens @niedbalski
+/plugins/out_calyptia/     @pwhelan @patrick-stephens @niedbalski

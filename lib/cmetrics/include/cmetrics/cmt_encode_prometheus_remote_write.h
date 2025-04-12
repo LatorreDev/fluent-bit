@@ -2,7 +2,7 @@
 
 /*  CMetrics
  *  ========
- *  Copyright 2021 Eduardo Silva <eduardo@calyptia.com>
+ *  Copyright 2021-2022 The CMetrics Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,39 +22,40 @@
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_H
 
 #include <cmetrics/cmetrics.h>
-#include <cmetrics/cmt_sds.h>
 #include <prometheus_remote_write/remote.pb-c.h>
 
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_ADD_METADATA           CMT_FALSE
+#define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_CUTOFF_THRESHOLD       3600000000000L /* One hour in nanoseconds */
 
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_SUCCESS                0
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_ALLOCATION_ERROR       1
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_UNEXPECTED_ERROR       2
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_INVALID_ARGUMENT_ERROR 3
 #define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_UNEXPECTED_METRIC_TYPE 4
+#define CMT_ENCODE_PROMETHEUS_REMOTE_WRITE_CUTOFF_ERROR           5
 
 struct cmt_prometheus_metric_metadata {
     Prometheus__MetricMetadata data;
-    struct mk_list _head;
+    struct cfl_list _head;
 };
 
 struct cmt_prometheus_time_series {
     uint64_t               label_set_hash;
     size_t                 entries_set;
     Prometheus__TimeSeries data;
-    struct mk_list _head;
+    struct cfl_list _head;
 };
 
 struct cmt_prometheus_remote_write_context
 {
-    struct mk_list           time_series_entries;
-    struct mk_list           metadata_entries;
+    struct cfl_list           time_series_entries;
+    struct cfl_list           metadata_entries;
     uint64_t                 sequence_number;
     Prometheus__WriteRequest write_request;
     struct cmt              *cmt;
 };
 
-cmt_sds_t cmt_encode_prometheus_remote_write_create(struct cmt *cmt);
-void cmt_encode_prometheus_remote_write_destroy(cmt_sds_t text);
+cfl_sds_t cmt_encode_prometheus_remote_write_create(struct cmt *cmt);
+void cmt_encode_prometheus_remote_write_destroy(cfl_sds_t text);
 
 #endif

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@
 #include <fluent-bit/flb_output_plugin.h>
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/flb_upstream.h>
+#include <fluent-bit/flb_hash_table.h>
+#include <cfl/cfl_list.h>
 
 #define FLB_LOKI_CT              "Content-Type"
 #define FLB_LOKI_CT_JSON         "application/json"
@@ -39,6 +41,11 @@
 #define FLB_LOKI_FMT_JSON  0
 #define FLB_LOKI_FMT_KV    1
 
+/* Drop single key */
+#define FLB_LOKI_DROP_SINGLE_KEY_OFF (((uint64_t) 1) << 0)
+#define FLB_LOKI_DROP_SINGLE_KEY_ON  (((uint64_t) 1) << 1)
+#define FLB_LOKI_DROP_SINGLE_KEY_RAW (((uint64_t) 1) << 2)
+
 struct flb_loki_kv {
     int val_type;                       /* FLB_LOKI_KV_STR or FLB_LOKI_KV_RA */
     flb_sds_t key;                      /* string key */
@@ -52,37 +59,59 @@ struct flb_loki_kv {
 struct flb_loki {
     /* Public configuration properties */
     int auto_kubernetes_labels;
-    int drop_single_key;
+
+    flb_sds_t drop_single_key;
+    flb_sds_t uri;
     flb_sds_t line_format;
     flb_sds_t tenant_id;
     flb_sds_t tenant_id_key_config;
+    int compress_gzip;
 
     /* HTTP Auth */
     flb_sds_t http_user;
     flb_sds_t http_passwd;
 
+    /* Bearer Token Auth */
+    flb_sds_t bearer_token;
+
     /* Labels */
     struct mk_list *labels;
     struct mk_list *label_keys;
+    struct mk_list *structured_metadata;
+    struct mk_list *structured_metadata_map_keys;
     struct mk_list *remove_keys;
+
+    flb_sds_t label_map_path;
 
     /* Private */
     int tcp_port;
     char *tcp_host;
     int out_line_format;
-    int ra_used;                        /* number of record accessor label keys */
-    struct flb_record_accessor *ra_k8s; /* kubernetes record accessor */
-    struct mk_list labels_list;         /* list of flb_loki_kv nodes */
-    struct mk_list remove_keys_derived; /* remove_keys with label RAs */
-    struct flb_mp_accessor *remove_mpa; /* remove_keys multi-pattern accessor */
-    struct flb_record_accessor *ra_tenant_id_key; /* dynamic tenant id key */
-    flb_sds_t dynamic_tenant_id; /* temporary buffer for tenant id */
+    int out_drop_single_key;
+    int ra_used;                           /* number of record accessor label keys */
+    struct flb_record_accessor *ra_k8s;              /* kubernetes record accessor */
+    struct mk_list labels_list;                       /* list of flb_loki_kv nodes */
+    struct mk_list structured_metadata_list;          /* list of flb_loki_kv nodes */
+    struct mk_list structured_metadata_map_keys_list; /* list of flb_loki_kv nodes */
+    struct mk_list remove_keys_derived;              /* remove_keys with label RAs */
+    struct flb_mp_accessor *remove_mpa;      /* remove_keys multi-pattern accessor */
+    struct flb_record_accessor *ra_tenant_id_key;         /* dynamic tenant id key */
+
+    struct cfl_list dynamic_tenant_list;
+    pthread_mutex_t dynamic_tenant_list_lock;
 
     /* Upstream Context */
     struct flb_upstream *u;
 
     /* Plugin instance */
     struct flb_output_instance *ins;
+
+    /* Arbitrary HTTP headers */
+    struct mk_list *headers;
+
+    /* Response buffer size */
+    size_t http_buffer_max_size;
+
 };
 
 #endif

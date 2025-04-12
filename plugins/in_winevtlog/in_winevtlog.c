@@ -28,7 +28,10 @@
 
 #define DEFAULT_INTERVAL_SEC  1
 #define DEFAULT_INTERVAL_NSEC 0
-#define DEFAULT_THRESHOLD_SIZE 0x7ffff /* Default reading buffer size (512kb) */
+#define DEFAULT_THRESHOLD_SIZE 0x7ffff /* Default reading buffer size */
+                                       /* (512kib = 524287bytes) */
+#define MINIMUM_THRESHOLD_SIZE 0x0400   /* 1024 bytes */
+#define MAXIMUM_THRESHOLD_SIZE (FLB_INPUT_CHUNK_FS_MAX_SIZE - (1024 * 200))
 
 static int in_winevtlog_collect(struct flb_input_instance *ins,
                                 struct flb_config *config, void *in_context);
@@ -38,6 +41,7 @@ static int in_winevtlog_init(struct flb_input_instance *in,
 {
     int ret;
     const char *tmp;
+    char human_readable_size[32];
     int read_existing_events = FLB_FALSE;
     struct mk_list *head;
     struct winevtlog_channel *ch;
@@ -51,15 +55,51 @@ static int in_winevtlog_init(struct flb_input_instance *in,
     }
     ctx->ins = in;
 
+    ctx->log_encoder = flb_log_event_encoder_create(FLB_LOG_EVENT_FORMAT_DEFAULT);
+
+    if (ctx->log_encoder == NULL) {
+        flb_plg_error(in, "could not initialize event encoder");
+        flb_free(ctx);
+
+        return NULL;
+    }
+
     /* Load the config map */
     ret = flb_input_config_map_set(in, (void *) ctx);
     if (ret == -1) {
+        flb_log_event_encoder_destroy(ctx->log_encoder);
         flb_free(ctx);
         return -1;
     }
 
     /* Set up total reading size threshold */
-    ctx->total_size_threshold = DEFAULT_THRESHOLD_SIZE;
+    if (ctx->total_size_threshold >= MINIMUM_THRESHOLD_SIZE &&
+        ctx->total_size_threshold <= MAXIMUM_THRESHOLD_SIZE) {
+        flb_utils_bytes_to_human_readable_size((size_t) ctx->total_size_threshold,
+                                               human_readable_size,
+                                               sizeof(human_readable_size) - 1);
+        flb_plg_debug(ctx->ins,
+                      "read limit per cycle is set up as %s",
+                      human_readable_size);
+    }
+    else if (ctx->total_size_threshold > MAXIMUM_THRESHOLD_SIZE) {
+        flb_utils_bytes_to_human_readable_size((size_t) MAXIMUM_THRESHOLD_SIZE,
+                                               human_readable_size,
+                                               sizeof(human_readable_size) - 1);
+        flb_plg_warn(ctx->ins,
+                     "read limit per cycle cannot exceed %s. Set up to %s",
+                     human_readable_size, human_readable_size);
+        ctx->total_size_threshold = (unsigned int) MAXIMUM_THRESHOLD_SIZE;
+    }
+    else if (ctx->total_size_threshold < MINIMUM_THRESHOLD_SIZE){
+        flb_utils_bytes_to_human_readable_size((size_t) MINIMUM_THRESHOLD_SIZE,
+                                               human_readable_size,
+                                               sizeof(human_readable_size) - 1);
+        flb_plg_warn(ctx->ins,
+                     "read limit per cycle cannot under 1KiB. Set up to %s",
+                     human_readable_size);
+        ctx->total_size_threshold = (unsigned int) MINIMUM_THRESHOLD_SIZE;
+    }
 
     /* Open channels */
     tmp = flb_input_get_property("channels", in);
@@ -68,9 +108,10 @@ static int in_winevtlog_init(struct flb_input_instance *in,
         tmp = "Application";
     }
 
-    ctx->active_channel = winevtlog_open_all(tmp, ctx->read_existing_events);
+    ctx->active_channel = winevtlog_open_all(tmp, ctx);
     if (!ctx->active_channel) {
         flb_plg_error(ctx->ins, "failed to open channels");
+        flb_log_event_encoder_destroy(ctx->log_encoder);
         flb_free(ctx);
         return -1;
     }
@@ -82,6 +123,7 @@ static int in_winevtlog_init(struct flb_input_instance *in,
         if (!ctx->db) {
             flb_plg_error(ctx->ins, "could not open/create database");
             winevtlog_close_all(ctx->active_channel);
+            flb_log_event_encoder_destroy(ctx->log_encoder);
             flb_free(ctx);
             return -1;
         }
@@ -91,6 +133,7 @@ static int in_winevtlog_init(struct flb_input_instance *in,
             flb_plg_error(ctx->ins, "could not create 'channels' table");
             flb_sqldb_close(ctx->db);
             winevtlog_close_all(ctx->active_channel);
+            flb_log_event_encoder_destroy(ctx->log_encoder);
             flb_free(ctx);
             return -1;
         }
@@ -125,13 +168,8 @@ static int in_winevtlog_read_channel(struct flb_input_instance *ins,
                                      struct winevtlog_channel *ch)
 {
     unsigned int read;
-    msgpack_packer mp_pck;
-    msgpack_sbuffer mp_sbuf;
 
-    msgpack_sbuffer_init(&mp_sbuf);
-    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
-
-    if (winevtlog_read(ch, &mp_pck, ctx, &read)) {
+    if (winevtlog_read(ch, ctx, &read)) {
         flb_plg_error(ctx->ins, "failed to read '%s'", ch->name);
         return -1;
     }
@@ -147,9 +185,14 @@ static int in_winevtlog_read_channel(struct flb_input_instance *ins,
         winevtlog_sqlite_save(ch, ctx->db);
     }
 
-    flb_input_chunk_append_raw(ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
+    if (ctx->log_encoder->output_length > 0) {
+        flb_input_log_append(ctx->ins, NULL, 0,
+                             ctx->log_encoder->output_buffer,
+                             ctx->log_encoder->output_length);
+    }
 
-    msgpack_sbuffer_destroy(&mp_sbuf);
+    flb_log_event_encoder_reset(ctx->log_encoder);
+
     return 0;
 }
 
@@ -238,7 +281,21 @@ static struct flb_config_map config_map[] = {
       0, FLB_TRUE, offsetof(struct winevtlog_config, use_ansi),
       "Use ANSI encoding on eventlog messages"
     },
-
+    {
+      FLB_CONFIG_MAP_BOOL, "ignore_missing_channels", "false",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, ignore_missing_channels),
+      "Whether to ignore channels missing in eventlog"
+    },
+    {
+      FLB_CONFIG_MAP_STR, "event_query", "*",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, event_query),
+      "Specify XML query for filtering events"
+    },
+    {
+      FLB_CONFIG_MAP_SIZE, "read_limit_per_cycle", "524287",
+      0, FLB_TRUE, offsetof(struct winevtlog_config, total_size_threshold),
+      "Specify reading limit for collecting Windows EventLog per a cycle"
+    },
     /* EOF */
     {0}
 };

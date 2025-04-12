@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,6 +29,16 @@
 
 #include <fluent-bit/flb_record_accessor.h>
 #include <fluent-bit/record_accessor/flb_ra_parser.h>
+
+#define LOG_CLASS_STANDARD                  "STANDARD"
+#define LOG_CLASS_STANDARD_LEN              8
+#define LOG_CLASS_INFREQUENT_ACCESS         "INFREQUENT_ACCESS"
+#define LOG_CLASS_INFREQUENT_ACCESS_LEN     17
+/* log_group_class not configured; do not send the logGroupClass field in request */
+#define LOG_CLASS_DEFAULT_TYPE              0
+/* send configured & validated string in request */
+#define LOG_CLASS_STANDARD_TYPE             1
+#define LOG_CLASS_INFREQUENT_ACCESS_TYPE    2
 
 /* buffers used for each flush */
 struct cw_flush {
@@ -70,7 +80,7 @@ struct cw_event {
 struct log_stream {
     flb_sds_t name;
     flb_sds_t group;
-    flb_sds_t sequence_token;
+
     /*
      * log streams in CloudWatch do not expire; but our internal representations
      * of them are periodically cleaned up if they have been unused for too long
@@ -86,8 +96,6 @@ struct log_stream {
 
     struct mk_list _head;
 };
-
-void log_stream_destroy(struct log_stream *stream);
 
 struct flb_cloudwatch {
     /*
@@ -114,6 +122,9 @@ struct flb_cloudwatch {
     const char *log_key;
     const char *extra_user_agent;
     const char *external_id;
+    const char *profile;
+    const char *log_group_class;
+    int log_group_class_type;
     int custom_endpoint;
     /* Should the plugin create the log group */
     int create_group;
@@ -134,14 +145,9 @@ struct flb_cloudwatch {
     struct flb_record_accessor *ra_group;
     struct flb_record_accessor *ra_stream;
 
-    /* if we're writing to a static log stream, we'll use this */
-    struct log_stream stream;
-    int stream_created;
-    /* if the log stream is dynamic, we'll use this */
+    /* stores log streams we're putting to */
     struct mk_list streams;
 
-    /* buffers for data processing and request payload */
-    struct cw_flush *buf;
     /* The namespace to use for the metric */
     flb_sds_t metric_namespace;
 
@@ -156,5 +162,7 @@ struct flb_cloudwatch {
 };
 
 void flb_cloudwatch_ctx_destroy(struct flb_cloudwatch *ctx);
+
+void log_stream_destroy(struct log_stream *stream);
 
 #endif

@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -91,6 +91,9 @@ static int cb_pgsql_init(struct flb_output_instance *ins,
     else {
         ctx->db_table = flb_sds_create(FLB_PGSQL_TABLE);
     }
+
+    /* connection options */
+    ctx->conn_options = flb_output_get_property("connection_options", ins);
 
     if (!ctx->db_table) {
         flb_errno();

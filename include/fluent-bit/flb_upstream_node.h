@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ struct flb_upstream_node {
 #ifdef FLB_HAVE_TLS
     /* TLS: given configuration */
     int tls_verify;           /* Verify certs (default: true) */
+    int tls_verify_hostname;  /* Verify hostname (default: false) */
     int tls_debug;            /* mbedtls debug level          */
     char *tls_ca_path;        /* Path to certificates         */
     char *tls_ca_file;        /* CA root cert                 */
@@ -62,9 +63,10 @@ struct flb_upstream_node {
 };
 
 
-struct flb_upstream_node *flb_upstream_node_create(const char *name, const char *host,
-                                                   const char *port,
+struct flb_upstream_node *flb_upstream_node_create(flb_sds_t name, flb_sds_t host,
+                                                   flb_sds_t port,
                                                    int tls, int tls_verify,
+                                                   int tls_verify_hostname,
                                                    int tls_debug,
                                                    const char *tls_vhost,
                                                    const char *tls_ca_path,

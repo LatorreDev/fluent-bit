@@ -2,7 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
- *  Copyright (C) 2015-2022 The Fluent Bit Authors
+ *  Copyright (C) 2015-2024 The Fluent Bit Authors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@
 struct upload_queue {
     struct s3_file *upload_file;
     struct multipart_upload *m_upload_file;
-    char *tag;
+    flb_sds_t tag;
     int tag_len;
 
     int retry_counter;
@@ -112,6 +112,7 @@ struct flb_s3 {
     char *storage_class;
     char *log_key;
     char *external_id;
+    char *profile;
     int free_endpoint;
     int retry_requests;
     int use_put_object;
@@ -120,6 +121,10 @@ struct flb_s3 {
     int compression;
     int port;
     int insecure;
+    size_t store_dir_limit_size;
+
+    /* track the total amount of buffered data */
+    size_t current_buffer_size;
 
     struct flb_aws_provider *provider;
     struct flb_aws_provider *base_provider;
